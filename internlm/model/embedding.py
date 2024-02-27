@@ -3,12 +3,12 @@
 
 from typing import Tuple
 
-import rotary_emb
+# import rotary_emb
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from flash_attn.layers.rotary import ApplyRotaryEmb as LegacyApplyRotaryEmb
-from flash_attn.layers.rotary import ApplyRotaryEmbQKV_ as LegacyApplyRotaryEmbQKV_
+# from flash_attn.layers.rotary import ApplyRotaryEmb as LegacyApplyRotaryEmb
+# from flash_attn.layers.rotary import ApplyRotaryEmbQKV_ as LegacyApplyRotaryEmbQKV_
 from torch import Tensor, nn
 
 from internlm.core.context import ParallelMode
@@ -16,6 +16,7 @@ from internlm.core.context import global_context as gpc
 
 from .utils import gather_forward_split_backward, split_forward_gather_backward
 
+rotary_emb = None
 
 class Embedding1D(nn.Module):
     """

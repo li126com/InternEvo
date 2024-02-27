@@ -1,4 +1,5 @@
-from .internlm_accelerator import Accelerator
+from .abstract_accelerator import Accelerator
+
 
 try:
     import torch.npu

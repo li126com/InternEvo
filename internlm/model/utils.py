@@ -5,12 +5,12 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from flash_attn.ops.fused_dense import FusedDenseFunc
-from flash_attn.utils.distributed import (
-    all_gather_raw,
-    all_reduce_raw,
-    reduce_scatter_raw,
-)
+# from flash_attn.ops.fused_dense import FusedDenseFunc
+# from flash_attn.utils.distributed import (
+#     all_gather_raw,
+#     all_reduce_raw,
+#     reduce_scatter_raw,
+# )
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
