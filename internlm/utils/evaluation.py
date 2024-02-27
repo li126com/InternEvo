@@ -8,6 +8,7 @@ from internlm.accelerator import internlm_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.metrics import AccPerplex, SchedulerMetricHook
+from internlm.utils.common import get_current_device
 
 
 @contextmanager
@@ -88,7 +89,7 @@ def evaluate_on_val_dls(
                 continue
 
             val_metric = AccPerplex(
-                device=internlm_accelerator.current_device(),
+                device=get_current_device(),
                 tp_pg=gpc.get_group(ParallelMode.TENSOR),
                 dp_pg=gpc.get_group(ParallelMode.DATA),
             )

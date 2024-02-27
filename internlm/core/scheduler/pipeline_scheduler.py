@@ -307,7 +307,7 @@ class PipelineScheduler(BaseScheduler):
         moe_loss = (
             sum(moe_losses) * gpc.config.loss.moe_loss_coeff
             if hasattr(gpc.config.model, "num_experts") and gpc.config.model.num_experts > 1
-            else torch.tensor(0.0, device=internlm_accelerator.current_device(), dtype=gpc.config.model.get("dtype"))
+            else torch.tensor(0.0, device=get_current_device(), dtype=gpc.config.model.get("dtype"))
         )
         # the moe_loss is computed among the "tensor" group if sequence parallel is enabled, so we need to do allreduce
         if gpc.config.parallel.sequence_parallel:
@@ -861,7 +861,7 @@ class InterleavedPipelineScheduler(PipelineScheduler):
         moe_loss = (
             sum(moe_losses) * gpc.config.loss.moe_loss_coeff
             if hasattr(gpc.config.model, "num_experts") and gpc.config.model.num_experts > 1
-            else torch.tensor(0.0, device=internlm_accelerator.current_device(), dtype=gpc.config.model.get("dtype"))
+            else torch.tensor(0.0, device=get_current_device(), dtype=gpc.config.model.get("dtype"))
         )
         # the moe_loss is computed among the "tensor" group if sequence parallel is enabled, so we need to do allreduce
         if gpc.config.parallel.sequence_parallel:

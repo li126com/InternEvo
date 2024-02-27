@@ -207,7 +207,7 @@ class HybridZeroOptimizer(BaseOptimizer):
                     tensor_list = self._param_store.get_fp16_params_by_rank_group(rank, group_id)
                     with torch.no_grad():
                         flat_tensor = flatten(tensor_list)
-                    flat_tensor = flat_tensor.data.cuda()
+                    flat_tensor = flat_tensor.data.to(get_current_device())
                     self._param_store.add_flat_fp16_param_by_rank_group(rank, group_id, flat_tensor)
                     sync_param(flat_tensor=flat_tensor, tensor_list=tensor_list)
 

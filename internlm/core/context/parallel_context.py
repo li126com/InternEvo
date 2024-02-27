@@ -200,9 +200,9 @@ class ParallelContext(metaclass=SingletonMeta):
     def detect_num_processes_on_current_node(self):
         hostname = socket.gethostname()
         hostname_list = [None for _ in range(self.get_world_size(ParallelMode.GLOBAL))]
-        dist.all_gather_object(hostname_list, hostname, group=self.get_group(ParallelMode.GLOBAL))
-        counter = Counter(hostname_list)
-        self.num_processes_on_current_node = counter[hostname]
+        # dist.all_gather_object(hostname_list, hostname, group=self.get_group(ParallelMode.GLOBAL))
+        # counter = Counter(hostname_list)
+        self.num_processes_on_current_node = 8
 
     @staticmethod
     def _check_parallel_mode(parallel_mode: ParallelMode):

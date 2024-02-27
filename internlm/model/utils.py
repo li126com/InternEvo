@@ -6,7 +6,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.amp import custom_bwd, custom_fwd
+# from torch.cuda.amp import custom_bwd, custom_fwd
 from torch.distributed import ProcessGroup
 
 from internlm.accelerator import get_accelerator, internlm_accelerator
@@ -19,7 +19,7 @@ if internlm_accelerator is None:
     internlm_accelerator = get_accelerator()
 
 custom_bwd = internlm_accelerator.return_custom_bwd()
-
+custom_fwd = internlm_accelerator.return_custom_fwd()
 
 # Raw operation, does not support autograd, but does support async
 def all_reduce_raw(input_: Tensor, process_group: ProcessGroup, async_op: bool = False):

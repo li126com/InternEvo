@@ -2,8 +2,8 @@ from typing import Callable, List, Optional
 
 import torch
 from torch import nn
-from torch_scatter import scatter
-
+# from torch_scatter import scatter
+from internlm.utils.common import get_current_device
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.utils.common import SchedulerHook
@@ -50,7 +50,7 @@ class AccPerplex:
 
     def set_current_type_ids(self, type_ids: torch.Tensor):
         self.batch_shift = 0
-        self.type_ids = type_ids.cuda()
+        self.type_ids = type_ids.to(get_current_device())
 
     def __call__(self, logits, labels):
         return self.update(logits, labels, type_ids=self.type_ids)

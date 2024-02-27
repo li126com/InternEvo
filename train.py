@@ -45,6 +45,7 @@ from internlm.utils.model_checkpoint import CheckpointManager
 from internlm.utils.parallel import get_parallel_log_file_name
 from internlm.utils.simple_memory_profiler import SimpleMemoryProfiler
 from internlm.utils.writer import Writer
+from internlm.utils.common import get_current_device
 
 # global llm logger
 logger = get_logger(__file__)
@@ -93,9 +94,9 @@ def main(args):
 
     # get and broadcast current time
     current_time = launch_time()
-    objs = [current_time]
-    dist.broadcast_object_list(objs, src=0)
-    current_time = objs[0]
+    # objs = [current_time]
+    # dist.broadcast_object_list(objs, src=0)
+    # current_time = objs[0]
 
     # initialize customed llm logger
     uniscale_logger = initialize_llm_logger(start_time=current_time)
@@ -152,7 +153,7 @@ def main(args):
 
     # initialize metric for calculating accuracy and perplexity
     metric = AccPerplex(
-        device=internlm_accelerator.current_device(),
+        device=get_current_device(),
         tp_pg=gpc.get_group(ParallelMode.TENSOR),
         dp_pg=gpc.get_group(ParallelMode.DATA),
         dataset_types=dataset_types,
@@ -302,7 +303,7 @@ def main(args):
                 prof.step()
 
             # torch.cuda.memory._dump_snapshot(f"my_snapshot_{gpc.get_global_rank()}.pickle")
-            torch.cuda.reset_peak_memory_stats()
+            # torch.cuda.reset_peak_memory_stats()
 
     ckpt_manager.wait_async_upload_finish()
 
