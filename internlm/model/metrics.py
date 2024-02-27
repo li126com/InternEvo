@@ -1,11 +1,13 @@
-from typing import List
+from typing import Callable, List, Optional
 
 import torch
-from flash_attn.losses.cross_entropy import CrossEntropyLoss as FlashCrossEntropyLoss
+from torch import nn
 from torch_scatter import scatter
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
+from internlm.utils.common import SchedulerHook
+from internlm.utils.megatron_timers import megatron_timer as timer
 
 
 class AccPerplex:
@@ -208,9 +210,16 @@ class LossWithTypeId:
             self.ds_loss = torch.zeros(self.total_type_count, dtype=torch.float, device=device)
             self.ds_token_num = torch.zeros(self.total_type_count, dtype=torch.float, device=device)
 
-        self.loss_fn = FlashCrossEntropyLoss(
-            reduction="none", inplace_backward=True, process_group=gpc.get_group(ParallelMode.TENSOR)
-        )
+        if gpc.config.model.use_flash_attn:
+            from flash_attn.losses.cross_entropy import (
+                CrossEntropyLoss as FlashCrossEntropyLoss,
+            )
+
+            self.loss_fn = FlashCrossEntropyLoss(
+                reduction="none", inplace_backward=True, process_group=gpc.get_group(ParallelMode.TENSOR)
+            )
+        else:
+            self.loss_fn = nn.CrossEntropyLoss(reduction="none")
 
     def update(self, logits, labels, type_ids=None):
         with torch.no_grad():
@@ -268,3 +277,41 @@ class LossWithTypeId:
                 self.ds_token_num.fill_(0.0)
 
         return res
+
+
+class SchedulerMetricHook(SchedulerHook):
+    """
+    Scheduler Metric Hook.
+    """
+
+    def __init__(self, metric: Optional[Callable] = None, skip: bool = False) -> None:
+        self._post_func = metric
+        self._skip = skip
+
+    def before_forward(self, scheduler, inputs) -> None:
+        if not self._skip:
+            timer("fwd").start()
+
+    def after_forward(self, scheduler, outputs) -> None:
+        if not self._skip:
+            timer("fwd").stop()
+
+    def before_criterion(self, scheduler, outputs, label) -> None:
+        if not self._skip:
+            timer("cal_loss").start()
+
+    def after_criterion(self, scheduler, loss) -> None:
+        if not self._skip:
+            timer("cal_loss").stop()
+
+    def before_backward(self, scheduler, outputs, outputs_grad) -> None:
+        if not self._skip:
+            timer("bwd").start()
+
+    def after_backward(self, scheduler, inputs_grad) -> None:
+        if not self._skip:
+            timer("bwd").stop()
+
+    def post_helper_func(self, scheduler, outputs, label) -> None:
+        if self._post_func is not None:
+            self._post_func(outputs, label)

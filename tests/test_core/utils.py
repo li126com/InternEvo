@@ -11,12 +11,8 @@ from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.engine import Engine
 from internlm.core.gradient_handler import PipelineSharedModuleGradientHandler
-from internlm.core.scheduler import (
-    InterleavedPipelineScheduler,
-    NonPipelineScheduler,
-    PipelineScheduler,
-    SchedulerMetricHook,
-)
+from internlm.core.scheduler import InterleavedPipelineScheduler, NonPipelineScheduler, PipelineScheduler
+from internlm.model.metrics import SchedulerMetricHook
 from internlm.solver.pipeline_utils import partition_uniform
 from internlm.train import initialize_optimizer
 
@@ -160,7 +156,6 @@ def build_environment(rank, world_size, config):
 
 
 def loose_close(a, b, dtype: torch.dtype = torch.float32):
-
     if dtype is torch.float32:
         rtol = 1.3e-6
         atol = 1e-5

@@ -6,15 +6,17 @@
 from typing import Any, Callable, Iterable, List, Optional
 
 import torch
+import torch.distributed as dist
 
 from internlm.accelerator import internlm_accelerator
+from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.engine import Engine
-from internlm.utils.common import conditional_context
+from internlm.utils.common import SchedulerHook, conditional_context
 from internlm.utils.logger import get_logger
 from internlm.utils.timeout import llm_timeout
 
-from .base_scheduler import BaseScheduler, SchedulerHook
+from .base_scheduler import BaseScheduler
 
 logger = get_logger(__file__)
 
@@ -91,6 +93,7 @@ class NonPipelineScheduler(BaseScheduler):
         engine: Engine,
         forward_only: bool = False,
         return_loss: bool = True,
+        return_output: bool = False,
         scale_loss: int = 1,
     ):
         """Trains one batch of data.
@@ -102,6 +105,7 @@ class NonPipelineScheduler(BaseScheduler):
             forward_only (bool, optional): If True, the model is run for the forward pass, else back propagation will
                 be executed.
             return_loss (bool, optional): Loss will be returned if True.
+            return_output (bool, optional): Output will be returned if True.
             scale_loss (int, optional): The scale factor for the loss.
         """
 
@@ -128,9 +132,17 @@ class NonPipelineScheduler(BaseScheduler):
                         0.0, device=internlm_accelerator.current_device(), dtype=gpc.config.model.get("dtype")
                     )
                 )
+                # the moe_loss is computed among the "tensor" group if sequence parallel is enabled,
+                # so we need to do allreduce
+                if gpc.config.parallel.sequence_parallel:
+                    dist.all_reduce(moe_loss, op=dist.ReduceOp.AVG, group=gpc.get_group(ParallelMode.TENSOR))
                 moe_loss /= scale_loss
                 loss /= scale_loss
                 loss += moe_loss
+
+        # clear output before backward for releasing memory resource
+        if not return_output:
+            output = None
 
         # backward
         if not forward_only:
@@ -194,7 +206,7 @@ class NonPipelineScheduler(BaseScheduler):
             _data, _label = self._load_accum_batch(data, label)
 
             _output, _loss, _moe_loss = self._train_one_batch(
-                _data, _label, engine, forward_only, return_loss, self._grad_accum_size
+                _data, _label, engine, forward_only, return_loss, return_output_label, self._grad_accum_size
             )
 
             if return_loss:

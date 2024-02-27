@@ -3,41 +3,283 @@
 
 import math
 import warnings
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
+from torch import Tensor, nn
+from torch.nn import Module
 
-try:
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_func
-except ImportError:
-    try:
-        from flash_attn.flash_attn_interface import (
-            flash_attn_unpadded_kvpacked_func as flash_attn_unpadded_func,
-        )
-    except ImportError:
-        try:
-            from flash_attn.flash_attn_interface import (
-                flash_attn_varlen_kvpacked_func as flash_attn_unpadded_func,
-            )
-        except ImportError:
-            raise ImportError("Please check your flash_attn version >= 1.0.5.")
-
-from flash_attn.modules.mha import (
-    CrossAttention,
-    FlashCrossAttention,
-    FlashSelfAttention,
-    SelfAttention,
-    _update_kv_cache,
-)
-from torch import nn
-
-from internlm.accelerator import internlm_accelerator
-from internlm.core.context import IS_TENSOR_PARALLEL, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.embedding import DynamicNTKScalingRotaryEmbedding, RotaryEmbedding
-from internlm.model.linear import ColumnParallelLinearTorch, RowParallelLinearTorch
+from internlm.model.linear import get_linear_cls
+
+
+# adpated from https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/sequence/layer.py
+class _SeqAllToAll(torch.autograd.Function):
+    "sequence alltoall"
+
+    @staticmethod
+    def forward(ctx: Any, group: dist.ProcessGroup, input_: Tensor, scatter_idx: int, gather_idx: int) -> Tensor:
+        ctx.group = group
+        ctx.scatter_idx = scatter_idx
+        ctx.gather_idx = gather_idx
+
+        seq_world_size = dist.get_world_size(group)
+
+        input_list = [t.contiguous() for t in torch.tensor_split(input_, seq_world_size, scatter_idx)]
+        output_list = [torch.empty_like(input_list[0]) for _ in range(seq_world_size)]
+        # TODO Use all_to_all_single instead
+        dist.all_to_all(output_list, input_list, group=group)
+        return torch.cat(output_list, dim=gather_idx).contiguous()
+
+    @staticmethod
+    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+        return (None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None)
+
+
+# adpated from https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/sequence/layer.py
+class DistributedAttention(torch.nn.Module):
+    """Initialization.
+
+    Arguments:
+        local_attention (Module): local attention with q,k,v
+        sequence_process_group (ProcessGroup): sequence parallel process group
+        first_scatter_idx (int): scatter_idx for the first all2all comm
+        first_gather_idx (int): gather_idx for the first all2all comm
+        second_scatter_idx (int): scatter_idx for the second all2all comm
+        second_gather_idx (int): gather_idx for the second all2all comm
+    """
+
+    def __init__(
+        self,
+        local_attention: Module,
+        sequence_process_group: dist.ProcessGroup,
+    ) -> None:
+        super().__init__()
+        self.local_attn = local_attention
+        self.spg = sequence_process_group
+        self._scatter_gather_idx = {}
+
+        # scatter_gather_idx contains the scatter and gather index for different data packed mode
+        # key is the data packed mode, which should be in ['qkv', 'kv', 'q', 'output']
+        # value is the scatter and gather index in all2all
+        self._scatter_gather_idx["qkv"] = [2, 0]  # qkv shape:[sequence, 3, head, head_dim]
+        self._scatter_gather_idx["kv"] = [2, 0]  # kv shape: [sequence, 2, head, head_dim]
+        self._scatter_gather_idx["q"] = [1, 0]  # q/k/v shape: [sequence, head, head_dim]
+        self._scatter_gather_idx["output"] = [0, 1]  # output shape: [sequence, head, head_dim]
+
+    def forward(
+        self, qkv: Tensor = None, kv: Tensor = None, q: Tensor = None, k: Tensor = None, v: Tensor = None, **kwargs: Any
+    ) -> Tensor:
+        if gpc.is_evaluating is True:
+            # when conducting evaluation, the scatter and gather index should add 1.
+            eval_scatter_gather_idx = {key: [x + 1 for x in value] for key, value in self._scatter_gather_idx.items()}
+            return self._forward(qkv=qkv, kv=kv, q=q, k=k, v=v, scatter_gather=eval_scatter_gather_idx, **kwargs)
+        else:
+            return self._forward(qkv=qkv, kv=kv, q=q, k=k, v=v, scatter_gather=self._scatter_gather_idx, **kwargs)
+
+    def _forward(
+        self,
+        qkv: Tensor = None,
+        kv: Tensor = None,
+        q: Tensor = None,
+        k: Tensor = None,
+        v: Tensor = None,
+        scatter_gather: dict = None,
+        **kwargs: Any,
+    ) -> Tensor:
+        """forward
+
+        Arguments:
+            qkv (Tensor): packed qkv input to the layer
+            kv (Tensor): packed kv input to the layer
+            q (Tensor): q input to the layer
+            k (Tensor): k input to the layer
+            v (Tensor): v input to the layer
+            args: other args
+
+        Returns:
+            * output (Tensor): context output
+        """
+
+        if qkv is not None:
+            qkv = _SeqAllToAll.apply(self.spg, qkv, scatter_gather["qkv"][0], scatter_gather["qkv"][1])
+            context_layer = self.local_attn(qkv, **kwargs)
+        elif kv is not None:
+            q = _SeqAllToAll.apply(self.spg, q, scatter_gather["q"][0], scatter_gather["q"][1])
+            kv = _SeqAllToAll.apply(self.spg, kv, scatter_gather["kv"][0], scatter_gather["kv"][1])
+            context_layer = self.local_attn(q, kv, **kwargs)
+        else:
+            q = _SeqAllToAll.apply(self.spg, q, scatter_gather["q"][0], scatter_gather["q"][1])
+            k = _SeqAllToAll.apply(self.spg, k, scatter_gather["q"][0], scatter_gather["q"][1])
+            v = _SeqAllToAll.apply(self.spg, v, scatter_gather["q"][0], scatter_gather["q"][1])
+            context_layer = self.local_attn(q, k, v, **kwargs)
+        output = _SeqAllToAll.apply(self.spg, context_layer, scatter_gather["output"][0], scatter_gather["output"][1])
+
+        # out e.g., [s/p::h]
+        return output
+
+
+class SelfAttention(nn.Module):
+    """Implement the scaled dot product attention with softmax.
+    Arguments
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                      (default: 1/sqrt(d_keys) where d_keys is computed at
+                      runtime)
+        attention_dropout: The dropout rate to apply to the attention
+                           (default: 0.0)
+    """
+
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+        super().__init__()
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        self.drop = nn.Dropout(attention_dropout)
+
+    def forward(self, qkv, causal=None, key_padding_mask=None):
+        """Implements the multihead softmax attention.
+        Arguments
+        ---------
+            qkv: The tensor containing the query, key, and value. (B, S, 3, H, D)
+            causal: if passed, will override self.causal
+            key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
+                False means to mask out. (B, S)
+        """
+        batch_size, seqlen = qkv.shape[0], qkv.shape[1]
+        causal = self.causal if causal is None else causal
+        q, k, v = qkv.unbind(dim=2)
+        softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
+        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+        if key_padding_mask is not None:
+            padding_mask = torch.full((batch_size, seqlen), -10000.0, dtype=scores.dtype, device=scores.device)
+            padding_mask.masked_fill_(key_padding_mask, 0.0)
+            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
+            scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
+        if causal:
+            # "triu_tril_cuda_template" not implemented for 'BFloat16'
+            # So we have to construct the mask in float
+            causal_mask = torch.triu(torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1)
+            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
+            scores = scores + causal_mask.to(dtype=scores.dtype)
+        attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
+        attention_drop = self.drop(attention)
+        output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+        return output
+
+
+class CrossAttention(nn.Module):
+    """Implement the scaled dot product attention with softmax.
+    Arguments
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                      (default: 1/sqrt(d_keys) where d_keys is computed at
+                      runtime)
+        attention_dropout: The dropout rate to apply to the attention
+                           (default: 0.0)
+    """
+
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+        super().__init__()
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        self.drop = nn.Dropout(attention_dropout)
+
+    def forward(self, q, kv, causal=None, key_padding_mask=None):
+        """Implements the multihead softmax attention.
+        Arguments
+        ---------
+            q: The tensor containing the query. (B, Sq, H, D)
+            kv: The tensor containing the key and value. (B, Sk, 2, H_k, D)
+            causal: if passed, will override self.causal
+            key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
+                False means to mask out. (B, Sk)
+        """
+        batch_size, seqlen_q = q.shape[0], q.shape[1]
+        causal = self.causal if causal is None else causal
+        seqlen_k = kv.shape[1]
+        assert kv.shape[0] == batch_size and kv.shape[4] == q.shape[3]
+        if kv.shape[3] != q.shape[2]:  # MQA/GQA
+            kv = repeat(kv, "... hkv d -> ... (hkv g) d", g=q.shape[2] // kv.shape[3])
+        k, v = kv.unbind(dim=2)
+        softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
+        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+        if key_padding_mask is not None:
+            padding_mask = torch.full((batch_size, seqlen_k), -10000.0, dtype=scores.dtype, device=scores.device)
+            padding_mask.masked_fill_(key_padding_mask, 0.0)
+            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
+            scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
+        if causal:
+            # causal mask needs to take into account the difference between seqlen_q and seqlen_k
+            row_idx = rearrange(torch.arange(seqlen_q, device=q.device, dtype=torch.long), "s -> s 1")
+            col_idx = torch.arange(seqlen_k, device=kv.device, dtype=torch.long)
+            sk = seqlen_k if key_padding_mask is None else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+            causal_mask = col_idx > row_idx + sk - seqlen_q
+            scores = scores.masked_fill(causal_mask, -10000.0)
+        attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
+        attention_drop = self.drop(attention)
+        output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+        return output
+
+
+def _update_kv_cache(kv, inference_params, layer_idx):
+    """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
+    # Pre-allocate memory for key-values for inference.
+    num_heads, head_dim = kv.shape[-2:]
+    if layer_idx not in inference_params.key_value_memory_dict:
+        kv_cache = torch.empty(
+            inference_params.max_batch_size,
+            inference_params.max_sequence_len,
+            2,
+            num_heads,
+            head_dim,
+            dtype=kv.dtype,
+            device=kv.device,
+        )
+        inference_params.key_value_memory_dict[layer_idx] = kv_cache
+    else:
+        if not inference_params.fused_ft_kernel:
+            kv_cache = inference_params.key_value_memory_dict[layer_idx]
+        else:
+            # For FT, k_cache has shape (b, h, headdim / packsize, s, packsize)
+            # where packsize = 4 if fp32, 8 if fp16 or bf16.
+            # v_cache has shape (b, h, s, headdim)
+            k_cache, v_cache = inference_params.key_value_memory_dict[layer_idx]
+            kv_cache = None
+    # Adjust key and value for inference
+    batch_start = inference_params.batch_size_offset
+    batch_end = batch_start + kv.shape[0]
+    sequence_start = inference_params.sequence_len_offset
+    sequence_end = sequence_start + kv.shape[1]
+    assert batch_end <= (kv_cache.shape[0] if kv_cache is not None else v_cache.shape[0])
+    assert sequence_end <= (kv_cache.shape[1] if kv_cache is not None else v_cache.shape[2])
+    # Copy key and values.
+    if not inference_params.fused_ft_kernel:
+        assert kv_cache is not None
+        kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+        kv = kv_cache[batch_start:batch_end, :sequence_end, ...]
+        return kv
+    else:
+        assert inference_params.sequence_len_offset == 0
+        # FT kernel requires different layouts for the k_cache and v_cache.
+        assert kv.dtype in [torch.float16, torch.bfloat16, torch.float32]
+        packsize = 4 if kv.dtype == torch.float32 else 8
+        if kv_cache is not None:
+            kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+            k_cache = rearrange(
+                kv_cache[:, :, 0], "b s h (d packsize) -> b h d s packsize", packsize=packsize
+            ).contiguous()
+            v_cache = rearrange(kv_cache[:, :, 1], "b s h d -> b h s d").contiguous()
+            inference_params.key_value_memory_dict[layer_idx] = (k_cache, v_cache)
+        else:
+            k_cache[batch_start:batch_end, :, :, :sequence_end, :] = rearrange(
+                kv[:, :, 0], "b s h (d packsize) -> b h d s packsize", packsize=packsize
+            )
+            v_cache[batch_start:batch_end, :, :sequence_end, :] = rearrange(kv[:, :, 1], "b s h d -> b h s d")
+        return kv
 
 
 class MHA(nn.Module):
@@ -48,23 +290,19 @@ class MHA(nn.Module):
         embed_dim (int): The dimention of hidden state.
         num_heads (int): The number of attention heads.
         process_group (torch.distributed.ProcessGroup): The group of the current device for `parallel_mode`.
-        bias (boolean): Whether the bias is needed for linears. Will be used when initializing QKV matrix and
-                        output projection. True by default.
+        max_position_embeddings (int): max position embeddings, 2048 by default.
         dropout (float): The dropout rate for cross attention and self attention. 0.0 by default.
         softmax_scale (float): The temperature to use for the softmax attention.
         causal (boolean): Whether to apply causal attention mask. False by default.
         layer_idx (int): The index of current layer. None by default.
+        use_dynamic_ntk_rope (bool): whether use dynamic ntk rope, false by default.
         rotary_emb_dim (int): The dimention of Rotary Embedding. 0 by default.
         rotary_emb_scale_base (int): The scaling factor of Rotary Embedding. If scale_base > 0, this implements
                                     XPos(Sun et al., https://arxiv.org/abs/2212.10554). 0 by default.
-        use_flash_attn (boolean): Whether to use flash attention or not.If False, vanilla attention module will be used.
-                                    False by default.
-        sequence_parallel (boolean): If True, we're doing Tensor Parallel with sequence parallelism. An all_gather_raw
-                                    of x will be done before doing the matmul.
-        device (Optional[Union[str, torch.device]]): The device will be used.
-        dtype (Optional[torch.dtype]): The type of data.
         use_flash_attn (bool): Whether to use flash-attn. True by default.
         rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
+        device (Optional[Union[str, torch.device]]): The device will be used.
+        dtype (Optional[torch.dtype]): The type of data.
 
     """
 
@@ -73,6 +311,7 @@ class MHA(nn.Module):
         embed_dim: int,
         num_heads: int,
         process_group: Optional[torch.distributed.ProcessGroup],
+        sequence_process_group: Optional[torch.distributed.ProcessGroup],
         max_position_embeddings: int = 2048,
         dropout: float = 0.0,
         softmax_scale: float = None,
@@ -85,6 +324,7 @@ class MHA(nn.Module):
         rope_base: int = 10000,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        tp_mode: str = "mtp",
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -98,6 +338,7 @@ class MHA(nn.Module):
         self.num_heads = num_heads
         assert self.embed_dim % num_heads == 0, "self.kdim must be divisible by num_heads"
         self.head_dim = self.embed_dim // num_heads
+        self.tp_mode = tp_mode
 
         if self.rotary_emb_dim > 0:
             if self.use_dynamic_ntk_rope:
@@ -115,7 +356,8 @@ class MHA(nn.Module):
                 )
 
         # notice here should change bias=True
-        self.Wqkv = ColumnParallelLinearTorch(
+        Wqkv_cls = get_linear_cls(self.tp_mode, "column")
+        self.Wqkv = Wqkv_cls(
             embed_dim,
             3 * embed_dim,
             process_group,
@@ -124,26 +366,34 @@ class MHA(nn.Module):
             **factory_kwargs,
         )  # according to https://spaces.ac.cn/archives/9577
 
-        inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
-        inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
+        if gpc.config.model.use_flash_attn:
+            from flash_attn.modules.mha import FlashCrossAttention, FlashSelfAttention
+
+            inner_attn_cls = FlashSelfAttention
+            inner_cross_attn_cls = FlashCrossAttention
+        else:
+            inner_attn_cls = SelfAttention
+            inner_cross_attn_cls = CrossAttention
         self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout)
         self.inner_cross_attn = inner_cross_attn_cls(
             causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
         )
+        if self.tp_mode == "isp":
+            self.inner_attn = DistributedAttention(self.inner_attn, sequence_process_group=sequence_process_group)
+            self.inner_cross_attn = DistributedAttention(
+                self.inner_cross_attn, sequence_process_group=sequence_process_group
+            )
 
         # output projection always have the bias (for now)
-        self.out_proj = RowParallelLinearTorch(
+        out_proj_cls = get_linear_cls(self.tp_mode, "row")
+        self.out_proj = out_proj_cls(
             embed_dim,
             embed_dim,
             process_group,
+            bias=True,
             sequence_parallel=gpc.config.parallel.sequence_parallel,
             **factory_kwargs,
         )
-        # need to assign tp attribute so that internlm know it is tensor parallel module
-        if gpc.get_world_size(ParallelMode.TENSOR) > 1:
-            for name in ["out_proj", "Wqkv"]:
-                for param in getattr(self, name).parameters():
-                    setattr(param, IS_TENSOR_PARALLEL, True)
 
     def forward(self, x, seqlen=None, inference_params=None, **kwargs):
         if kwargs.get("indexes", None) is not None:
@@ -208,6 +458,8 @@ class MHA(nn.Module):
                 q, k, v = (x.squeeze(2) for x in qkv.chunk(chunks=3, dim=2))
                 kv = torch.stack([k, v], dim=2)
                 assert self.rotary_emb_dim > 0, "You should use rotary_emb."
+                cu_seqlens = kwargs.get("cu_seqlens", None)
+                max_seqlen = kwargs.get("max_seqlen", None)
 
                 if hasattr(inference_params, "attention_mask") and inference_params.attention_mask is not None:
                     empties = inference_params.attention_mask[..., -1].sum(dim=-1)
@@ -240,12 +492,16 @@ class MHA(nn.Module):
                             inference_params.sequence_len_offset
                             * torch.ones(q.size(0), dtype=torch.int, device=q.device)
                             - empties,
+                            cu_seqlens=cu_seqlens,
+                            max_seqlen=max_seqlen,
                         ).unsqueeze(1)
                         k = self.rotary_emb._single_forward(
                             k,
                             inference_params.sequence_len_offset
                             * torch.ones(k.size(0), dtype=torch.int, device=k.device)
                             - empties,
+                            cu_seqlens=cu_seqlens,
+                            max_seqlen=max_seqlen,
                         ).unsqueeze(1)
                     else:
                         q = q.squeeze(1)
@@ -254,6 +510,8 @@ class MHA(nn.Module):
                             inference_params.sequence_len_offset
                             * torch.ones(q.size(0), dtype=torch.int, device=q.device)
                             - empties,
+                            cu_seqlens=cu_seqlens,
+                            max_seqlen=max_seqlen,
                         ).unsqueeze(1)
                         moved_k = k.clone()
                         for i in range(len(empties)):
@@ -266,8 +524,12 @@ class MHA(nn.Module):
                             else:
                                 k[i] = moved_k[i]
                 else:
-                    q = self.rotary_emb._single_forward(q, inference_params.sequence_len_offset)
-                    k = self.rotary_emb._single_forward(k, inference_params.sequence_len_offset)
+                    q = self.rotary_emb._single_forward(
+                        q, inference_params.sequence_len_offset, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                    )
+                    k = self.rotary_emb._single_forward(
+                        k, inference_params.sequence_len_offset, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                    )
 
                 kv = torch.stack([k, v], dim=2)
                 kv = _update_kv_cache(kv, inference_params, self.layer_idx)
@@ -301,9 +563,40 @@ class MHA(nn.Module):
                             if total_kv.dtype not in [torch.float16, torch.bfloat16]:
                                 total_kv = total_kv.to(torch.bfloat16)
 
-                    output = flash_attn_unpadded_func(
-                        total_q, total_kv, cu_seqlens, cu_seqlens, max_seqlen_q, max_seqlen_k, 0.0, None, True, False
-                    ).to(x.dtype)
+                    if gpc.config.model.use_flash_attn:
+                        try:
+                            from flash_attn.flash_attn_interface import (
+                                flash_attn_unpadded_func,
+                            )
+                        except ImportError:
+                            try:
+                                from flash_attn.flash_attn_interface import (
+                                    flash_attn_unpadded_kvpacked_func as flash_attn_unpadded_func,
+                                )
+                            except ImportError:
+                                try:
+                                    from flash_attn.flash_attn_interface import (
+                                        flash_attn_varlen_kvpacked_func as flash_attn_unpadded_func,
+                                    )
+                                except ImportError:
+                                    raise ImportError("Please check your flash_attn version >= 1.0.5.")
+
+                        output = flash_attn_unpadded_func(
+                            total_q,
+                            total_kv,
+                            cu_seqlens,
+                            cu_seqlens,
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            0.0,
+                            None,
+                            True,
+                            False,
+                        ).to(x.dtype)
+                    else:
+                        attn_scores = torch.matmul(total_q, total_kv.transpose(-2, -1)) / (cu_seqlens**0.5)
+                        attn_weights = F.softmax(attn_scores, dim=-1)
+                        output = torch.matmul(attn_weights, total_kv)
 
                     context = torch.zeros_like(q)
                     context = context.masked_scatter_(attn_mask4flsh.view(bsz, -1, 1, 1), output)
@@ -350,7 +643,6 @@ class MHA(nn.Module):
         qkv = rearrange(qkv, "t (three h d) -> t three h d", three=3, d=self.head_dim)  # total x 3 x n_head x d
         qkv = self.rotary_emb(qkv, **kwargs)
         kwargs.pop("indexes")
-
         if inference_params is None:
             if gpc.config.model.dtype is torch.float32 and gpc.config.model.use_flash_attn:
                 with internlm_accelerator.amp.autocast(dtype=torch.bfloat16):
@@ -365,4 +657,5 @@ class MHA(nn.Module):
 
         context = rearrange(context, "b h d -> b (h d)")  # recover the shape
         out = self.out_proj(context)
+
         return out

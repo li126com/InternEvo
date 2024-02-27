@@ -7,9 +7,9 @@ import socket
 
 import torch
 import torch.distributed as dist
-from flash_attn.modules.mha import FlashSelfAttention, SelfAttention
 from torch.utils import benchmark
 
+from internlm.model.multi_head_attention import SelfAttention
 from internlm.monitor import send_alert_message
 from internlm.utils.logger import get_logger
 from internlm.utils.megatron_timers import megatron_timer as timer
@@ -49,7 +49,7 @@ def empty_cache_and_diag(batch_count, interval=50):
                 logger.info("Empty Cache and Diagnosis GPU/NCCL/Timer ...")
             with torch.no_grad():
                 timer_diagnosis()
-                bench_gpu()
+                bench_gpu(gpc.config.model.use_flash_attn)
                 # FIXME: Runtime benchmark diagnosis can easily cause the training process
                 # to exit due to NCCL errors.
                 # bench_net()
@@ -237,7 +237,13 @@ def bench_gpu(use_flash_attn=True):
     batch_size, seqlen = 2, 1024
     nheads = dim // headdim
 
-    inner_attn = FlashSelfAttention if use_flash_attn else SelfAttention
+    if use_flash_attn:
+        from flash_attn.modules.mha import FlashSelfAttention
+
+        inner_attn = FlashSelfAttention
+    else:
+        inner_attn = SelfAttention
+
     inner_attn = inner_attn(causal=True, softmax_scale=None, attention_dropout=0)
 
     qkv = torch.randn(
@@ -272,11 +278,6 @@ def bench_gpu(use_flash_attn=True):
         )
 
 
-"""
-Useful utility functions migrated from deepseped.
-"""
-
-
 def warmup_process_group():
     # Prevent OOM from nccl communication.
     if dist.is_initialized():
@@ -304,6 +305,10 @@ def warmup_process_group():
 
 
 def cuda_memory_analyze(step=0, print_mm_suage=False):
+    """
+    Useful utility functions migrated from deepseped.
+    """
+
     global n_caching_allocator_flushes
     internlm_accelerator.synchronize()
 
