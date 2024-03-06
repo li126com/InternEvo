@@ -40,7 +40,7 @@ def get_master_node():
 
 def move_norm_to_cuda(norm: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
     if torch.is_tensor(norm) and norm.device.type != "cuda":
-        norm = norm.to(internlm_accelerator.current_device())
+        norm = norm.to(get_current_device())
     return norm
 
 
@@ -88,7 +88,7 @@ def get_tensor_norm(norm: Union[float, torch.Tensor], move_to_cuda) -> torch.Ten
     if isinstance(norm, float):
         norm = torch.Tensor([norm])
     if move_to_cuda:
-        norm = norm.to(internlm_accelerator.current_device())
+        norm = norm.to(get_current_device())
     return norm
 
 
@@ -98,7 +98,7 @@ def get_current_device() -> torch.device:
     If cuda available, return gpu, otherwise return cpu.
     """
     if internlm_accelerator.is_available():
-        return torch.device(f"cuda:{internlm_accelerator.current_device()}")
+        return torch.device(f"{internlm_accelerator.current_device_name()}")
     else:
         return torch.device("cpu")
 
@@ -236,7 +236,7 @@ def get_megatron_flops(
 
 
 def enable_pytorch_expandable_segments():
-    if torch.__version__ >= "2.1.0":
+    if torch.__version__ >= "2.1.0" and "cuda" in internlm_accelerator.current_device_name():
         _alloc_setting = "expandable_segments:True"
         if os.getenv("PYTORCH_CUDA_ALLOC_CONF", None) is not None:
             _alloc_setting = os.getenv("PYTORCH_CUDA_ALLOC_CONF") + "," + _alloc_setting

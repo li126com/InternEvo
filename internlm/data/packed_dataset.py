@@ -370,6 +370,7 @@ def get_packed_dataset_without_short_length(
     """
 
     assert os.path.exists(folder), f"{folder} does not exist."
+    print(f"load_data_folder: {folder}", flush=True)
     datasets = []
     delete_samples = 0
 

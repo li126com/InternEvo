@@ -70,7 +70,7 @@ def benchmark_forward(
     """Use Pytorch Benchmark on the forward pass of an arbitrary function."""
 
     def amp_wrapper(*inputs, **kwinputs):
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp):
+        with torch.autocast(device_type="npu", dtype=amp_dtype, enabled=amp):
             test_fn(*inputs, **kwinputs)
 
     bench_timer = benchmark.Timer(
@@ -281,7 +281,7 @@ def bench_gpu(use_flash_attn=True):
 def warmup_process_group():
     # Prevent OOM from nccl communication.
     if dist.is_initialized():
-        buffer = torch.ones([64]).cuda()
+        buffer = torch.ones([64]).to(device=get_current_device())
         if gpc.is_initialized(ParallelMode.DATA):
             dist.all_reduce(buffer, group=gpc.get_group(ParallelMode.DATA))
         if gpc.is_initialized(ParallelMode.TENSOR):

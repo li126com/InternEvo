@@ -450,7 +450,7 @@ def launch(
     gpc.load_config(config)
 
     # init default process group
-    gpc.init_global_dist(rank, world_size, backend, host, port)
+    gpc.init_global_dist(rank, world_size, "hccl", host, port)
 
     # init process groups for different parallel modes from config
     gpc.init_parallel_groups()

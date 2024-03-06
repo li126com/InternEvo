@@ -385,6 +385,7 @@ def get_train_data_loader(num_worker: int = 0, dataset_generate_func: Optional[C
     else:
         if train_folder is None:
             dataset_types = ["en", "cn", "code"]
+            # dataset_types = None
             train_ds = RandomDataset(num_samples=1000000, max_len=data_cfg.seq_len)
             if data_cfg.pack_sample_into_one:
                 train_ds = PackedDatasetWithoutCuSeqlen(

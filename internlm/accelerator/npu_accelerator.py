@@ -10,7 +10,7 @@ except ImportError:
 class ASCEND_Accelerator(Accelerator):
     def __init__(self) -> None:
         self._name = "npu"
-        self._communication_backend_name = "nccl"
+        self._communication_backend_name = "hccl"
 
     # Device APIs
     def device_name(self, device_index=None):
@@ -202,3 +202,6 @@ class ASCEND_Accelerator(Accelerator):
 
     def return_custom_bwd(self):
         return torch.npu.amp.custom_bwd
+
+    def return_custom_fwd(self):
+        return torch.npu.amp.custom_fwd
