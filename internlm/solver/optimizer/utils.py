@@ -72,10 +72,10 @@ def get_grad_accumulate_object(tensor):
 
 def split_half_float_double(tensor_list):
     dtype_buckets = {
-        "internlm_accelerator.HalfTensor": [],
-        "internlm_accelerator.FloatTensor": [],
-        "internlm_accelerator.DoubleTensor": [],
-        "internlm_accelerator.BFloat16Tensor": [],
+        f"torch.{internlm_accelerator._name}.HalfTensor": [],
+        f"torch.{internlm_accelerator._name}.FloatTensor": [],
+        f"torch.{internlm_accelerator._name}.DoubleTensor": [],
+        f"torch.{internlm_accelerator._name}.BFloat16Tensor": [],
     }
 
     for t in tensor_list:
