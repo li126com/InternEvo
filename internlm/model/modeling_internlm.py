@@ -181,15 +181,15 @@ class PackedFlashBaseLayer1D(nn.Module):
                     else:
                         normal_(std=0.006 if "fc1" in name else 0.0015)(param.data)
 
-    def forward(self, hidden_states, cu_seqlens=None, indexes=None, inference_params=None, max_seqlen=None):
+    def forward(self, hidden_states, cu_seqlens=None, indexes=None, inference_params=None, max_seqlen=None, attention_mask=None):
         if self.checkpoint and self.training:
             return activation_checkpoint(
-                self._forward, False, hidden_states, cu_seqlens, indexes, inference_params, max_seqlen
+                self._forward, False, hidden_states, cu_seqlens, indexes, inference_params, max_seqlen, attention_mask
             )
         else:
-            return self._forward(hidden_states, cu_seqlens, indexes, inference_params, max_seqlen)
+            return self._forward(hidden_states, cu_seqlens, indexes, inference_params, max_seqlen, attention_mask)
 
-    def _forward(self, hidden_states=None, cu_seqlens=None, indexes=None, inference_params=None, max_seqlen=None):
+    def _forward(self, hidden_states=None, cu_seqlens=None, indexes=None, inference_params=None, max_seqlen=None, attention_mask=None):
         r"""Pass the input through the encoder layer.
 
         Args:
@@ -203,6 +203,7 @@ class PackedFlashBaseLayer1D(nn.Module):
             "max_seqlen": max_seqlen,
             "indexes": indexes,
             "inference_params": inference_params,
+            "attention_mask": attention_mask,
         }
 
         def _dropout_and_norm_attn(_hidden_states):
@@ -299,6 +300,7 @@ class PackedFlashInternLm1D(nn.Module):
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
         use_flash_attn: bool = True,
+        use_flash_attn_npu: bool = False,
         rope_base: int = 10000,
     ):
         super().__init__()
@@ -383,8 +385,11 @@ class PackedFlashInternLm1D(nn.Module):
 
         self.parallel_output = parallel_output
 
-    def forward(self, hidden_states=None, cu_seqlens=None, input_ids=None, indexes=None, inference_params=None):
+    def forward(self, hidden_states=None, cu_seqlens=None, input_ids=None, indexes=None, inference_params=None, attention_mask=None):
         # attention_mask: compute attention on the places where the value is 1
+        if attention_mask is not None:
+            self.attention_mask = attention_mask
+
         if hasattr(self, "embedding"):
             hidden_states = self.embedding(input_ids)
             if self.embed_grad_scale != 1:
@@ -397,6 +402,8 @@ class PackedFlashInternLm1D(nn.Module):
 
         if cu_seqlens is not None:
             cu_seqlens = cu_seqlens.squeeze(0)
+        
+        if cu_seqlens is not None or self.attention_mask is not None:
             hidden_states = hidden_states.squeeze(0)  # If cu_seqlens is passed in，it indicated a packed state，
             # the batch dimension with a size of 1 should be directly squeezed off.
 
@@ -417,6 +424,7 @@ class PackedFlashInternLm1D(nn.Module):
                 indexes=indexes,
                 inference_params=inference_params,
                 max_seqlen=max_seqlen,
+                attention_mask=self.attention_mask,
             )
 
         if hasattr(self, "norm"):
@@ -499,6 +507,7 @@ def build_model_with_cfg(
     use_scaled_init: bool = True,
     use_swiglu: bool = True,
     use_flash_attn: bool = True,
+    use_flash_attn_npu: bool = False,
     rope_base: int = 10000,
 ):
     """
@@ -556,6 +565,7 @@ def build_model_with_cfg(
         use_scaled_init=use_scaled_init,
         use_swiglu=use_swiglu,
         use_flash_attn=use_flash_attn,
+        use_flash_attn_npu=use_flash_attn_npu,
         rope_base=rope_base,
     )
 

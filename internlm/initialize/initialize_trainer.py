@@ -79,7 +79,7 @@ def initialize_trainer(
 
     # initialize scheduler for trainer
     scheduler = None
-    if gpc.config.model.use_flash_attn:
+    if gpc.config.model.use_flash_attn or gpc.config.model.use_flash_attn_npu:
         data_fn = None
     else:
         data_fn = unpack_data

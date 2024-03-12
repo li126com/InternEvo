@@ -113,7 +113,7 @@ def main(args):
     criterion = FlashGPTLMLoss(parallel_output=True, label_smoothing=label_smoothing)
 
     # initialize the train and validation data loader
-    train_dl, dataset_types = get_train_data_loader(num_worker=4)
+    train_dl, dataset_types = get_train_data_loader(num_worker=0)
     val_dls = get_validation_data_loader()
 
     # initialize and resume train state
@@ -216,6 +216,7 @@ def main(args):
             # process data
             if batch[0].get("type_ids", None) is not None:
                 metric.set_current_type_ids(type_ids=batch[0].pop("type_ids", None))
+                # print(f"warning!!! disable set_current_type_ids", flush=True)
 
             # do forward and backward
             timer("fwd-bwd").start()
