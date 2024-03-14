@@ -2,6 +2,7 @@
 # -*- encoding: utf-8 -*-
 
 import torch
+import numpy as np
 
 
 def packed_collate_fn(batch, packed_length):
@@ -116,7 +117,7 @@ def get_ltor_masks_and_position_ids(data,
 
     return attention_mask, loss_mask, position_ids
 
-def packed_collate_fn_npu(batch, packed_length):
+def packed_collate_fn_npu(batch, packed_length, eos_token):
 
     """
     Collate function for packed input sequences.
@@ -139,7 +140,7 @@ def packed_collate_fn_npu(batch, packed_length):
     for b in batch: # micro_num
         assert (
             len(b["tokens"]) * len(b["tokens"][0]) == packed_length
-        ), f"length of a sample should be equal to packed_length, but got {len(b['tokens'])},{len(b['tokens'][0])} and {packed_length})"
+        ), f"length of a sample should be equal to packed_length, but got {len(b['tokens'])},{len(b['tokens'][0])},{len(b['tokens'][1])} and {packed_length})"
         assert (
             len(b["labels"]) * len(b["labels"][0]) == packed_length
         ), f"length of a sample should be equal to packed_length, but got {len(b['labels'])},{len(b['labels'][0])} and {packed_length})"
@@ -147,42 +148,37 @@ def packed_collate_fn_npu(batch, packed_length):
            len(b["type_ids"]) * len(b["type_ids"][0]) == packed_length
         ), f"length of a sample should be equal to packed_length, but got {len(b['type_ids'])},{len(b['type_ids'][0])} and {packed_length})"
 
-        tokens = [abs(w) for w in b["tokens"]]
-        # labels = [w if w > 0 else -100 for w in b["labels"]]
-        labels = b["labels"]
+        tokens = [abs(np.array(w)) for w in b["tokens"]]
 
+        # labels = [w if w > 0 else -100 for w in b["labels"]]
         xs.append(torch.LongTensor(tokens))
         # The labels have been shifted here, so they are aligned with the output corresponding to the token
-        ys.append(torch.LongTensor(labels))
+        ys.append(torch.LongTensor(b["labels"]))
         ts.append(torch.LongTensor(b["type_ids"]))
         cu_seqlens.append(torch.IntTensor(b["cu_seqlens"]))
-        indexes.append(torch.LongTensor(b["indexes"]))
+        # indexes.append(torch.LongTensor(b["indexes"]))
 
     attention_mask_micro_num_list = []
     for micro_num_dix in range(len(xs)):
         attention_mask, _, _ = get_ltor_masks_and_position_ids(
             data=xs[micro_num_dix],
-            eod_token=0,
+            eod_token=eos_token,
             reset_position_ids=True,
             reset_attention_mask=True,
             eod_mask_loss=True
         )
+        
         attention_mask_micro_num_list.append(attention_mask)
 
-    # print(f"attention_mask_micro_num_list: {len(attention_mask_micro_num_list)}", flush=True)
-    # print(f"{len(xs)}, {len(xs[0])}")
     xs = torch.nn.utils.rnn.pad_sequence(xs, batch_first=True)
     ys = torch.nn.utils.rnn.pad_sequence(ys, batch_first=True, padding_value=-100)
     ts = torch.nn.utils.rnn.pad_sequence(ts, batch_first=True, padding_value=0)    
     # ts = ts.view(-1, packed_length) # metirc will cut type_ids based on micro_num
-    # print(f"xs: {xs.shape}")
 
-    indexes = torch.stack(indexes, dim=0)
     if len(set(map(len, cu_seqlens))) == 1:  # if has uniform length, then stack to save device transfer time
         cu_seqlens = torch.stack(cu_seqlens, dim=0)
 
-    # assert xs.shape[1] == packed_length, (xs.shape[1], packed_length)
-    print(f"attention_mask: {attention_mask.shape}, {attention_mask}, cu_seqlens: {cu_seqlens}, indexes: {indexes.shape}, type_ids: {ts.shape}", flush=True)
+    # print(f"attention_mask: {attention_mask.shape}, {attention_mask}, cu_seqlens: {cu_seqlens}, indexes: {indexes.shape}, type_ids: {ts.shape}", flush=True)
 
     return {"input_ids": xs, "cu_seqlens": cu_seqlens, "type_ids": ts, "attention_mask": attention_mask_micro_num_list}, ys   # "cu_seqlens": cu_seqlens, "indexes": indexes, 
 

@@ -91,7 +91,6 @@ class AccPerplex:
         return self.update(logits, labels, type_ids=self.type_ids)
 
     def update(self, logits, labels, type_ids=None):
-        print(f"enter AccPerplex, logits: {logits.shape}, labels: {labels.shape}, type_ids.shape: {type_ids.shape}", flush=True)
         if gpc.config.model.use_flash_attn:
             micro_bsz = labels.size(0)
         elif gpc.config.model.use_flash_attn_npu:
@@ -149,9 +148,6 @@ class AccPerplex:
             torch.distributed.all_reduce(acc, op=torch.distributed.ReduceOp.SUM, group=self.tp_pg)
             self.right += acc  # Masked_fill is not needed here because -100 is not available anyway
             self.total += mask.sum()
-            torch.npu.synchronize()
-            print(f"acc: {acc}", flush=True)
-
             # Subtract the maximum value.
             shift_logits = shift_logits.sub(logits_max.unsqueeze(dim=-1))
 
@@ -164,9 +160,6 @@ class AccPerplex:
             target_mask = (shift_labels < vocab_start_index) | (shift_labels >= vocab_end_index)
             masked_target = shift_labels - vocab_start_index
             masked_target[target_mask] = 0
-
-            torch.npu.synchronize()
-            print(f"mask: {target_mask}", flush=True)
 
             # Get predicted-logits = logits[target].
             # For Simplicity, we convert logits to a 2-D tensor with size
@@ -181,9 +174,6 @@ class AccPerplex:
             # All reduce is needed to get the chunks from other GPUs.
             torch.distributed.all_reduce(predicted_logits, op=torch.distributed.ReduceOp.SUM, group=self.tp_pg)
 
-            torch.npu.synchronize()
-            print(f"predicted_logits: {predicted_logits.shape}", flush=True)
-
             if self.metric_dtype is not None:
                 predicted_logits = predicted_logits.to(dtype=self.metric_dtype)
                 shift_logits = shift_logits.to(dtype=self.metric_dtype)
@@ -195,9 +185,6 @@ class AccPerplex:
 
             total_log_probs = -(pred_exp_logits / sum_exp_logits).log().masked_fill(shift_labels.eq(-100), 0).sum()
             self.total_log_probs += total_log_probs
-
-            torch.npu.synchronize()
-            print(f"self.total_log_probs: {self.total_log_probs}", flush=True)
 
 
     def get_metric(self, reset=True):
@@ -282,10 +269,7 @@ class LossWithTypeId:
             logits = logits.contiguous().view(-1, logits.size(-1))
             labels = labels.contiguous().view(-1)
 
-            print(f"logits: {logits.shape}, labels: {labels.shape}", flush=True)
             loss_list = self.loss_fn(logits, labels)
-            torch.npu.synchronize()
-            print(f"loss_list: len: {len(loss_list)}", flush=True)
 
             cond = labels != -100
             real_loss_list = loss_list[cond]

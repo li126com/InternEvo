@@ -6,6 +6,7 @@ import warnings
 from typing import Any, Optional, Tuple
 
 import torch
+
 import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange, repeat
@@ -17,6 +18,10 @@ from internlm.core.context import ParallelMode
 from internlm.model.embedding import DynamicNTKScalingRotaryEmbedding, RotaryEmbedding
 from internlm.model.linear import get_linear_cls
 
+try:
+    import torch_npu
+except ImportError:
+    pass
 
 class FlashSelfAttentionNPU(torch.nn.Module):
     """Implement the scaled dot product attention with softmax.
@@ -44,14 +49,9 @@ class FlashSelfAttentionNPU(torch.nn.Module):
         ---------
             q, k, v: The tensor containing the query, key, and value. (B, S, H, D)
         """
-        import torch_npu
-        print(f"use npu attention", flush=True)
-
         pre_tockens = k.shape[0] #  seq_len
         batch_size, seq_length, head_num, head_dim = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
-
-        if not hasattr(self, 'attention_mask'):
-            attention_mask = torch.triu(torch.ones(seq_length, seq_length), 1).bool().npu()
+        # print(f"batch_size: {batch_size}, seq_length: {seq_length}, head_num: {head_num}, head_dim: {head_dim}", flush=True)
 
         if self.shape_order == 'BSH':
             q, k, v = [rearrange(x, 'b s h d -> b s (h d)') for x in [q, k, v]]
@@ -66,14 +66,19 @@ class FlashSelfAttentionNPU(torch.nn.Module):
             raise ValueError('Invalid head_dim: {}'.format(head_dim)) from e
 
         output = torch_npu.npu_fusion_attention( \
-            q, k, v, head_num, self.shape_order, \
-            pse=None, \
-            padding_mask=None, \
-            atten_mask=attention_mask, \
-            scale=scale, \
-            pre_tockens=pre_tockens, \
-            next_tockens=self.next_tockens, \
-            keep_prob=1 - self.dropout_p, \
+            query=q,
+            key=k,
+            value=v, 
+            head_num=head_num, 
+            input_layout=self.shape_order,
+            pse=None,
+            padding_mask=None, # resvered args, is not used for now.
+            atten_mask=attention_mask,
+            scale=scale,
+            sparse_mode=1,  # Represents allMask, which means passing in the complete attendMaskOptional matrix.
+            pre_tockens=pre_tockens,  # Used for sparse calculations, representing the left boundary of the slides window
+            next_tockens=self.next_tockens,
+            keep_prob=1 - self.dropout_p,
             inner_precise=0
         )[0]
 
@@ -442,7 +447,6 @@ class MHA(nn.Module):
             inner_attn_cls = FlashSelfAttention
             inner_cross_attn_cls = FlashCrossAttention
         else:
-            # from ascendspeed.core.transformer.module.flash_attention import FlashSelfAttention
             if gpc.config.model.use_flash_attn_npu:
                 inner_attn_cls = FlashSelfAttentionNPU
                 inner_cross_attn_cls = CrossAttention
@@ -501,18 +505,17 @@ class MHA(nn.Module):
                         qkv = qkv.to(torch.bfloat16)
                         context = self.inner_attn(qkv)
             else:
-                if "attention_mask" not in kwargs:
+                use_flash_attn_npu = gpc.config.model.use_flash_attn_npu
+
+                if not use_flash_attn_npu:
                     context = self.inner_attn(qkv).to(x.dtype)
                 else:
                     attention_mask = kwargs['attention_mask']
                     q = qkv[:, :, 0]
                     k = qkv[:, :, 1]
                     v = qkv[:, :, 2]
-                    torch.npu.synchronize()
-                    print(f"FA enter ! attention_mask: {len(attention_mask)}, shape: {attention_mask[0].shape}", flush=True)
+                    assert len(attention_mask) == 1
                     context = self.inner_attn(q, k, v, attention_mask[0])
-                    torch.npu.synchronize()
-                    print(f"FA done ! context: {context.shape}", flush=True)
         else:
             if self.use_dynamic_ntk_rope:
                 q = qkv[:, :, 0]

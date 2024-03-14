@@ -85,7 +85,6 @@ class NonPipelineScheduler(BaseScheduler):
             _data.pop("cu_seqlens")
             _data.pop("indexes")
 
-        print(f"_load_accum_batch: {_data}, {_label}", flush=True)
         return _data, _label
 
     def _train_one_batch(
@@ -146,17 +145,11 @@ class NonPipelineScheduler(BaseScheduler):
         if not return_output:
             output = None
 
-        torch.npu.synchronize()
-        print(f"do bwd, loss: {loss}", flush=True)
-
         # backward
         if not forward_only:
             self._call_hooks("before_backward", None, None)
             engine.backward(loss)
             self._call_hooks("after_backward", None)
-
-        torch.npu.synchronize()
-        print(f"bwd done", flush=True)
 
         if not return_loss:
             loss, moe_loss = None, None

@@ -384,6 +384,7 @@ class PackedFlashInternLm1D(nn.Module):
                 normal_(std=0.0052)(param)
 
         self.parallel_output = parallel_output
+        self.attention_mask = None
 
     def forward(self, hidden_states=None, cu_seqlens=None, input_ids=None, indexes=None, inference_params=None, attention_mask=None):
         # attention_mask: compute attention on the places where the value is 1

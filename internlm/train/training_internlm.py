@@ -418,7 +418,7 @@ def get_train_data_loader(num_worker: int = 0, dataset_generate_func: Optional[C
             data_world_size=gpc.get_world_size(ParallelMode.DATA),
         )
         train_collate_fn = partial(packed_collate_fn, packed_length=data_cfg.packed_length)
-        train_collate_fn_npu = partial(packed_collate_fn_npu, packed_length=data_cfg.packed_length)
+        train_collate_fn_npu = partial(packed_collate_fn_npu, packed_length=data_cfg.packed_length, eos_token=2)
 
     # Create the training data loader
     train_dl = DataLoader(
@@ -594,6 +594,15 @@ def record_current_batch_training_metrics(
             scaler = trainer.engine.optimizer.optim.grad_scaler._scale.item()
 
         num_tokens_in_batch = batch[1].nelement()
+        num_tokens_nopadding_in_batch = 0
+        if len(batch[1].shape) == 2:    # no micor_bsz dim
+            num_tokens_nopadding_in_batch = sum([sum(torch.tensor(micro_b)!=-100) for micro_b in batch[1]]).item()
+        elif len(batch[1].shape) == 3:  # has micor_bsz dim
+            for micro_num_batch in batch[1]:
+                num_tokens_nopadding_in_batch += sum([sum(torch.tensor(micro_b)!=-100) for micro_b in micro_num_batch]).item()
+        else:
+            raise RuntimeError(f"unkonw labels' shape: {batch[1].shape}")
+
         num_samples_in_batch = sum([len(b) - 1 for b in batch[0]["cu_seqlens"]])
         max_length_in_batch = max([(b[1:] - b[:-1]).max().item() for b in batch[0]["cu_seqlens"]])
         max_samples_in_batch = max([len(b) - 1 for b in batch[0]["cu_seqlens"]])
@@ -651,11 +660,21 @@ def record_current_batch_training_metrics(
             2,
         )
 
+        tgs_no_padding_origin = round(
+            num_tokens_nopadding_in_batch
+            * gpc.get_world_size(ParallelMode.DATA)
+            / gpc.get_world_size(ParallelMode.GLOBAL)
+            / (time.time() - start_time),
+            2,
+        )
+
         infos = {
             "tflops": tflops,
             "step": batch_count,
             "loss": loss.item() - moe_loss.item() if moe_loss is not None else loss.item(),
             "tgs (tokens/gpu/second)": tgs_origin,
+            "tgs_nopadding (tokens/gpu/second)": tgs_no_padding_origin,
+            "num_tokens_nopadding_in_batch": num_tokens_nopadding_in_batch,
             "tgs/last_tgs_1": last_tgs_1,
             "tgs/tgs_all": tgs_all,
             "tgs/tgs_avg": tgs_avg,
