@@ -113,7 +113,7 @@ class MHA(nn.Module):
         self.use_flash_attn = use_flash_attn
         self.dtype = dtype
         self.tp_mode = tp_mode
-
+        self.use_flash_attn_npu = use_flash_attn_npu 
         self.rot_embed_HF_impl = rot_embed_HF_impl
         sequence_parallel = gpc.config.parallel.get("sequence_parallel", False)
 
