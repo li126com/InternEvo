@@ -6,6 +6,7 @@ import warnings
 from typing import Any, Optional, Tuple
 
 import torch
+
 import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange, repeat
@@ -13,9 +14,82 @@ from torch import Tensor, nn
 from torch.nn import Module
 
 from internlm.core.context import global_context as gpc
+from internlm.core.context import ParallelMode
 from internlm.model.embedding import DynamicNTKScalingRotaryEmbedding, RotaryEmbedding
 from internlm.model.linear import get_linear_cls
 
+try:
+    import torch_npu
+except ImportError:
+    pass
+
+class FlashSelfAttentionNPU(torch.nn.Module):
+    """Implement the scaled dot product attention with softmax.
+    Arguments
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                      (default: 1/sqrt(d_keys) where d_keys is computed at
+                      runtime)
+        attention_dropout: The dropout rate to apply to the attention
+                           (default: 0.0)
+    """
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
+                 device=None, dtype=None):
+        super().__init__()
+        assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        self.shape_order = 'BSND'
+        self.next_tockens = 0 # 0
+        self.dropout_p = attention_dropout
+
+    def forward(self, q, k, v, attention_mask):
+        """Implements the multihead softmax attention.
+        Arguments
+        ---------
+            q, k, v: The tensor containing the query, key, and value. (B, S, H, D)
+        """
+        pre_tockens = k.shape[0] #  seq_len
+        batch_size, seq_length, head_num, head_dim = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
+        # print(f"batch_size: {batch_size}, seq_length: {seq_length}, head_num: {head_num}, head_dim: {head_dim}", flush=True)
+
+        if self.shape_order == 'BSH':
+            q, k, v = [rearrange(x, 'b s h d -> b s (h d)') for x in [q, k, v]]
+        elif self.shape_order == 'SBH':
+            q, k, v = [rearrange(x, 'b s h d -> s b (h d)') for x in [q, k, v]]
+        elif self.shape_order != 'BSND':
+            raise ValueError('Invalid shape-order: {}, shape-order must be SBH or BSH or BSND'.format(self.shape_order))
+
+        try:
+            scale = 1.0 / math.sqrt(head_dim) if self.softmax_scale is None else self.softmax_scale
+        except Exception as e:
+            raise ValueError('Invalid head_dim: {}'.format(head_dim)) from e
+
+        output = torch_npu.npu_fusion_attention( \
+            query=q,
+            key=k,
+            value=v, 
+            head_num=head_num, 
+            input_layout=self.shape_order,
+            pse=None,
+            padding_mask=None, # resvered args, is not used for now.
+            atten_mask=attention_mask,
+            scale=scale,
+            sparse_mode=1,  # Represents allMask, which means passing in the complete attendMaskOptional matrix.
+            pre_tockens=pre_tockens,  # Used for sparse calculations, representing the left boundary of the slides window
+            next_tockens=self.next_tockens,
+            keep_prob=1 - self.dropout_p,
+            inner_precise=0
+        )[0]
+
+        if self.shape_order == 'BSH':
+            output = rearrange(output, 'b s (h d) -> b s h d', h=head_num)
+        elif self.shape_order == 'SBH':
+            output = rearrange(output, 's b (h d) -> b s h d', h=head_num)
+        elif self.shape_order != 'BSND':
+            raise ValueError('Invalid shape-order: {}, shape-order must be SBH or BSH or BSND'.format(args.shape_order))
+
+        return output
 
 # adpated from https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/sequence/layer.py
 class _SeqAllToAll(torch.autograd.Function):
@@ -336,6 +410,7 @@ class MHA(nn.Module):
         self.rotary_emb_dim = rotary_emb_dim
         self.use_flash_attn = use_flash_attn
         self.num_heads = num_heads
+        self.num_attention_heads_per_partition = num_heads // gpc.get_world_size(parallel_mode=ParallelMode.TENSOR)
         assert self.embed_dim % num_heads == 0, "self.kdim must be divisible by num_heads"
         self.head_dim = self.embed_dim // num_heads
         self.tp_mode = tp_mode
@@ -372,8 +447,13 @@ class MHA(nn.Module):
             inner_attn_cls = FlashSelfAttention
             inner_cross_attn_cls = FlashCrossAttention
         else:
-            inner_attn_cls = SelfAttention
-            inner_cross_attn_cls = CrossAttention
+            if gpc.config.model.use_flash_attn_npu:
+                inner_attn_cls = FlashSelfAttentionNPU
+                inner_cross_attn_cls = CrossAttention
+            else:
+                inner_attn_cls = SelfAttention
+                inner_cross_attn_cls = CrossAttention
+
         self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout)
         self.inner_cross_attn = inner_cross_attn_cls(
             causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
@@ -396,7 +476,7 @@ class MHA(nn.Module):
         )
 
     def forward(self, x, seqlen=None, inference_params=None, **kwargs):
-        if kwargs.get("indexes", None) is not None:
+        if kwargs.get("indexes", None) is not None and "attention_mask" not in kwargs:
             return self._packed_forward(x=x, inference_params=inference_params, **kwargs)
         else:
             return self._forward(x=x, seqlen=seqlen, inference_params=inference_params, **kwargs)
@@ -423,10 +503,19 @@ class MHA(nn.Module):
                 with internlm_accelerator.amp.autocast(dtype=torch.bfloat16):
                     if qkv.dtype not in [torch.float16, torch.bfloat16]:
                         qkv = qkv.to(torch.bfloat16)
-                    context = self.inner_attn(qkv).to(x.dtype)
+                        context = self.inner_attn(qkv)
             else:
-                context = self.inner_attn(qkv)
+                use_flash_attn_npu = gpc.config.model.use_flash_attn_npu
 
+                if not use_flash_attn_npu:
+                    context = self.inner_attn(qkv).to(x.dtype)
+                else:
+                    attention_mask = kwargs['attention_mask']
+                    q = qkv[:, :, 0]
+                    k = qkv[:, :, 1]
+                    v = qkv[:, :, 2]
+                    assert len(attention_mask) == 1
+                    context = self.inner_attn(q, k, v, attention_mask[0])
         else:
             if self.use_dynamic_ntk_rope:
                 q = qkv[:, :, 0]

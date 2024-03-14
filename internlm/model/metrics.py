@@ -93,10 +93,16 @@ class AccPerplex:
     def update(self, logits, labels, type_ids=None):
         if gpc.config.model.use_flash_attn:
             micro_bsz = labels.size(0)
+        elif gpc.config.model.use_flash_attn_npu:
+            micro_bsz = labels.size(1)
         else:
             micro_bsz = 1
+
         if type_ids is not None:
-            type_ids = type_ids[self.batch_shift * micro_bsz : (self.batch_shift + 1) * micro_bsz].view(-1)
+            if gpc.config.model.use_flash_attn_npu:
+                type_ids = type_ids[self.batch_shift].view(-1)
+            else:
+                type_ids = type_ids[self.batch_shift * micro_bsz : (self.batch_shift + 1) * micro_bsz].view(-1)
             self.batch_shift += 1
         self.loss_with_type_id.update(logits, labels, type_ids)
 
@@ -142,7 +148,6 @@ class AccPerplex:
             torch.distributed.all_reduce(acc, op=torch.distributed.ReduceOp.SUM, group=self.tp_pg)
             self.right += acc  # Masked_fill is not needed here because -100 is not available anyway
             self.total += mask.sum()
-
             # Subtract the maximum value.
             shift_logits = shift_logits.sub(logits_max.unsqueeze(dim=-1))
 
@@ -180,6 +185,7 @@ class AccPerplex:
 
             total_log_probs = -(pred_exp_logits / sum_exp_logits).log().masked_fill(shift_labels.eq(-100), 0).sum()
             self.total_log_probs += total_log_probs
+
 
     def get_metric(self, reset=True):
         if gpc.is_no_pp_or_last_stage() and self.dp_pg is not None:
@@ -262,6 +268,7 @@ class LossWithTypeId:
                 logits = logits[0]
             logits = logits.contiguous().view(-1, logits.size(-1))
             labels = labels.contiguous().view(-1)
+
             loss_list = self.loss_fn(logits, labels)
 
             cond = labels != -100

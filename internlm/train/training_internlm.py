@@ -37,13 +37,14 @@ from internlm.core.context.random import set_mode
 from internlm.core.naive_amp import NaiveAMPModel, set_fp32_attr_to_module
 from internlm.core.trainer import TrainState
 from internlm.data.batch_sampler import StaticBatchSampler, get_dpsampler_dataloader
-from internlm.data.collaters import jsonl_ds_collate_fn, packed_collate_fn
+from internlm.data.collaters import jsonl_ds_collate_fn, packed_collate_fn, packed_collate_fn_npu
 from internlm.data.dataset import get_dataset_dict
 from internlm.data.dummy_dataset import RandomDataset
 from internlm.data.packed_dataset import (
     PackedDataset,
     PackedDatasetWithoutCuSeqlen,
     get_packed_dataset_without_short_length,
+    packed_dataset_type
 )
 from internlm.data.utils import get_dataset_type_ids_map, unpack_data
 from internlm.model.embedding import Embedding1D
@@ -404,6 +405,7 @@ def get_train_data_loader(num_worker: int = 0, dataset_generate_func: Optional[C
                 min_length=data_cfg.min_length,
                 min_length_dict=data_cfg.get("min_length_dict", {}),
                 pack_into_one_sample=data_cfg.pack_sample_into_one,
+                pack_type=packed_dataset_type[data_cfg.pack_type],
             )
         train_sampler = StaticBatchSampler(
             train_ds.datasets if isinstance(train_ds, ConcatDataset) else [train_ds],
@@ -416,6 +418,7 @@ def get_train_data_loader(num_worker: int = 0, dataset_generate_func: Optional[C
             data_world_size=gpc.get_world_size(ParallelMode.DATA),
         )
         train_collate_fn = partial(packed_collate_fn, packed_length=data_cfg.packed_length)
+        train_collate_fn_npu = partial(packed_collate_fn_npu, packed_length=data_cfg.packed_length, eos_token=2)
 
     # Create the training data loader
     train_dl = DataLoader(
@@ -423,7 +426,7 @@ def get_train_data_loader(num_worker: int = 0, dataset_generate_func: Optional[C
         batch_sampler=train_sampler,
         num_workers=num_worker,
         pin_memory=True,
-        collate_fn=train_collate_fn,
+        collate_fn=train_collate_fn if not gpc.config.model.use_flash_attn_npu else train_collate_fn_npu,
         persistent_workers=num_worker > 0,
     )
 
@@ -519,10 +522,11 @@ def load_new_batch(train_dl: DataLoader, train_iter: Iterable, train_state: Trai
             next(train_state.batch_sampler_iter)
     timer("batch-gen").stop()
 
-    if batch[0].get("type_ids", None) is not None:
-        # if use_flash_attn is False, we need to unpack type_ids
-        if not gpc.config.model.use_flash_attn:
-            batch[0]["type_ids"] = unpack_data(batch[0]["type_ids"], batch[0]["cu_seqlens"], is_type_ids=True)
+    # if use_flash_attn is False, we need to unpack type_ids
+    if not gpc.config.model.use_flash_attn_npu:
+        if batch[0].get("type_ids", None) is not None:
+            if not gpc.config.model.use_flash_attn:
+                batch[0]["type_ids"] = unpack_data(batch[0]["type_ids"], batch[0]["cu_seqlens"], is_type_ids=True)
 
     return batch, train_iter
 
@@ -590,6 +594,15 @@ def record_current_batch_training_metrics(
             scaler = trainer.engine.optimizer.optim.grad_scaler._scale.item()
 
         num_tokens_in_batch = batch[1].nelement()
+        num_tokens_nopadding_in_batch = 0
+        if len(batch[1].shape) == 2:    # no micor_bsz dim
+            num_tokens_nopadding_in_batch = sum([sum(torch.tensor(micro_b)!=-100) for micro_b in batch[1]]).item()
+        elif len(batch[1].shape) == 3:  # has micor_bsz dim
+            for micro_num_batch in batch[1]:
+                num_tokens_nopadding_in_batch += sum([sum(torch.tensor(micro_b)!=-100) for micro_b in micro_num_batch]).item()
+        else:
+            raise RuntimeError(f"unkonw labels' shape: {batch[1].shape}")
+
         num_samples_in_batch = sum([len(b) - 1 for b in batch[0]["cu_seqlens"]])
         max_length_in_batch = max([(b[1:] - b[:-1]).max().item() for b in batch[0]["cu_seqlens"]])
         max_samples_in_batch = max([len(b) - 1 for b in batch[0]["cu_seqlens"]])
@@ -647,11 +660,21 @@ def record_current_batch_training_metrics(
             2,
         )
 
+        tgs_no_padding_origin = round(
+            num_tokens_nopadding_in_batch
+            * gpc.get_world_size(ParallelMode.DATA)
+            / gpc.get_world_size(ParallelMode.GLOBAL)
+            / (time.time() - start_time),
+            2,
+        )
+
         infos = {
             "tflops": tflops,
             "step": batch_count,
             "loss": loss.item() - moe_loss.item() if moe_loss is not None else loss.item(),
             "tgs (tokens/gpu/second)": tgs_origin,
+            "tgs_nopadding (tokens/gpu/second)": tgs_no_padding_origin,
+            "num_tokens_nopadding_in_batch": num_tokens_nopadding_in_batch,
             "tgs/last_tgs_1": last_tgs_1,
             "tgs/tgs_all": tgs_all,
             "tgs/tgs_avg": tgs_avg,

@@ -47,7 +47,7 @@ def move_norm_to_cuda(norm: Union[float, torch.Tensor]) -> Union[float, torch.Te
 def _move_tensor(element):
     if not torch.is_tensor(element):
         # we expecte the data type if a list of dictionaries
-        for item in element:
+        for idx, item in enumerate(element):
             if isinstance(item, dict):
                 for key, value in item.items():
                     assert not value.is_cuda, "elements are already on devices."
@@ -58,11 +58,15 @@ def _move_tensor(element):
                     item[index] = value.to(get_current_device()).detach()
             elif torch.is_tensor(item):
                 if not item.is_cuda:
-                    item = item.to(get_current_device()).detach()
+                    element[idx] = item.to(get_current_device()).detach()
+            else:
+                assert False, f"{type(item)}, {item}"
     else:
         assert torch.is_tensor(element), f"element should be of type tensor, but got {type(element)}"
         if not element.is_cuda:
             element = element.to(get_current_device()).detach()
+        else:
+            assert False, f"{type(item)}"
     return element
 
 

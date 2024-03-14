@@ -7,6 +7,8 @@ import traceback
 from functools import partial
 
 import torch
+import pickle
+import os
 import torch.distributed as dist
 
 import internlm
@@ -46,7 +48,7 @@ from internlm.utils.parallel import get_parallel_log_file_name
 from internlm.utils.simple_memory_profiler import SimpleMemoryProfiler
 from internlm.utils.writer import Writer
 from internlm.utils.common import get_current_device
-
+from internlm.data.packed_dataset import test_npu_fa_packed_sample_into_one_batch
 # global llm logger
 logger = get_logger(__file__)
 
@@ -190,6 +192,25 @@ def main(args):
     # transfer the train data loader into train data iterator
     train_iter = iter(train_dl)
 
+    if "USE_DUMP_DATA" in os.environ:
+        with open(f'DP_{gpc.get_local_rank(ParallelMode.DATA)}_TOTAL_STEP_{gpc.config.data.total_steps}.pickle', 'rb') as f:
+            batch_list = pickle.load(f)
+        print("use dump data!", flush=True)
+
+    if gpc.get_global_rank() == 0:
+        print(gpc.config.data, flush=True)
+        print(gpc.config.model, flush=True)
+
+    # ckpt_manager.save_checkpoint(
+    #     folder="local:llm_ckpts_wgt_1b",
+    #     model=model,
+    #     optimizer=optimizer,
+    #     scheduler=lr_scheduler,
+    #     train_state=train_state,
+    #     model_config=ckpt_manager.model_config,
+    #     model_config_file=ckpt_manager.model_config_file,
+    # )
+
     with initialize_llm_profile(profiling=args.profiling, start_time=current_time) as prof:
         # start iterating the train data and begin training
         for batch_count in range(train_state.batch_count, total_steps):
@@ -200,7 +221,10 @@ def main(args):
             gpc.config.batch_count = batch_count
 
             # load batch data
-            batch, train_iter = load_new_batch(train_dl=train_dl, train_iter=train_iter, train_state=train_state)
+            if "USE_DUMP_DATA" in os.environ:
+                batch = test_npu_fa_packed_sample_into_one_batch(batch_list[batch_count])
+            else:
+                batch, train_iter = load_new_batch(train_dl=train_dl, train_iter=train_iter, train_state=train_state)
 
             # record the consumed samples in training
             train_state.batch_count = batch_count
@@ -216,6 +240,7 @@ def main(args):
             # process data
             if batch[0].get("type_ids", None) is not None:
                 metric.set_current_type_ids(type_ids=batch[0].pop("type_ids", None))
+                # print(f"warning!!! disable set_current_type_ids", flush=True)
 
             # do forward and backward
             timer("fwd-bwd").start()
@@ -302,8 +327,6 @@ def main(args):
                 prof.step()
 
             # torch.cuda.memory._dump_snapshot(f"my_snapshot_{gpc.get_global_rank()}.pickle")
-            # torch.cuda.reset_peak_memory_stats()
-            torch.npu.reset_peak_memory_stats()
 
     ckpt_manager.wait_async_upload_finish()
 
