@@ -1,21 +1,20 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
+import os
+import pickle
 import socket
 import time
 import traceback
 from functools import partial
 
-import torch
-import pickle
-import os
 import torch.distributed as dist
 
 import internlm
-from internlm.accelerator import internlm_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.trainer import TrainState
+from internlm.data.packed_dataset import test_npu_fa_packed_sample_into_one_batch
 from internlm.initialize import initialize_distributed_env
 from internlm.model.loss import FlashGPTLMLoss
 from internlm.model.metrics import AccPerplex
@@ -35,6 +34,7 @@ from internlm.train import (
 from internlm.utils.common import (
     BatchSkipper,
     enable_pytorch_expandable_segments,
+    get_current_device,
     get_megatron_flops,
     launch_time,
     parse_args,
@@ -47,10 +47,10 @@ from internlm.utils.model_checkpoint import CheckpointManager
 from internlm.utils.parallel import get_parallel_log_file_name
 from internlm.utils.simple_memory_profiler import SimpleMemoryProfiler
 from internlm.utils.writer import Writer
-from internlm.utils.common import get_current_device
-from internlm.data.packed_dataset import test_npu_fa_packed_sample_into_one_batch
+
 # global llm logger
 logger = get_logger(__file__)
+
 
 def initialize_llm_logger(start_time: str):
     """
@@ -193,7 +193,9 @@ def main(args):
     train_iter = iter(train_dl)
 
     if "USE_DUMP_DATA" in os.environ:
-        with open(f'DP_{gpc.get_local_rank(ParallelMode.DATA)}_TOTAL_STEP_{gpc.config.data.total_steps}.pickle', 'rb') as f:
+        with open(
+            f"DP_{gpc.get_local_rank(ParallelMode.DATA)}_TOTAL_STEP_{gpc.config.data.total_steps}.pickle", "rb"
+        ) as f:
             batch_list = pickle.load(f)
         print("use dump data!", flush=True)
 
