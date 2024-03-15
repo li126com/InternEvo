@@ -1209,4 +1209,4 @@ def build_model_with_cfg(
     )
 
     return _build_generic_model_1d(num_layers=num_layers, num_chunks=num_chunks, **cfg)
-                                                                                                  
+
