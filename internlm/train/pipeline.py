@@ -500,7 +500,7 @@ def record_current_batch_training_metrics(
             scaler = trainer.engine.optimizer.optim.grad_scaler._scale.item()
 
         num_tokens_in_batch = batch[1].nelement()
-        real_num_tokens = math.ceil(acc_perplex.pop("real_toekn_num") / gpc.get_world_size(ParallelMode.GLOBAL))
+        real_num_tokens = math.ceil(acc_perplex.pop("real_token_num") / gpc.get_world_size(ParallelMode.GLOBAL))
         num_samples_in_batch = sum([len(b) - 1 for b in batch[0]["cu_seqlens"]])
         max_length_in_batch = max([(b[1:] - b[:-1]).max().item() for b in batch[0]["cu_seqlens"]])
         max_samples_in_batch = max([len(b) - 1 for b in batch[0]["cu_seqlens"]])
@@ -559,10 +559,7 @@ def record_current_batch_training_metrics(
         )
 
         real_tgs = round(
-            real_num_tokens
-            * gpc.get_world_size(ParallelMode.DATA)
-            / gpc.get_world_size(ParallelMode.GLOBAL)
-            / time_cost,
+            real_num_tokens / time_cost,
             2,
         )
 
