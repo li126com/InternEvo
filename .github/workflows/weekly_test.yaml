@@ -256,6 +256,7 @@ jobs:
       training_8GPU_4DP2TP,
       training_8GPU_4DP2TPSP,
       training_8GPU_4DP2PP,
+      training_8GPU_4DP2PP_InterleavedOverlap
       training_16GPU_4DP2TP2PP_MTP,
       training_16GPU_4DP2TP2PP_MSP,
       training_16GPU_4DP2TP2PP_FSP,
