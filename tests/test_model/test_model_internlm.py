@@ -132,10 +132,12 @@ def check_block(args):
     hidden_states = torch.tensor(
         [
             [
-                [-1.1620, 1.3113, 0.1507, 2.2698],
-                [-1.2610, 1.0990, 0.3787, -0.3478],
-                [1.4001, 1.1982, -0.6696, 0.3269],
-                [1.3304, 1.2262, 1.0735, -1.1169],
+                [
+                    [-1.1620, 1.3113, 0.1507, 2.2698],
+                    [-1.2610, 1.0990, 0.3787, -0.3478],
+                    [1.4001, 1.1982, -0.6696, 0.3269],
+                    [1.3304, 1.2262, 1.0735, -1.1169],
+                ]
             ]
         ]
     )
@@ -302,8 +304,8 @@ def check_gather_forward(args):
     rank, world_size, parallel_tensor = args
     assert parallel_tensor in [1, 2]
     config.parallel.tensor = parallel_tensor
-    device = get_current_device()
     build_environment(rank, world_size)
+    device = get_current_device()
     rtol, atol = (1e-3, 5e-3)
 
     # fix seed

@@ -421,8 +421,9 @@ def _build_generic_model_1d(num_layers, num_chunks, **kwargs):
         logger.info(f"The layer sharding is {all_parts}.")
 
     models = []
-
+    start_idx, end_idx = 0, 0
     for start, end in parts:
+        start_idx, end_idx = start, end
         kwargs["num_layers"] = end - start
         kwargs["first"] = start == 0
         # If there is no content in the final layer, assign the last layer.
@@ -437,7 +438,8 @@ def _build_generic_model_1d(num_layers, num_chunks, **kwargs):
         model = models[0]
     else:
         model = nn.ModuleList(models)
-
+    setattr(model, "first_layer", start_idx)
+    setattr(model, "last_layer", end_idx)
     return model
 
 

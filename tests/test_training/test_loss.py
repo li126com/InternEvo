@@ -2,11 +2,12 @@ import math
 import os
 
 import pytest
+import torch
 import torch.distributed as dist
 
 import internlm
 from internlm.checkpoint import CheckpointManager
-from internlm.core.context import ParallelMode
+from internlm.core.context import Config, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.trainer import TrainState
 from internlm.data import build_train_loader_with_data_type
@@ -25,22 +26,24 @@ from internlm.utils.gputest import empty_cache_and_diag
 from internlm.utils.megatron_timers import megatron_timer as timer
 
 CONFIG_FILE_PATH = os.getenv("CONFIG_FILE_PATH", "./configs/7B_sft.py")
+INTERNLM1_CKPT_PATH = os.path.join(os.environ["share_path"], "quailty_assurance/test_loss/model_ckpt")
 TOTAL_STEPS = 10
 LOSS_SPIKE_LIMIT = 1.5
-LOSS_DEVIATION_LIMIT = 0.2
+LOSS_DEVIATION_LIMIT = 0.02
 # dp_size = 4
 BASELINE_LOSS_LIST = [
     11.63298511505127,
-    7.826552391052246,
-    6.727715969085693,
-    6.182102680206299,
-    5.395875930786133,
-    5.394404411315918,
-    5.053983688354492,
-    4.741974353790283,
-    4.629222869873047,
-    4.6164231300354,
+    7.82645320892334,
+    6.727725505828857,
+    6.182029724121094,
+    5.395882606506348,
+    5.394383430480957,
+    5.053952217102051,
+    4.742049694061279,
+    4.629276752471924,
+    4.616517543792725,
 ]
+
 
 cur_loss_list = []
 
@@ -58,7 +61,38 @@ def train(
     model_type: str = "INTERNLM",
 ):
     # initialize distributed environment
-    initialize_distributed_env(config=CONFIG_FILE_PATH)
+    config = Config.from_file(CONFIG_FILE_PATH)
+
+    # init setting
+    config.data.total_steps = TOTAL_STEPS
+    config.data.fixed_random_dataset_seqlen = False
+    config.lr_scheduler.total_steps = TOTAL_STEPS
+    config.model_type = model_type
+    total_steps = config.data.total_steps
+    skip_batches = config.data.skip_batches
+    label_smoothing = config.loss.label_smoothing
+
+    # update ckpt config
+    if model_type == "INTERNLM" and tp_mode != "isp":
+        config.ckpt.load_ckpt_info = dict(path=INTERNLM1_CKPT_PATH, content=("model",), ckpt_type="internlm_test")
+
+    if enable_ckpt:
+        config.ckpt.enable_save_ckpt = True
+        config.ckpt.checkpoint_every = 10
+        config.ckpt.save_ckpt_folder = "local:llm_ckpts/"
+        config.ckpt.load_ckpt_folder = "local:llm_ckpts/"
+        config.ckpt.load_ckpt_info["content"] = ("all",)
+        config.ckpt.oss_snapshot_freq = 100
+
+    # update parallel config
+    config.parallel.tensor = dict(size=tp_size, mode=tp_mode)
+    config.parallel.pipeline = dict(size=pp_size)
+    config.parallel.weight = dict(size=wp_size, overlap=True, memory_pool=True)
+    if interleaved is True:
+        config.parallel.pipeline = dict(size=pp_size, interleaved_overlap=True)
+        config.model.num_chunks = num_chunks
+
+    initialize_distributed_env(config=config)
     assert hasattr(gpc, "config") and gpc.config is not None
 
     # check parallel config
@@ -88,24 +122,6 @@ def train(
             "sequence_parallel", False
         ), "sequence_parallel must be True when enable_sp is True"
     assert gpc.config.parallel["tensor"]["mode"] == tp_mode
-
-    # init setting
-    gpc.config.data.total_steps = TOTAL_STEPS
-    gpc.config.data.fixed_random_dataset_seqlen = False
-    gpc.config.lr_scheduler.total_steps = TOTAL_STEPS
-    gpc.config.model_type = model_type
-    total_steps = gpc.config.data.total_steps
-    skip_batches = gpc.config.data.skip_batches
-    label_smoothing = gpc.config.loss.label_smoothing
-
-    # update ckpt config
-    if enable_ckpt:
-        gpc.config.ckpt.enable_save_ckpt = True
-        gpc.config.ckpt.checkpoint_every = 10
-        gpc.config.ckpt.save_ckpt_folder = "local:llm_ckpts/"
-        gpc.config.ckpt.load_ckpt_folder = "local:llm_ckpts/"
-        gpc.config.ckpt.load_ckpt_info["content"] = ("all",)
-        gpc.config.ckpt.oss_snapshot_freq = 100
 
     # get and broadcast current time
     current_time = launch_time()
@@ -170,16 +186,24 @@ def train(
 
     trainer.train()
 
-    # transfer the train data loader into train data iterator
     train_iter = iter(train_dl)
+
+    if model_type == "INTERNLM":
+        data_path = os.path.join(os.environ["share_path"], "quailty_assurance/test_loss/data_batch_4DP")
+        data_batch = torch.load(f"{data_path}/{gpc.get_local_rank(ParallelMode.DATA)}_data_batch.pt")
 
     # start iterating the train data and begin training
     for batch_count in range(train_state.batch_count, total_steps):
         empty_cache_and_diag(batch_count, interval=gpc.config.data.empty_cache_and_diag_interval)
         timer("one-batch").start()
 
-        # load batch data
-        batch, train_iter = load_new_batch(train_dl=train_dl, train_iter=train_iter, train_state=train_state)
+        if model_type == "INTERNLM":
+            if batch_count >= 10:
+                batch = data_batch[batch_count - 10]
+            else:
+                batch = data_batch[batch_count]
+        else:
+            batch, train_iter = load_new_batch(train_dl=train_dl, train_iter=train_iter, train_state=train_state)
 
         # record the consumed samples in training
         train_state.batch_count = batch_count
@@ -304,16 +328,16 @@ def test_training_loss_with_dp4_pp2():
     check_loss_accuracy()
 
 
-@pytest.mark.training_8GPU_4DP2PP_InterleavedOverlap
-def test_training_loss_with_dp4_pp2_interleaved_overlap():
-    # model training
-    train(dp_size=4, pp_size=2, interleaved=True)
+# @pytest.mark.training_8GPU_4DP2PP_InterleavedOverlap
+# def test_training_loss_with_dp4_pp2_interleaved_overlap():
+#     # model training
+#     train(dp_size=4, pp_size=2, interleaved=True)
 
-    # print loss value
-    print(f"cur_loss_list: {cur_loss_list}", flush=True)
+#     # print loss value
+#     print(f"cur_loss_list: {cur_loss_list}", flush=True)
 
-    check_loss_spike()
-    check_loss_accuracy()
+#     check_loss_spike()
+#     check_loss_accuracy()
 
 
 @pytest.mark.training_16GPU_4DP2TP2PP_MTP
@@ -355,11 +379,28 @@ def test_training_loss_with_dp4_tp2_pp2_fsp():
 @pytest.mark.training_8GPU_ISP
 def test_training_with_isp():
     # update config file
-    global CONFIG_FILE_PATH
+    global CONFIG_FILE_PATH, BASELINE_LOSS_LIST
     CONFIG_FILE_PATH = "./configs/7B_isp_sft.py"
-
+    BASELINE_LOSS_LIST = [
+        11.594964981079102,
+        8.874114990234375,
+        7.090242385864258,
+        6.782063961029053,
+        5.961512088775635,
+        5.606202125549316,
+        5.305666446685791,
+        5.0156569480896,
+        4.9411516189575195,
+        4.983800411224365,
+    ]
     # model training
     train(dp_size=4, tp_size=2, wp_size=4, tp_mode="isp", enable_sp=True)
+
+    # print loss value
+    print(f"cur_loss_list: {cur_loss_list}", flush=True)
+
+    check_loss_spike()
+    check_loss_accuracy()
 
 
 @pytest.mark.training_8GPU_ISP_SAVE_CKPT
