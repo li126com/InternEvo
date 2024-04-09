@@ -73,7 +73,7 @@ def train(
     label_smoothing = config.loss.label_smoothing
 
     # update ckpt config
-    if model_type == "INTERNLM" and tp_mode != "isp":
+    if model_type == "INTERNLM" and tp_mode != "isp" and interleaved is False:
         config.ckpt.load_ckpt_info = dict(path=INTERNLM1_CKPT_PATH, content=("model",), ckpt_type="internlm_test")
 
     if enable_ckpt:
@@ -328,16 +328,15 @@ def test_training_loss_with_dp4_pp2():
     check_loss_accuracy()
 
 
-# @pytest.mark.training_8GPU_4DP2PP_InterleavedOverlap
-# def test_training_loss_with_dp4_pp2_interleaved_overlap():
-#     # model training
-#     train(dp_size=4, pp_size=2, interleaved=True)
+@pytest.mark.training_8GPU_4DP2PP_InterleavedOverlap
+def test_training_loss_with_dp4_pp2_interleaved_overlap():
+    # model training
+    train(dp_size=4, pp_size=2, interleaved=True)
 
-#     # print loss value
-#     print(f"cur_loss_list: {cur_loss_list}", flush=True)
+    # print loss value
+    print(f"cur_loss_list: {cur_loss_list}", flush=True)
 
-#     check_loss_spike()
-#     check_loss_accuracy()
+    check_loss_spike()
 
 
 @pytest.mark.training_16GPU_4DP2TP2PP_MTP
