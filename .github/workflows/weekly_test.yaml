@@ -262,7 +262,6 @@ jobs:
       training_8GPU_ISP,
       training_8GPU_ISP_CKPT,
       unit_test_optimizer,
-      unit_test_model,
       load_ckpt_then_assert_loss
       ]
     runs-on: [t_cluster]
