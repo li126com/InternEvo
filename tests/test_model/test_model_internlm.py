@@ -204,8 +204,8 @@ def check_block(args):
 def check_head(args):
     # init
     rank, world_size, is_reward = args
-    device = get_current_device()
     build_environment(rank, world_size)
+    device = get_current_device()
     rtol, atol = (1e-3, 5e-3)
     hidden_size = 4
     vocab_size = 4
