@@ -2,6 +2,7 @@
 # -*- encoding: utf-8 -*-
 
 import functools
+import math
 import time
 from typing import Callable, Iterable, List, Optional, Union
 
@@ -495,6 +496,7 @@ def record_current_batch_training_metrics(
             scaler = trainer.engine.optimizer.optim.grad_scaler._scale.item()
 
         num_tokens_in_batch = batch[1].nelement()
+        real_num_tokens = math.ceil(acc_perplex.pop("real_token_num") / gpc.get_world_size(ParallelMode.GLOBAL))
         num_samples_in_batch = sum([len(b) - 1 for b in batch[0]["cu_seqlens"]])
         max_length_in_batch = max([(b[1:] - b[:-1]).max().item() for b in batch[0]["cu_seqlens"]])
         max_samples_in_batch = max([len(b) - 1 for b in batch[0]["cu_seqlens"]])
@@ -542,13 +544,18 @@ def record_current_batch_training_metrics(
         tgs_avg = round(tgs_statistic["sum_tgs"] / tgs_statistic["sum_step"], 2)
         tgs_SMA = round(tgs_statistic["SMA_tg_50"] / tgs_statistic["SMA_time_50"], 2)
 
-        tflops = get_tflops_func((time.time() - start_time))
+        tflops = get_tflops_func(time_cost)
 
         tgs_origin = round(
             num_tokens_in_batch
             * gpc.get_world_size(ParallelMode.DATA)
             / gpc.get_world_size(ParallelMode.GLOBAL)
-            / (time.time() - start_time),
+            / time_cost,
+            2,
+        )
+
+        real_tgs = round(
+            real_num_tokens / time_cost,
             2,
         )
 
@@ -556,6 +563,7 @@ def record_current_batch_training_metrics(
             "tflops": tflops,
             "step": batch_count,
             "loss": loss.item() - moe_loss.item() if moe_loss is not None else loss.item(),
+            "real_tgs": real_tgs,
             "tgs (tokens/gpu/second)": tgs_origin,
             "tgs/last_tgs_1": last_tgs_1,
             "tgs/tgs_all": tgs_all,

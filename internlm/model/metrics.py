@@ -307,6 +307,7 @@ class LossWithTypeId:
         loss = round((self.loss / self.token_num).item(), 4)
         res = {
             "loss_from_metric": loss,
+            "real_token_num": self.token_num.item(),
         }
         if hasattr(self, "total_type_count"):
             ds_loss = {}

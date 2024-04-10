@@ -99,19 +99,25 @@ class BaseFeedForward(nn.Module):
         w1_o, w3_o = torch.split(w1_w3_out, w1_w3_out.shape[-1] // 2, dim=-1)
         return w1_o, w3_o
 
-    def _mlp_pre_load_convert(self, state_dict, *args, **kwargs) -> None:  # pylint: disable=W0613
-        if self.mlp_layer_fusion and "fused_w1_w3.weight" not in state_dict:
-            w1, w3 = state_dict.pop("w1.weight"), state_dict.pop("w3.weight")
-            state_dict["fused_w1_w3.weight"] = torch.cat([w1, w3], dim=0)
-        if not self.mlp_layer_fusion and ("w1.weight" not in state_dict or "w3.weight" not in state_dict):
-            state_dict["w1.weight"], state_dict["w3.weight"] = self.split_fused_mlp_weight(
-                state_dict.pop("fused_w1_w3.weight")
-            )
+    def _mlp_pre_load_convert(self, state_dict, prefix, *args, **kwargs) -> None:  # pylint: disable=W0613
+        w1_name = f"{prefix}w1.weight"
+        w3_name = f"{prefix}w3.weight"
+        fused_w1_w3_name = f"{prefix}fused_w1_w3.weight"
 
-    def _mlp_save_convert(self, state_dict, *args, **kwargs) -> Dict:  # pylint: disable=W0613
+        if self.mlp_layer_fusion and fused_w1_w3_name not in state_dict:
+            w1, w3 = state_dict.pop(w1_name), state_dict.pop(w3_name)
+            state_dict[fused_w1_w3_name] = torch.cat([w1, w3], dim=0)
+        if not self.mlp_layer_fusion and (w1_name not in state_dict or w3_name not in state_dict):
+            state_dict[w1_name], state_dict[w3_name] = self.split_fused_mlp_weight(state_dict.pop(fused_w1_w3_name))
+
+    def _mlp_save_convert(self, state_dict, prefix, *args, **kwargs) -> Dict:  # pylint: disable=W0613
+        w1_name = f"{prefix}w1.weight"
+        w3_name = f"{prefix}w3.weight"
+        fused_w1_w3_name = f"{prefix}fused_w1_w3.weight"
+
         if self.mlp_layer_fusion:
-            state_dict["w1.weight"], state_dict["w3.weight"] = self.split_fused_mlp_weight(
-                w1_w3=state_dict.pop("fused_w1_w3.weight")
+            state_dict[w1_name], state_dict[w3_name] = self.split_fused_mlp_weight(
+                w1_w3=state_dict.pop(fused_w1_w3_name)
             )
 
         return state_dict

@@ -71,7 +71,7 @@ def try_import_fused_rotary() -> Tuple[Union[None, Callable], Union[None, Callab
             if gpc.is_rank_for_log():
                 logger.warning("Use DeeplinkApplyRotaryEmb, Please note this!")
 
-            return DeeplinkApplyRotaryEmb, DeeplinkApplyRotaryEmbQKV_, None
+            return DeeplinkApplyRotaryEmb.apply, DeeplinkApplyRotaryEmbQKV_.apply, None
 
     except (ModuleNotFoundError, ImportError):
         pass
