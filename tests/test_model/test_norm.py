@@ -14,7 +14,7 @@ def check_norm(args):
     # init
     rank, world_size = args
     build_environment(rank, world_size)
-    device = get_current_device(rank)
+    device = get_current_device()
     rtol, atol = (1e-3, 5e-3)
     hidden_size = 4
     layer_norm_epsilon = 1e-05
