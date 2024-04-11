@@ -182,6 +182,9 @@ def load_model_checkpoint(folder, model):
     # try to load expert parameter to separate files if model have moe layer
     try_load_moe_checkpoint(folder, model, states, tp_rank, pp_rank)
 
+    for key in list(states.keys()):
+        states[key.replace("model.", "")] = states.pop(key)
+
     if gpc.config.parallel.zero1.fsdp:
         missing_k, unexpected_keys = load_shard_state_dict(model, states, strict=False)
     else:

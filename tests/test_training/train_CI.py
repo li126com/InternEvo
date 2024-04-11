@@ -66,14 +66,19 @@ def check_model_weights(model, ckpt_path, total_equal=False):
         if key not in model1_dict:
             assert False, f"Error: The key {key} for current model dose not exist in standard ckpt!"
 
+    dp = gpc.get_local_rank(ParallelMode.DATA)
+    pp = gpc.get_local_rank(ParallelMode.PIPELINE)
+    tp = gpc.get_local_rank(ParallelMode.TENSOR)
     for key in model1_dict.keys():
         if key in model2_dict:
             tensor1 = model1_dict[key]
             tensor2 = model2_dict[key]
             if total_equal:
-                assert torch.equal(tensor1, tensor2), "model weights are not equal"
+                assert torch.equal(tensor1, tensor2), f"Error: dp{dp}_pp{pp}_tp{tp}: {key} is not equal!"
             else:
-                assert torch.allclose(tensor1, tensor2, rtol=3e-2, atol=3e-2), "model weights are not close"
+                assert torch.allclose(
+                    tensor1, tensor2, rtol=3e-2, atol=3e-2
+                ), f"Error: dp{dp}_pp{pp}_tp{tp}: {key} is not close!"
         else:
             if gpc.is_rank_for_log():
                 logger.warning(f"The old key {key} no longer exists!")
@@ -138,6 +143,28 @@ def main(args):
 
     # Loading other persistent training states.
     ckpt_manager.try_resume_training(train_state, current_time)
+
+    if not hasattr(gpc.config, "CHECK_INIT"):
+        ckpt_path = os.path.join(
+            os.environ["share_path"], "quailty_assurance/7B_model_weights_ckpt/init/model_tp0_pp0.pt"
+        )
+        if gpc.get_local_rank(ParallelMode.DATA) == 0:
+            logger.info(f"Reload: load ckpt from {ckpt_path}")
+        states = torch.load(ckpt_path, map_location="cuda")
+
+        # Exchange w2.weight and w3.weight
+        for key in list(states.keys()):
+            if "mlp.w2.weight" in key:
+                key2 = key.replace("w2", "w3")
+                states[key], states[key2] = states[key2], states[key]
+
+        missing_keys, unexpected_keys = model.load_state_dict(states, strict=False)
+
+        if gpc.get_local_rank(ParallelMode.DATA) == 0:
+            logger.info(f"Missing keys:{missing_keys}, unexpected keys:{unexpected_keys}")
+
+        if unexpected_keys != []:
+            assert False, "unexpected keys are not None"
 
     # initialize customed llm writer
     writer = Writer(

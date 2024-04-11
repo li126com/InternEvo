@@ -57,6 +57,10 @@ def load_llama_pretrained_weights(folder, model):
     if "output.weight" in model_state_keys:
         current_states["norm.weight"] = states["norm.weight"]
         current_states["output.weight"] = states["output.weight"]
+
+    for key in list(current_states.keys()):
+        current_states[key.replace("model.", "")] = current_states.pop(key)
+
     missing_keys, unexpected_keys = model.load_state_dict(current_states, strict=False)
 
     if gpc.get_local_rank(ParallelMode.DATA) == 0:
@@ -176,6 +180,9 @@ def load_hf_llama_pretrained_weights(folder, model):
             states["lm_head.weight"], gpc.get_world_size(ParallelMode.TENSOR), dim=0
         )[gpc.get_local_rank(ParallelMode.TENSOR)]
 
+    for key in list(current_states.keys()):
+        current_states[key.replace("model.", "")] = current_states.pop(key)
+
     missing_keys, unexpected_keys = model.load_state_dict(current_states, strict=False)
 
     if gpc.get_local_rank(ParallelMode.DATA) == 0:
@@ -293,6 +300,9 @@ def load_internlm_with_dynamic_parallel_size(folder, model):
                 current_states[name] = torch.concat(
                     data, dim=1 if name == "embedding.weight" or any(x in name for x in ("out_proj", "w2")) else 0
                 )
+
+    for key in list(current_states.keys()):
+        current_states[key.replace("model.", "")] = current_states.pop(key)
 
     missing_keys, unexpected_keys = model.load_state_dict(current_states, strict=False)
 
