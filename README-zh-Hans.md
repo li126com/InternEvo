@@ -17,9 +17,9 @@
 [![使用文档](https://readthedocs.org/projects/internevo/badge/?version=latest)](https://internevo.readthedocs.io/zh_CN/latest/?badge=latest)
 [![license](./doc/imgs/license.svg)](./LICENSE)
 
-[📘使用教程](./doc/en/usage.md) |
-[🛠️安装指引](./doc/en/install.md) |
-[📊框架性能](./doc/en/train_performance.md) |
+[📘使用教程](./doc/usage.md) |
+[🛠️安装指引](./doc/install.md) |
+[📊框架性能](./doc/train_performance.md) |
 [🤔问题报告](https://github.com/InternLM/InternEvo/issues/new)
 
 [English](./README.md) |
