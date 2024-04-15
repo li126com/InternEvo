@@ -106,6 +106,8 @@ def train_check_norm_weight(args):
     train_iter = iter(train_dl)
 
     for batch_count in range(total_steps):
+        if gpc.is_rank_for_log() and batch_count % 100 == 0:
+            print(f"batch_count: {batch_count}", flush=True)
         if batch_count % 100 == 0:
             internlm_accelerator.empty_cache()
             gc.collect()
@@ -180,6 +182,7 @@ def test_check_norm_msp():
         pool.join()
 
     check_result(result)
+    print("msp check pass", flush=True)
 
 
 @pytest.mark.check_norm_fsp
@@ -195,6 +198,7 @@ def test_check_norm_fsp():
         pool.join()
 
     check_result(result)
+    print("fsp check pass", flush=True)
 
 
 @pytest.mark.check_norm_isp
@@ -210,3 +214,4 @@ def test_check_norm_isp():
         pool.join()
 
     check_result(result)
+    print("isp check pass", flush=True)

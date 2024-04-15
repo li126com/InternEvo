@@ -36,6 +36,7 @@ config_7B = Config(
             diag_outlier_ratio=1.1,
             train_folder=None,
             valid_folder=None,
+            num_worker=0,
         ),
         model=dict(
             checkpoint=False,
