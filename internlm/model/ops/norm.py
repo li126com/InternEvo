@@ -47,6 +47,8 @@ class RMSNormTorch(torch.nn.Module):
 
 
 class RMSNormNPU(torch.nn.Module):
+    """A custom NPU module for RMS normalization."""
+
     def __init__(self, normalized_shape, eps=1e-5):
         super().__init__()
         import torch_npu
