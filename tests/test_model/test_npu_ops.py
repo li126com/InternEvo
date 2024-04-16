@@ -17,6 +17,8 @@ from internlm.model.modules.multi_head_attention import (
     SelfAttention,
 )
 from internlm.model.ops.fusion_ops_import_helper import try_import_RMSNorm
+from internlm.model.ops.norm import RMSNormNPU, RMSNormTorch
+from internlm.utils.common import get_current_device
 
 RMSNorm = try_import_RMSNorm()
 
@@ -152,6 +154,32 @@ def npu_transform(B, S, N, N_KV, D, dtype, use_padding):
     )
 
 
+def check_RMSNormNPU():
+    device = get_current_device()
+    input = torch.randn(128).to(torch.float32).to(device)
+    input2 = input.clone().detach()
+
+    rmsnorm_torch = RMSNormTorch(128, eps=1e-5).to(torch.bfloat16).to(device)
+    output_torch = rmsnorm_torch(input)
+
+    rmsnorm_npu = RMSNormNPU(128, eps=1e-5).to(torch.bfloat16).to(device)
+    output_npu = rmsnorm_npu(input2)
+
+    if torch.equal(output_torch, output_npu):
+        print("RMSNorm check passed: totaly equal", flush=True)
+    else:
+        max_diff, index_max_diff = (output_torch - output_npu).abs().max(dim=0)
+        max_diff = max_diff.item()
+        index_max_diff = index_max_diff.item()
+        rtol = max_diff / abs(output_npu[index_max_diff])
+        print(
+            f"The relative error is {rtol}. Between {output_torch[index_max_diff]} and {output_npu[index_max_diff]}",
+            flush=True,
+        )
+        assert rtol <= 1e-5, f"RMSNorm check failed: The relative error is {rtol}"
+        print("RMSNorm check passed: allclose", flush=True)
+
+
 @pytest.mark.parametrize("micro_bsz", MICRO_BSZ_LIST)
 @pytest.mark.parametrize("test_dtype", DTYPE_LIST)
 @pytest.mark.parametrize("num_kv_head", NUM_KV_HEAD_LIST)
@@ -159,6 +187,11 @@ def npu_transform(B, S, N, N_KV, D, dtype, use_padding):
 def test_NPU_fa(micro_bsz, test_dtype, num_kv_head, use_padding):
     if internlm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
         npu_transform(micro_bsz, SEQ_LEN, HEAD_NUM, num_kv_head, HIDDEN_SZIE // HEAD_NUM, test_dtype, use_padding)
+
+
+def test_RMSNorm():
+    if internlm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
+        check_RMSNormNPU()
 
 
 if __name__ == "__main__":
