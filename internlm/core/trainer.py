@@ -64,7 +64,7 @@ class TrainState:
         self.tgs_statistic = {
             "sum_step": 0,
             "sum_tg": 0,
-            "sum_time": 0,
+            "total_time": 0,
             "sum_last_tg_10": 0,
             "sum_last_time_10": 0,
             "sum_last_tg_50": 0,

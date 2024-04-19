@@ -474,6 +474,7 @@ def record_current_batch_training_metrics(
     beta2_scheduler,
     trainer,
     start_time,
+    very_begining_time,
     loss,
     moe_loss,
     grad_norm,
@@ -512,7 +513,7 @@ def record_current_batch_training_metrics(
         tgs_statistic = train_state.tgs_statistic
         tgs_statistic["sum_step"] += 1
         tgs_statistic["sum_tg"] += tk_per_gpu
-        tgs_statistic["sum_time"] += time_cost
+        tgs_statistic["total_time"] = time.time() - very_begining_time
         tgs_statistic["sum_last_tg_10"] += tk_per_gpu
         tgs_statistic["sum_last_time_10"] += time_cost
         tgs_statistic["sum_last_tg_50"] += tk_per_gpu
@@ -543,7 +544,7 @@ def record_current_batch_training_metrics(
         last_tgs_10 = tgs_statistic["last_tgs_10"]
         last_tgs_50 = tgs_statistic["last_tgs_50"]
 
-        tgs_all = round(tgs_statistic["sum_tg"] / tgs_statistic["sum_time"], 2)
+        tgs_all = round(tgs_statistic["sum_tg"] / tgs_statistic["total_time"], 2)
         tgs_avg = round(tgs_statistic["sum_tgs"] / tgs_statistic["sum_step"], 2)
         tgs_SMA = round(tgs_statistic["SMA_tg_50"] / tgs_statistic["SMA_time_50"], 2)
 

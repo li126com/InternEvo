@@ -53,6 +53,7 @@ logger = logging.getLogger(__file__)
 
 
 def main(args):
+    very_begining_time = time.time()
     enable_pytorch_expandable_segments()
 
     # init setting
@@ -253,6 +254,7 @@ def main(args):
                 beta2_scheduler=beta2_scheduler,
                 trainer=trainer,
                 start_time=start_time,
+                very_begining_time=very_begining_time,
                 loss=loss,
                 moe_loss=moe_loss,
                 grad_norm=grad_norm_groups,
