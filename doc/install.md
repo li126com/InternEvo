@@ -91,3 +91,30 @@ docker pull internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-centos7
 docker run --gpus all -it -m 500g --cap-add=SYS_PTRACE --cap-add=IPC_LOCK --shm-size 20g --network=host --name myinternlm internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-centos7 bash
 ```
 容器内默认目录即 `/InternLM`，根据[使用文档](./usage.md)即可启动训练。
+
+
+## 环境安装（NPU）
+在搭载NPU的机器上安装环境的版本可参考GPU，在NPU上使用昇腾torch_npu代替torch，同时Flash-Attention和Apex不再支持安装，相应功能已由InternEvo代码内部实现。以下教程仅为torch_npu安装。
+
+torch_npu官方文档：https://gitee.com/ascend/pytorch
+
+### 环境安装样例
+- Linux OS
+- torch_npu: v2.1.0-6.0.rc1
+- NPU显卡：910B
+
+
+#### 安装torch_run
+
+参考文档：https://gitee.com/ascend/pytorch/tree/v2.1.0-6.0.rc1/
+
+安装时可尝试根据文档内方式安装，或者从 https://gitee.com/ascend/pytorch/releases 下载指定版本torch_npu进行安装，如下所示：
+
+```bash
+pip3 install torch==2.1.0+cpu --index-url https://download.pytorch.org/whl/cpu
+pip3 install pyyaml
+pip3 install setuptools
+wget https://gitee.com/ascend/pytorch/releases/download/v6.0.rc1-pytorch2.1.0/torch_npu-2.1.0.post3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+pip install torch_npu-2.1.0.post3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+```
+

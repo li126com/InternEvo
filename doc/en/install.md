@@ -92,3 +92,26 @@ For the local standard image built with dockerfile or pulled, use the following 
 docker run --gpus all -it -m 500g --cap-add=SYS_PTRACE --cap-add=IPC_LOCK --shm-size 20g --network=host --name myinternlm internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-centos7 bash
 ```
 The default directory in the container is `/InternLM`, please start training according to the [Usage](./usage.md).
+
+## Environment Installation (NPU)
+For machines with NPU, the version of the installation environment can refer to that of GPU. Use Ascend's torch_npu instead of torch on NPU machines. Additionally, Flash-Attention and Apex are no longer supported for installation on NPU. The corresponding functionalities have been internally implemented in the InternEvo codebase. The following tutorial is only for installing torch_npu.
+
+Official documentation for torch_npu: https://gitee.com/ascend/pytorch
+
+### Example Installation of Environment
+- Linux OS
+- torch_npu: v2.1.0-6.0.rc1
+- NPU card: 910B
+
+#### Installing torch_run
+Refer to the documentation: https://gitee.com/ascend/pytorch/tree/v2.1.0-6.0.rc1/
+
+You can try installing according to the methods in the documentation or download the specified version of torch_npu from https://gitee.com/ascend/pytorch/releases for installation, as shown below:
+
+```bash
+pip3 install torch==2.1.0+cpu --index-url https://download.pytorch.org/whl/cpu
+pip3 install pyyaml
+pip3 install setuptools
+wget https://gitee.com/ascend/pytorch/releases/download/v6.0.rc1-pytorch2.1.0/torch_npu-2.1.0.post3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+pip install torch_npu-2.1.0.post3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+```
