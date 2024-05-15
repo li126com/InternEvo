@@ -28,229 +28,277 @@ class BaseStore:
         return self._local_rank
 
 
-class BucketStore(BaseStore):
-    """
-    Bucket Store
-    """
-
-    def __init__(self, group_id, dp_parallel_mode):
-        super().__init__(dp_parallel_mode)
-        self._grads = dict()
-        self._params = dict()
-        self._num_elements_in_bucket = dict()
-        self._dp_parallel_mode = dp_parallel_mode
-        self._group_id = group_id
-
-        self.reset()
-
-    def num_elements_in_bucket(self, reduce_rank: int = None):
-        return self._num_elements_in_bucket[reduce_rank]
-
-    def num_params_in_bucket(self, reduce_rank: int = None):
-        return len(self._params[reduce_rank])
-
-    def get_param_group_id(self):
-        return self._group_id
-
-    def get_dp_parallel_mode(self):
-        return self._dp_parallel_mode
-
-    def add_num_elements_in_bucket(self, num_elements, reduce_rank: int = None):
-        self._num_elements_in_bucket[reduce_rank] += num_elements
-
-    def add_grad(self, tensor, reduce_rank: int = None):
-        self._grads[reduce_rank].append(tensor)
-
-    def add_param(self, tensor, reduce_rank: int = None):
-        self._params[reduce_rank].append(tensor)
-
-    def reset(self):
-        keys = [None] + list(range(self._world_size))
-        self._grads = {rank: [] for rank in keys}
-        self._params = {rank: [] for rank in keys}
-        self._num_elements_in_bucket = {rank: 0 for rank in keys}
-
-    def reset_by_rank(self, reduce_rank=None):
-        self._grads[reduce_rank] = []
-        self._params[reduce_rank] = []
-        self._num_elements_in_bucket[reduce_rank] = 0
-
-    def get_grad(self, reduce_rank: int = None):
-        return self._grads[reduce_rank]
-
-    def get_param(self, reduce_rank: int = None):
-        return self._params[reduce_rank]
 
 
-class GradientStore(BaseStore):
-    """
-    Gradient Store
-    """
+# class BucketStore(BaseStore):
+#     """
+#     Bucket Store
+#     """
 
-    def __init__(self, *args):
-        super().__init__(*args)
-        # bookkeeping data structures
-        self._averaged_gradients = dict()
+#     def __init__(self, group_id, dp_parallel_mode):
+#         super().__init__(dp_parallel_mode)
+#         self._grads = dict()
+#         self._params = dict()
+#         self._num_elements_in_bucket = dict()
+#         self._dp_parallel_mode = dp_parallel_mode
+#         self._group_id = group_id
+        
+#         self._padding_size = dict()
 
-        # for backward reduction hooks
-        self._grad_acc_objs = []
+#         self.reset()
+    
+#     def add_padding_size(self, padding_size, reduce_rank: int = None):
+#         self._padding_size[reduce_rank].append(padding_size)
 
-    def add_accumulate_grad_object(self, obj):
-        """
-        Keep :class:`AccumulateGrad` objects. If these objects are not kept, reduction hooks may not
-        be attached successfully.
+#     def num_elements_in_bucket(self, reduce_rank: int = None):
+#         return self._num_elements_in_bucket[reduce_rank]
 
-        :param obj: An object of :class:`AccumulateGrad` class
-        :type obj: :class:`AccumulateGrad`
-        """
+#     def num_params_in_bucket(self, reduce_rank: int = None):
+#         return len(self._params[reduce_rank])
 
-        self._grad_acc_objs.append(obj)
+#     def get_param_group_id(self):
+#         return self._group_id
 
-    def get_averaged_gradients_by_group(self, group_id: int) -> List[Tensor]:
-        """
-        Return average gradients of a parameter group
+#     def get_dp_parallel_mode(self):
+#         return self._dp_parallel_mode
 
-        :param group_id: The index of parameter group
-        :type group_id: int
+#     def add_num_elements_in_bucket(self, num_elements, reduce_rank: int = None):
+#         self._num_elements_in_bucket[reduce_rank] += num_elements
 
-        :return: Return the list of averaged gradients of a parameter group. Each element is a gradient,
-            not a parameter.
-        :rtype: List[torch.Tensor]
-        """
+#     def add_grad(self, tensor, reduce_rank: int = None):
+#         self._grads[reduce_rank].append(tensor)
 
-        return self._averaged_gradients[group_id]
+#     def add_param(self, tensor, reduce_rank: int = None):
+#         self._params[reduce_rank].append(tensor)
 
-    def add_average_gradient_by_group(self, group_id: int, tensor: Tensor) -> None:
-        """
-        Append an average gradient to the list of averaged gradients of a parameter group
+#     def reset(self):
+#         keys = [None] + list(range(self._world_size))
+#         self._grads = {rank: [] for rank in keys}
+#         self._params = {rank: [] for rank in keys}
+#         self._padding_size = {rank: [] for rank in keys}
+#         self._num_elements_in_bucket = {rank: 0 for rank in keys}
 
-        :param group_id: The index of a parameter group
-        :param tensor: A :class:`torch.Tensor` object
-        :type group_id: int
-        :type tensor: torch.Tensor
+#     def reset_by_rank(self, reduce_rank=None):
+#         self._grads[reduce_rank] = []
+#         self._params[reduce_rank] = []
+#         self._padding_size[reduce_rank] = []
+#         self._num_elements_in_bucket[reduce_rank] = 0
 
-        """
+#     def get_grad(self, reduce_rank: int = None):
+#         return self._grads[reduce_rank]
 
-        if group_id in self._averaged_gradients:
-            self._averaged_gradients[group_id].append(tensor)
-        else:
-            self._averaged_gradients[group_id] = [tensor]
-
-    def reset_average_gradients_by_group(self, group_id: int) -> None:
-        """
-        Reset the bookkeeping data structure for averaged gradients to an empty list
-
-        :param group_id: The index of a parameter group
-        :type group_id: int
-        """
-
-        self._averaged_gradients[group_id] = []
+#     def get_param(self, reduce_rank: int = None):
+#         return self._params[reduce_rank]
 
 
-class ParameterStore(BaseStore):
-    """
-    Parameter Store
-    """
+# class GradientStore(BaseStore):
+#     """
+#     Gradient Store
+#     """
 
-    def __init__(self, dp_paralle_mode):
-        super().__init__(dp_paralle_mode)
-        # param partitioning data structures
-        self._fp16_param_to_rank = dict()
-        self._rank_groupid_to_fp16_param_list = dict()
-        self._rank_group_id_to_flat_fp16_param = dict()
+#     def __init__(self, *args):
+#         super().__init__(*args)
+#         # bookkeeping data structures
+#         self._averaged_gradients = dict()
 
-        # param reduction data structures
-        self._is_param_reduced = dict()
-        self._reduced_param = []
+#         # for backward reduction hooks
+#         self._grad_acc_objs = []
 
-        self._bucket_reduced_param = {}
-        self._bucket_reduced_grad = {}
+#     def add_accumulate_grad_object(self, obj):
+#         """
+#         Keep :class:`AccumulateGrad` objects. If these objects are not kept, reduction hooks may not
+#         be attached successfully.
 
-    def set_param_to_rank(self, tensor: Tensor, rank: int) -> None:
-        """
-        Set the mapping between parameter to rank, each parameter should be owned by a rank.
+#         :param obj: An object of :class:`AccumulateGrad` class
+#         :type obj: :class:`AccumulateGrad`
+#         """
 
-        :param tensor: A :class:`torch.Tensor` object
-        :type tensor: torch.Tensor
-        :param rank: The rank of which the process is responsible for updating the parameter
-        :type rank: int
-        """
-        if tensor not in self._fp16_param_to_rank:
-            self._fp16_param_to_rank[tensor] = []
+#         self._grad_acc_objs.append(obj)
 
-        self._fp16_param_to_rank[tensor].append(rank)
+#     def get_averaged_gradients_by_group(self, group_id: int) -> List[Tensor]:
+#         """
+#         Return average gradients of a parameter group
 
-    def get_param_rank(self, tensor: Tensor) -> int:
-        """
-        Gives the rank which the parameter belongs to
+#         :param group_id: The index of parameter group
+#         :type group_id: int
 
-        :param tensor: A :class:`torch.Tensor` object
-        :type tensor: torch.Tensor
-        """
-        return self._fp16_param_to_rank[tensor]
+#         :return: Return the list of averaged gradients of a parameter group. Each element is a gradient,
+#             not a parameter.
+#         :rtype: List[torch.Tensor]
+#         """
 
-    def add_fp16_param_list_by_rank_group(self, rank, group_id, tensor_list) -> None:
-        if rank not in self._rank_groupid_to_fp16_param_list:
-            self._rank_groupid_to_fp16_param_list[rank] = dict()
+#         return self._averaged_gradients[group_id]
 
-        if group_id not in self._rank_groupid_to_fp16_param_list[rank]:
-            self._rank_groupid_to_fp16_param_list[rank][group_id] = []
+#     def add_average_gradient_by_group(self, group_id: int, tensor: Tensor) -> None:
+#         """
+#         Append an average gradient to the list of averaged gradients of a parameter group
 
-        self._rank_groupid_to_fp16_param_list[rank][group_id].extend(tensor_list)
+#         :param group_id: The index of a parameter group
+#         :param tensor: A :class:`torch.Tensor` object
+#         :type group_id: int
+#         :type tensor: torch.Tensor
 
-    def get_fp16_params_by_rank_group(self, rank, group_id) -> List[Tensor]:
-        return self._rank_groupid_to_fp16_param_list[rank][group_id]
+#         """
 
-    def add_flat_fp16_param_by_rank_group(self, rank, group_id, tensor) -> None:
-        if rank not in self._rank_group_id_to_flat_fp16_param:
-            self._rank_group_id_to_flat_fp16_param[rank] = dict()
+#         if group_id in self._averaged_gradients:
+#             self._averaged_gradients[group_id].append(tensor)
+#         else:
+#             self._averaged_gradients[group_id] = [tensor]
 
-        self._rank_group_id_to_flat_fp16_param[rank][group_id] = tensor
+#     def reset_average_gradients_by_group(self, group_id: int) -> None:
+#         """
+#         Reset the bookkeeping data structure for averaged gradients to an empty list
 
-    def get_flat_fp16_param_by_rank_group(self, rank, group_id) -> Tensor:
-        return self._rank_group_id_to_flat_fp16_param[rank][group_id]
+#         :param group_id: The index of a parameter group
+#         :type group_id: int
+#         """
 
-    def is_param_reduced(self, tensor):
-        return self._is_param_reduced[tensor]
+#         self._averaged_gradients[group_id] = []
 
-    def set_param_reduction_state(self, tensor, state):
-        self._is_param_reduced[tensor] = state
 
-    def get_param_reduction_states(self):
-        return self._is_param_reduced
+# class ParameterStore(BaseStore):
+#     """
+#     Parameter Store
+#     """
 
-    def reset_previous_reduced_params(self):
-        self._reduced_param = []
+#     def __init__(self, dp_paralle_mode):
+#         super().__init__(dp_paralle_mode)
+#         # param partitioning data structures
+#         self._fp16_param_to_rank = dict()
+#         self._rank_groupid_to_fp16_param_list = dict()
+#         self._rank_group_id_to_flat_fp16_param = dict()
 
-    def add_previous_reduced_param(self, tensor):
-        self._reduced_param.append(tensor)
+#         # param reduction data structures
+#         self._is_param_reduced = dict()
+#         self._reduced_param = []
 
-    def add_reduced_param_for_compute_norm(self, param):
-        group_id = getattr(param, "group_id")
-        if group_id not in self._bucket_reduced_param:
-            self._bucket_reduced_param[group_id] = []
-            self._bucket_reduced_grad[group_id] = []
+#         self._bucket_reduced_param = {}
+#         self._bucket_reduced_grad = {}
+        
+#         self._padding_map = dict()
+        
+#         # mapping working param and master param
+#         self.master_to_working_param = dict()
+#         self.working_to_master_param = dict()
+        
+#     def record_param_padding_size(self, param: Tensor, padding_size: int):
+#         """Record the padding size of a param
 
-        self._bucket_reduced_param[group_id].append(param)
-        self._bucket_reduced_grad[group_id].append(param.grad)
+#         Args:
+#             param (Tensor): The parameter
+#             padding_size (int): The padding size of the parameter
+#         """
 
-    def get_reduced_param_for_compute_norm(self, group_id=0):
-        if group_id not in self._bucket_reduced_param:
-            return [], []
-        return (
-            self._bucket_reduced_param[group_id],
-            self._bucket_reduced_grad[group_id],
-        )
+#         self._padding_map[id(param)] = padding_size
 
-    def reset_reduced_data_for_compute_norm(self):
-        self._bucket_reduced_param = {}
-        self._bucket_reduced_grad = {}
+#     def get_param_padding_size(self, param: Tensor) -> int:
+#         """Return the padding size of the parameter
 
-    def clear_grads_of_previous_reduced_params(self):
-        if len(self._reduced_param) > 0:
-            for param in self._reduced_param:
-                param.grad = None
-            self.reset_previous_reduced_params()
+#         Args:
+#             param (Tensor): The parameter
+
+#         Returns:
+#             int: the padding size of the parameter
+#         """
+
+#         return self._padding_map[id(param)]
+    
+#     def link_master_and_working_param(self, master_param: Tensor, working_param: Tensor):
+#         """Mapping master parameter and working parameter
+
+#         Args:
+#             master_param (Tensor): The parameter copy in optimizer
+#             working_param (Tensor): The parameter of the model
+#         """
+
+#         self.master_to_working_param[id(master_param)] = working_param
+#         self.working_to_master_param[id(working_param)] = master_param
+
+#     def set_param_to_rank(self, tensor: Tensor, rank: int) -> None:
+#         """
+#         Set the mapping between parameter to rank, each parameter should be owned by a rank.
+
+#         :param tensor: A :class:`torch.Tensor` object
+#         :type tensor: torch.Tensor
+#         :param rank: The rank of which the process is responsible for updating the parameter
+#         :type rank: int
+#         """
+#         if tensor not in self._fp16_param_to_rank:
+#             self._fp16_param_to_rank[tensor] = []
+
+#         self._fp16_param_to_rank[tensor].append(rank)
+
+#     def get_param_rank(self, tensor: Tensor) -> int:
+#         """
+#         Gives the rank which the parameter belongs to
+
+#         :param tensor: A :class:`torch.Tensor` object
+#         :type tensor: torch.Tensor
+#         """
+#         return self._fp16_param_to_rank[tensor]
+
+#     def add_fp16_param_list_by_rank_group(self, rank, group_id, tensor_list) -> None:
+#         if rank not in self._rank_groupid_to_fp16_param_list:
+#             self._rank_groupid_to_fp16_param_list[rank] = dict()
+
+#         if group_id not in self._rank_groupid_to_fp16_param_list[rank]:
+#             self._rank_groupid_to_fp16_param_list[rank][group_id] = []
+
+#         self._rank_groupid_to_fp16_param_list[rank][group_id].extend(tensor_list)
+
+#     def get_fp16_params_by_rank_group(self, rank, group_id) -> List[Tensor]:
+#         return self._rank_groupid_to_fp16_param_list[rank][group_id]
+
+#     def add_flat_fp16_param_by_rank_group(self, rank, group_id, tensor) -> None:
+#         if rank not in self._rank_group_id_to_flat_fp16_param:
+#             self._rank_group_id_to_flat_fp16_param[rank] = dict()
+
+#         self._rank_group_id_to_flat_fp16_param[rank][group_id] = tensor
+
+#     def get_flat_fp16_param_by_rank_group(self, rank, group_id) -> Tensor:
+#         return self._rank_group_id_to_flat_fp16_param[rank][group_id]
+
+#     def is_param_reduced(self, tensor):
+#         return self._is_param_reduced[tensor]
+
+#     def set_param_reduction_state(self, tensor, state):
+#         self._is_param_reduced[tensor] = state
+
+#     def get_param_reduction_states(self):
+#         return self._is_param_reduced
+
+#     def reset_previous_reduced_params(self):
+#         self._reduced_param = []
+
+#     def add_previous_reduced_param(self, tensor):
+#         self._reduced_param.append(tensor)
+
+#     def add_reduced_param_for_compute_norm(self, param):
+#         group_id = getattr(param, "group_id")
+#         if group_id not in self._bucket_reduced_param:
+#             self._bucket_reduced_param[group_id] = []
+#             self._bucket_reduced_grad[group_id] = []
+
+#         self._bucket_reduced_param[group_id].append(param)
+#         self._bucket_reduced_grad[group_id].append(param.grad)
+
+#     def get_reduced_param_for_compute_norm(self, group_id=0):
+#         if group_id not in self._bucket_reduced_param:
+#             return [], []
+#         return (
+#             self._bucket_reduced_param[group_id],
+#             self._bucket_reduced_grad[group_id],
+#         )
+
+#     def reset_reduced_data_for_compute_norm(self):
+#         self._bucket_reduced_param = {}
+#         self._bucket_reduced_grad = {}
+
+#     def clear_grads_of_previous_reduced_params(self):
+#         if len(self._reduced_param) > 0:
+#             for param in self._reduced_param:
+#                 param.grad = None
+#             self.reset_previous_reduced_params()
 
 
 class TensorBucket:
@@ -320,3 +368,380 @@ class TensorBucket:
             unflattened_tensor_list = _unflatten_dense_tensors(self._flat_tensor, self._bucket)
             for old, new in zip(self._bucket, unflattened_tensor_list):
                 old.copy_(new)
+
+
+
+
+
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
+from typing import List
+from typing import Dict
+from torch._utils import _flatten_dense_tensors
+import torch
+
+
+
+class BucketStore(BaseStore):
+    def __init__(self, torch_pg: ProcessGroup):
+        super().__init__(torch_pg)
+        self.reset_all()
+
+    def reset_all(self) -> None:
+        # init
+        self.current_group_id = 0
+        self._num_elements_in_bucket = 0
+        # mapping gradient slices and parameter
+        self.grad_to_param_mapping = dict()
+
+        self._grad_in_bucket = dict()
+        
+        self._grad_current_rank_for_group = dict()
+        self._param_list_for_group = dict()
+        self._padding_size_for_group = dict()
+        self.grad_to_param_mapping2 = dict()
+        self.offset_list_for_group = dict()
+        
+        self._param_list = []
+        self._padding_size = []
+        for rank in range(self._world_size):
+            self._grad_in_bucket[rank] = []
+
+        # offset_list records number of tensors in the bucket before each reduction
+        self.offset_list = [0]
+
+    def num_elements_in_bucket(self) -> int:
+        """Return the total number of elements in bucket
+
+        Returns:
+            int: the total number of elements in bucket
+        """
+
+        return self._num_elements_in_bucket
+
+    def reset_num_elements_in_bucket(self):
+        """Set the number of elements in bucket to zero."""
+
+        self._num_elements_in_bucket = 0
+
+    def add_param_grad(self, group_id: int, param: Tensor, padding_size: int):
+        """Add a param to bucket and record the padding size of a param for gradient padding
+
+        Args:
+            group_id (int): The index of a parameter group
+            param (Tensor): The parameter
+            padding_size (int): The padding size of the parameter
+        """
+        
+        # print(f"group_id: {group_id}", flush=True)
+
+        self._param_list.append(param)
+        
+        # if group_id not in self._param_list_for_group:
+        #     self._param_list_for_group[group_id] = []
+        #     self._padding_size_for_group[group_id] = []
+        #     self.offset_list_for_group[group_id] = [0]
+        # self._param_list_for_group[group_id].append(param)
+        # self._padding_size_for_group[group_id].append(padding_size)
+        # self.offset_list_for_group[group_id][-1] += 1
+        
+         
+        self._padding_size.append(padding_size)
+        self._num_elements_in_bucket += param.numel() + padding_size
+        self.current_group_id = group_id
+
+        # number of tensors in current bucket
+        self.offset_list[-1] += 1
+
+    def build_grad_in_bucket(self):
+        """Organize parameters' gradient(padding and split), follows the parameters' splitting method
+
+        Data structure of self._grad_in_bucket:
+        {
+        rank0: [grad0_rank0, grad1_rank0, ...]
+        rank1: [grad0_rank1, grad1_rank1, ...]
+        }
+        """
+        # for group_id in self._param_list_for_group:
+        #     for param, padding_size in zip(self._param_list_for_group[group_id], self._padding_size_for_group[group_id]):
+        #         if param.grad == None:
+        #             print(f"grad None: {param}", flush=True)
+        #         grad = param.grad.clone().detach().flatten()
+        #         if padding_size > 0:
+        #             with torch.no_grad():
+        #                 grad = torch.nn.functional.pad(grad.view(-1), [0, padding_size])
+        #         grad_list = grad.split(grad.numel() // self._world_size)
+                
+        #         grad_current_rank = grad_list[self._local_rank].clone().detach()
+        #         self.grad_to_param_mapping2[id(grad_current_rank)] = id(param)
+        #         if group_id not in self._grad_current_rank_for_group:
+        #             self._grad_current_rank_for_group[group_id] = []
+        #         self._grad_current_rank_for_group[group_id].append(grad_current_rank)
+        #     self.offset_list_for_group[group_id].append(0)
+
+        
+        for param, padding_size in zip(self._param_list, self._padding_size):
+            if param.grad == None:
+                print(f"grad None: {param}", flush=True)
+            grad = param.grad.clone().detach().flatten()
+            if padding_size > 0:
+                with torch.no_grad():
+                    grad = torch.nn.functional.pad(grad.view(-1), [0, padding_size])
+            grad_list = grad.split(grad.numel() // self._world_size)
+            for rank in range(self._world_size):
+                grad_current_rank = grad_list[rank].clone().detach()
+                self.grad_to_param_mapping[id(grad_current_rank)] = id(param)
+                self._grad_in_bucket[rank].append(grad_current_rank)
+            param.grad = None
+
+        self.offset_list.append(0)
+        
+
+
+    def get_grad(self) -> Dict:
+        """Return the dictionary of gradients slices, of which the keys are ranks
+
+        Returns:
+            Dict: The dictionary of gradients slices
+        """
+
+        return self._grad_in_bucket
+
+    def get_flatten_grad(self) -> Tensor:
+        """Return the flattened gradients slices in the bucket, the data organization of the flattened tensor:
+        [grad0_rank0, grad1_rank0, ..., grad_0_rank1, grad1_rank1, ....]
+
+        Returns:
+            Tensor: the flattened gradients slices in the bucket
+        """
+
+        flat_grad = []
+        for grad_list in self._grad_in_bucket.values():
+            flat_grad.append(_flatten_dense_tensors(grad_list))
+        flat_grad = _flatten_dense_tensors(flat_grad)
+        return flat_grad
+
+    def get_param_id_of_grad(self, grad: Tensor) -> int:
+        """Return the id of a parameter which the gradient slice belongs to
+
+        Args:
+            grad (Tensor): the gradient slice
+
+        Returns:
+            int: the id of a parameter which the gradient slice belongs to
+        """
+
+        return self.grad_to_param_mapping[id(grad)]
+
+    def reset(self):
+        """Reset the bucket storage after reduction, only release the tensors have been reduced"""
+        # for group_id in self.offset_list_for_group:
+        #     cur_offset = self.offset_list_for_group[group_id].pop(0)
+        #     self._param_list_for_group[group_id] = self._param_list_for_group[group_id][cur_offset:]
+        #     self._padding_size_for_group[group_id] = self._padding_size_for_group[group_id][cur_offset:]
+        #     for _ in range(cur_offset):
+        #         del self.grad_to_param_mapping2[next(iter(self.grad_to_param_mapping2))]
+            
+        #     self._grad_current_rank_for_group[group_id] = self._grad_current_rank_for_group[group_id][cur_offset:]
+            
+            
+        cur_offset = self.offset_list.pop(0)
+        self._param_list = self._param_list[cur_offset:]
+        self._padding_size = self._padding_size[cur_offset:]
+        for _ in range(cur_offset):
+            del self.grad_to_param_mapping[next(iter(self.grad_to_param_mapping))]
+        for rank in range(self._world_size):
+            self._grad_in_bucket[rank] = self._grad_in_bucket[rank][cur_offset:]
+
+
+
+class GradientStore(BaseStore):
+    def __init__(self, *args, partition_grad: bool = False):
+        super().__init__(*args)
+        """
+        self._grads_of_params mapping the parameter and its gradient slices
+        data structure:
+        {
+         group_id:{
+            param_id: [grad_rank0, grad_rank1, ...]
+          }
+        }
+        """
+        self._grads_of_params = dict()
+        # for zero2, it's `param_id: [grad_local_rank]`
+        self._working_index = 0 if partition_grad else self._local_rank
+
+        self.grad_to_param_mapping = dict()
+
+    def get_partitioned_gradients_by_param_id(self, group_id: int, param_id: int) -> List:
+        """Return list of gradient slices of a specific parameter
+
+        Args:
+            group_id (int): The index of a parameter group
+            param_id (int): The id of a parameter
+
+        Returns:
+            List: the list of gradient slices of a parameter.
+        """
+
+        if group_id in self._grads_of_params:
+            if param_id in self._grads_of_params[group_id]:
+                return self._grads_of_params[group_id][param_id]
+        # the param has no grad, for instance, in layer drop
+        return []
+
+    def append_gradients_by_param_id(self, grad: Tensor, group_id: int, param_id: int):
+        """Append a gradient slice to the parameter's gradient slice list
+
+        Args:
+            grad (Tensor): The gradient slice to append to list
+            group_id (int): The index of a parameter group
+            param_id (int): The id of a parameter
+        """
+
+        if group_id not in self._grads_of_params:
+            self._grads_of_params[group_id] = dict()
+        if param_id not in self._grads_of_params[group_id]:
+            self._grads_of_params[group_id][param_id] = [grad]
+        else:
+            self._grads_of_params[group_id][param_id].append(grad)
+
+        self.grad_to_param_mapping[id(grad)] = param_id
+
+    def add_gradients_by_param_id(self, grad: Tensor, grad_idx: int, group_id: int, param_id: int):
+        """Add a gradient slice on an existing slice of the parameter's gradient
+        Used when no_sync is not activated.
+
+        Args:
+            grad (Tensor): The split gradient to append to list
+            grad_idx (int): The index of the existing slice
+            group_id (int): The index of a parameter group
+            param_id (int): The id of a parameter
+        """
+
+        self._grads_of_params[group_id][param_id][grad_idx].add_(grad)
+
+    def get_working_grads_by_group_id(self, group_id: int) -> List:
+        """Return list of working gradient slices in the group
+
+        Args:
+            group_id (int): The index of a parameter group
+
+        Returns:
+            List: the list working gradient slices in the group
+        """
+
+        grad_list = []
+        # When using LoRa and the user sets multiple param_groups, it is possible that some param_groups have no parameters with gradients.
+        if group_id not in self._grads_of_params.keys():
+            return grad_list
+        for param_grads in self._grads_of_params[group_id].values():
+            grad_list.append(param_grads[self._working_index])
+
+        return grad_list
+
+    def get_working_grad_by_param_id(self, param_id) -> Tensor:
+        """
+        Return the working gradient for the specified parameter.
+
+        Args:
+            param_id (int): The index of the parameter.
+
+        Returns:
+            Tensor: The the working gradient slices for the specified param_id.
+        """
+
+        for group in self._grads_of_params.values():
+            if param_id in group.keys():
+                return group[param_id][self._working_index]
+
+        raise KeyError(f"Working gradient for param_id {param_id} not found.")
+
+    def reset_grads_by_group_id(self, group_id: int):
+        self._grads_of_params[group_id] = dict()
+
+    def reset_all_gradients(self):
+        self._grads_of_params = dict()
+
+    def get_param_id_for_grad(self, grad: Tensor) -> int:
+        """Return the id of a parameter which the gradient slice belongs to
+
+        Args:
+            grad (Tensor): the gradient slice
+
+        Returns:
+            int: the id of a parameter which the gradient slice belongs to
+        """
+
+        return self.grad_to_param_mapping[id(grad)]
+    
+
+
+class ParameterStore(BaseStore):
+    def __init__(self, torch_pg: ProcessGroup):
+        super().__init__(torch_pg)
+
+        # record the padding size of each param
+        self._padding_map = dict()
+
+        # mapping working param and master param
+        self.master_to_working_param = dict()
+        self.working_to_master_param = dict()
+        
+        self._bucket_reduced_param = {}
+        self._bucket_reduced_grad = {}
+
+    def record_param_padding_size(self, param: Tensor, padding_size: int):
+        """Record the padding size of a param
+
+        Args:
+            param (Tensor): The parameter
+            padding_size (int): The padding size of the parameter
+        """
+
+        self._padding_map[id(param)] = padding_size
+
+    def get_param_padding_size(self, param: Tensor) -> int:
+        """Return the padding size of the parameter
+
+        Args:
+            param (Tensor): The parameter
+
+        Returns:
+            int: the padding size of the parameter
+        """
+
+        return self._padding_map[id(param)]
+
+    def link_master_and_working_param(self, master_param: Tensor, working_param: Tensor):
+        """Mapping master parameter and working parameter
+
+        Args:
+            master_param (Tensor): The parameter copy in optimizer
+            working_param (Tensor): The parameter of the model
+        """
+
+        self.master_to_working_param[id(master_param)] = working_param
+        self.working_to_master_param[id(working_param)] = master_param
+        
+    def add_reduced_param_for_compute_norm(self, param):
+        group_id = getattr(param, "group_id")
+        if group_id not in self._bucket_reduced_param:
+            self._bucket_reduced_param[group_id] = []
+            self._bucket_reduced_grad[group_id] = []
+
+        self._bucket_reduced_param[group_id].append(param)
+        self._bucket_reduced_grad[group_id].append(param.grad)
+        
+    def get_reduced_param_for_compute_norm(self, group_id=0):
+        if group_id not in self._bucket_reduced_param:
+            return [], []
+        return (
+            self._bucket_reduced_param[group_id],
+            self._bucket_reduced_grad[group_id],
+        )
+    
+    def reset_reduced_data_for_compute_norm(self):
+        self._bucket_reduced_param = {}
+        self._bucket_reduced_grad = {}
+

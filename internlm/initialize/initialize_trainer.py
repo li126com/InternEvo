@@ -64,7 +64,7 @@ def initialize_trainer(
     # clip grad norm
     clip_grad_norm = gpc.config.hybrid_zero_optimizer.get("clip_grad_norm", 0.0)
 
-    assert isinstance(optimizer, BaseOptimizer), "optimizer must be instance of BaseOptimizer"
+    # assert isinstance(optimizer, BaseOptimizer), "optimizer must be instance of BaseOptimizer"
 
     # gradient handler, only support PipelineSharedModuleGradientHandler now
     if gpc.is_using_parallel_mode(ParallelMode.PIPELINE):

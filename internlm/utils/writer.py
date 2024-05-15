@@ -147,16 +147,16 @@ class Writer:
             self.add_scalar_step_counter += 1
             self.add_scalar_last_step = step
 
-        if self.add_scalar_step_counter == self.queue_max_length or step >= self.total_steps:
-            while len(self.add_scalar_buffer) > 0:
-                key, value, step = self.add_scalar_buffer.pop(0)
-                try:
-                    if self.enable_tb and self.tb_writer is not None:
-                        self.tb_writer.add_scalar(tag=key, scalar_value=value, global_step=step)
-                except Exception:
-                    traceback.print_exc()
+        # if self.add_scalar_step_counter == self.queue_max_length or step >= self.total_steps:
+        #     while len(self.add_scalar_buffer) > 0:
+        #         key, value, step = self.add_scalar_buffer.pop(0)
+        #         try:
+        #             if self.enable_tb and self.tb_writer is not None:
+        #                 self.tb_writer.add_scalar(tag=key, scalar_value=value, global_step=step)
+        #         except Exception:
+        #             traceback.print_exc()
 
-            self.add_scalar_step_counter = 0
+        #     self.add_scalar_step_counter = 0
 
     def add_scalars(self, key, value, step):
         self.add_scalars_buffer.append((key, value, step))
@@ -164,21 +164,22 @@ class Writer:
             self.add_scalars_step_counter += 1
             self.add_scalars_last_step = step
 
-        if self.add_scalars_step_counter == self.queue_max_length or step >= self.total_steps:
-            while len(self.add_scalars_buffer) > 0:
-                key, value, step = self.add_scalars_buffer.pop(0)
-                try:
-                    assert isinstance(value, dict)
-                    if self.enable_tb and self.tb_writer is not None:
-                        self.tb_writer.add_scalars(main_tag=key, tag_scalar_dict=value, global_step=step)
-                except Exception:
-                    traceback.print_exc()
+        # if self.add_scalars_step_counter == self.queue_max_length or step >= self.total_steps:
+        #     while len(self.add_scalars_buffer) > 0:
+        #         key, value, step = self.add_scalars_buffer.pop(0)
+        #         try:
+        #             assert isinstance(value, dict)
+        #             if self.enable_tb and self.tb_writer is not None:
+        #                 self.tb_writer.add_scalars(main_tag=key, tag_scalar_dict=value, global_step=step)
+        #         except Exception:
+        #             traceback.print_exc()
 
-            self.add_scalars_step_counter = 0
+        #     self.add_scalars_step_counter = 0
 
     def add_text(self, key, value, step):
-        try:
-            if self.enable_tb and self.tb_writer is not None:
-                self.tb_writer.add_text(tag=key, text_string=value, global_step=step)
-        except Exception:
-            traceback.print_exc()
+        pass
+        # try:
+        #     if self.enable_tb and self.tb_writer is not None:
+        #         self.tb_writer.add_text(tag=key, text_string=value, global_step=step)
+        # except Exception:
+        #     traceback.print_exc()

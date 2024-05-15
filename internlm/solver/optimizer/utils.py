@@ -172,6 +172,26 @@ def sync_param(flat_tensor, tensor_list):
         p.data = q.data
 
 
+def sync_tensor(flat_tensor, tensor_list):
+    """
+    Synchronize the flattened tensor and unflattened tensor list. When
+    a list of tensor are flattened with `torch._utils._unflatten_dense_tensors`,
+    a new tensor is created. Thus, the flat tensor and original tensor list do not
+    share the same memory space. This function will update the tensor list so that
+    they point to the same value.
+
+    :param flat_tensor: A flat tensor obtained by calling `torch._utils._unflatten_dense_tensors` on a tensor list
+    :param tensor_list: A list of tensors corresponding to the flattened tensor
+    :type flat_tensor: torch.Tensor
+    :type tensor_list: List[torch.Tensor]
+    """
+    updated_params = unflatten(flat_tensor, tensor_list)
+
+    # update the tensor data
+    for p, q in zip(tensor_list, updated_params):
+        p.data = q.data
+
+
 def multi_tensor_l2norm_torch(tensor_list, per_tensor):
     # Convert tensor_list elements to torch.float32
     tensor_list = [tensor.float() for tensor in tensor_list]
@@ -260,7 +280,7 @@ def reduce_grads(gradients, parameters, weight_parallel_mode):
     return parallel_grads
 
 
-def compute_norm(gradients, parameters, norm_type=2, zero_mode=ParallelMode.ZERO1):
+def compute_norm(gradients, parameters, norm_type=2, zero_mode=ParallelMode.ZERO1, group_id=None):
     """Get the norm
     Arguments:
         gradients (Iterable[Tensor]): The gradient value.
@@ -372,6 +392,12 @@ def compute_norm(gradients, parameters, norm_type=2, zero_mode=ParallelMode.ZERO
 
     if math.isnan(total_norm):
         total_norm = -2
+        
+    total_norm = total_norm ** 0.5
+    
+    # if gpc.get_global_rank() == 0 and group_id == 0:
+    #     print('save new pt')
+    #     torch.save(total_norm, "/mnt/petrelfs/lijiaxing/splite_zero_2/InternEvo/new_grads.pt")
 
     return total_norm
 
@@ -473,10 +499,12 @@ class DynamicGradScaler(BaseGradScaler):
 
         if self._min_scale:
             assert self._min_scale > 0, "The minimum gradient scale cannot be zero or negative"
+            assert self._min_scale <= self._scale, "The minimum gradient scale cannot be greater than the current scale"
         if self._max_scale:
             assert self._min_scale > 0, "The maximum gradient scale cannot be zero or negative"
+            assert self._max_scale >= self._scale, "The maximum gradient scale cannot be smaller than the current scale"
         assert self._growth_factor > 1, "The growth factor cannot be equal or smaller than 1"
-        assert self._backoff_factor < 1 and self._backoff_factor > 0, "The backoff factor must be between 0 and 1"
+        assert 0 < self._backoff_factor < 1, "The backoff factor must be between 0 and 1"
         assert self._hysteresis >= 0, "The hysteresis cannot be negative"
 
     def update(self, overflow: bool) -> None:

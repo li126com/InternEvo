@@ -337,11 +337,9 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
 
     if not gpc.config.parallel.zero1.fsdp:
         optimizer = HybridZeroOptimizer(
-            naive_optimizer,
+            optimizer=naive_optimizer,
             grad_scal_cfg=grad_scal_cfg,
             zero_cfg=zero_cfg,
-            param_bcast_sync_handler=param_bcast_sync_handler,
-            isp_communicator=isp_communicator,
         )
     else:
         optimizer = FSDPadaptOptimizer(
@@ -497,6 +495,8 @@ def record_current_batch_training_metrics(
             scaler = trainer.engine.optimizer.grad_scaler._scale.item()
         elif hasattr(trainer.engine.optimizer.optim, "grad_scaler"):
             scaler = trainer.engine.optimizer.optim.grad_scaler._scale.item()
+        
+        # scaler = "None"
 
         num_tokens_in_batch = batch[1].nelement()
         real_num_tokens = math.ceil(acc_perplex.pop("real_token_num") / gpc.get_world_size(ParallelMode.GLOBAL))

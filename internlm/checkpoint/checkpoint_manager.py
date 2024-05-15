@@ -210,8 +210,9 @@ def try_load_internlm_ckpt_func(ckpt_mm, load_info, *args, func=None, **kwargs):
     load_content_str += f"{CheckpointLoadContent.MODEL}, "
     internlm_accelerator.synchronize()
 
-    if isinstance(ckpt_mm.optimizer, HybridZeroOptimizer):
-        reload_zero_fp32_buff(ckpt_mm.optimizer)
+    ### todo
+    # if isinstance(ckpt_mm.optimizer, HybridZeroOptimizer):
+    #     reload_zero_fp32_buff(ckpt_mm.optimizer)
 
 
 class CheckpointManager:
@@ -551,10 +552,11 @@ now step_count is {train_state.step_count}",
             load_content_str = load_func(self, self.load_ckpt_info, train_state)
 
             # If we only load model weight, we need rewrite zero optim's fp32 buffer.
-            if (
-                load_content.only_load(CheckpointLoadContent.MODEL) and isinstance(self.optimizer, HybridZeroOptimizer)
-            ) or gpc.config.get("only_load_lr", False):
-                reload_zero_fp32_buff(self.optimizer)
+            ### todo
+            # if (
+            #     load_content.only_load(CheckpointLoadContent.MODEL) and isinstance(self.optimizer, HybridZeroOptimizer)
+            # ) or gpc.config.get("only_load_lr", False):
+            #     reload_zero_fp32_buff(self.optimizer)
 
             if gpc.is_rank_for_log():
                 logger.info(f"load_ckpt_info : {self.load_ckpt_info}")
