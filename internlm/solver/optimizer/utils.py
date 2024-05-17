@@ -393,11 +393,12 @@ def compute_norm(gradients, parameters, norm_type=2, zero_mode=ParallelMode.ZERO
     if math.isnan(total_norm):
         total_norm = -2
         
-    total_norm = total_norm ** 0.5
+    # Needed for colossalAI    
+    # total_norm = total_norm ** 0.5
     
     # if gpc.get_global_rank() == 0 and group_id == 0:
     #     print('save new pt')
-    #     torch.save(total_norm, "/mnt/petrelfs/lijiaxing/splite_zero_2/InternEvo/new_grads.pt")
+    #     torch.save(total_norm, "/mnt/petrelfs/lijiaxing/splite_zero_2/InternEvo/new_grads_3.pt")
 
     return total_norm
 

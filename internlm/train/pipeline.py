@@ -340,6 +340,8 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
             optimizer=naive_optimizer,
             grad_scal_cfg=grad_scal_cfg,
             zero_cfg=zero_cfg,
+            param_bcast_sync_handler=param_bcast_sync_handler,
+            isp_communicator=isp_communicator,
         )
     else:
         optimizer = FSDPadaptOptimizer(

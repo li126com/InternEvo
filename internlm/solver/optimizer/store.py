@@ -573,7 +573,7 @@ class GradientStore(BaseStore):
 
         self.grad_to_param_mapping = dict()
 
-    def get_partitioned_gradients_by_param_id(self, group_id: int, param_id: int) -> List:
+    def get_partitioned_gradients_by_param_id(self, group_id: int, param_id: int, temp=None) -> List:
         """Return list of gradient slices of a specific parameter
 
         Args:
@@ -587,6 +587,11 @@ class GradientStore(BaseStore):
         if group_id in self._grads_of_params:
             if param_id in self._grads_of_params[group_id]:
                 return self._grads_of_params[group_id][param_id]
+            # else:
+            #     print(f"get_partitioned_gradients_by_param_id no param_id {param_id}, pp: {gpc.get_local_rank(ParallelMode.PIPELINE)}, temp: {temp}", flush=True)
+
+        # else:
+        #     print(f"get_partitioned_gradients_by_param_id no groupid {group_id}, pp: {gpc.get_local_rank(ParallelMode.PIPELINE)}, temp: {temp}", flush=True)
         # the param has no grad, for instance, in layer drop
         return []
 

@@ -45,11 +45,13 @@ from internlm.utils.parallel import is_using_isp, is_using_sequence_parallel
 
 
 from internlm.utils.common import get_current_device
-
+from internlm.utils.logger import get_logger
+from internlm.monitor import send_alert_message
 
 from abc import ABC, abstractmethod
 from torch import Tensor
 import math
+
 
 def calculate_global_norm_from_list(norm_list):
     """Compute total from a list of norms"""
@@ -69,6 +71,8 @@ from typing import Union
 from internlm.core.context import Config, ParallelMode
 from .base_optimizer import BaseOptimizer
 
+logger = get_logger(__file__)
+
 
 class HybridZeroOptimizer(BaseOptimizer):
     """Optimizer used for ZeRO-1 and ZeRO-2."""
@@ -78,6 +82,8 @@ class HybridZeroOptimizer(BaseOptimizer):
         optimizer: Optimizer,
         grad_scal_cfg,
         zero_cfg,
+        param_bcast_sync_handler,
+        isp_communicator,
         verbose: bool = False,
         communication_dtype: Optional[torch.dtype] = None,
         overlap_communication: bool = False,
@@ -105,8 +111,18 @@ class HybridZeroOptimizer(BaseOptimizer):
         clip_grad_norm = zero_cfg.clip_grad_norm
         self._overlap_sync_grad = zero_cfg.overlap_sync_grad
         self._overlap_sync_param = zero_cfg.overlap_sync_param
+        self.use_isp = is_using_isp()
+        
+        self._param_bcast_sync_handler = param_bcast_sync_handler
+        
+        if self._overlap_sync_param:
+            assert self._param_bcast_sync_handler is not None
+
+        self._isp_communicator = isp_communicator
         
         super(HybridZeroOptimizer, self).__init__(optim=optimizer)
+        
+        self.use_isp = False
 
         self._dtype = self.optim.param_groups[0]["params"][0].dtype
         self._verbose = verbose
@@ -177,9 +193,10 @@ class HybridZeroOptimizer(BaseOptimizer):
 
         # ParameterStore will manage the tensor buffers used for zero
         # it will not manage the tensors used by mixed precision training
+        parallel_mode = ParallelMode.WEIGHT_DATA if self.use_isp else ParallelMode.DATA
         self._param_store = ParameterStore(ParallelMode.ZERO1)
-        self._grad_store = GradientStore(ParallelMode.DATA, partition_grad=partition_grad)
-        self._bucket_store = BucketStore(ParallelMode.DATA)
+        self._grad_store = GradientStore(parallel_mode, partition_grad=partition_grad)
+        self._bucket_store = BucketStore(parallel_mode)
 
         # moe param should not be stored in working_groups
         # because they have different parallel strategy
@@ -207,12 +224,8 @@ class HybridZeroOptimizer(BaseOptimizer):
 
             # add the working params to working_param_groups for bookkeeping
             self._working_param_groups[group_id] = group_params
-            # print(f"len group_params: {gpc.get_global_rank()}, {group_id}, {len(group_params)}", flush=True)
-
-
             master_param_current_rank = self._create_master_param_current_rank(group_params)
             self._master_param_groups_of_current_rank[group_id] = master_param_current_rank
-            # print(f"len self._master_param_groups_of_current_rank[group_id]: {gpc.get_global_rank()}, {group_id}, {len(self._master_param_groups_of_current_rank[group_id])}", flush=True)
 
             # need to replace the params in the `params` field in the optimizer
             # so that when the optimizer calls step(), it only updates the tensors
@@ -249,10 +262,12 @@ class HybridZeroOptimizer(BaseOptimizer):
         # reduction hook is only used if overlapping communication
         # or stage 2 is used
         # if it is stage 1 without overlapping, no hook will be attached
+        # colossalAI hook, not currently used
         if self._overlap_communication or self._partition_grads:
             print("_attach_reduction_hook", flush=True)
             self._attach_reduction_hook()
-            
+        
+        # InternEvo origin hook    
         self._attach_reduction_hook_2()
         
         
@@ -331,11 +346,9 @@ class HybridZeroOptimizer(BaseOptimizer):
                     assert (
                         param.dtype == self._dtype
                     ), f"Parameters are expected to have the same dtype `{self._dtype}`, but got `{param.dtype}`"
+    
                     
     def add_hook_for_splited_param(self, origin_param, splited_param_current_rank):
-        if hasattr(origin_param, "pipeline_shared_module_pg"):
-            value = getattr(origin_param, "pipeline_shared_module_pg")
-            setattr(splited_param_current_rank, "pipeline_shared_module_pg", value)
         
         if hasattr(origin_param, IS_TENSOR_ZERO_PARALLEL):
             value = getattr(origin_param, IS_TENSOR_ZERO_PARALLEL)
@@ -364,12 +377,9 @@ class HybridZeroOptimizer(BaseOptimizer):
         params_current_rank = []
         device = "cpu" if self._cpu_offload else get_current_device()
         
-        # print(f"len create0: {gpc.get_global_rank()}, {len(param_list)}", flush=True)
-
         for param in param_list:
             padding_size = (self._world_size - param.numel() % self._world_size) % self._world_size
             self._param_store.record_param_padding_size(param, padding_size)
-            # print(f"attr param: {hasattr(param, IS_TENSOR_ZERO_PARALLEL)}", flush=True)
 
             with torch.no_grad():
                 if padding_size > 0:
@@ -380,7 +390,6 @@ class HybridZeroOptimizer(BaseOptimizer):
                 else:
                     padding_param = param.data.view(-1)
 
-                # print(f"attr padding_param: {hasattr(padding_param, IS_TENSOR_ZERO_PARALLEL)}", flush=True)
                 splited_params = padding_param.split(padding_param.numel() // self._world_size)
                 splited_params = splited_params[self._local_rank]
 
@@ -390,18 +399,11 @@ class HybridZeroOptimizer(BaseOptimizer):
                 else:
                     splited_param_current_rank = splited_params
                     
-
-                    
                 self.add_hook_for_splited_param(param, splited_param_current_rank)
                 
-                # print(f"attr splited_param_current_rank: {type(splited_param_current_rank)}, {hasattr(splited_param_current_rank, IS_TENSOR_ZERO_PARALLEL)}", flush=True)
-
-                
-
                 params_current_rank.append(splited_param_current_rank)
                 self._param_store.link_master_and_working_param(splited_param_current_rank, param)
                 
-        # print(f"len create: {gpc.get_global_rank()}, {len(param_list)}, {len(params_current_rank)}", flush=True)
 
         return params_current_rank
 
@@ -427,7 +429,7 @@ class HybridZeroOptimizer(BaseOptimizer):
     # Reduction Functions #
     #######################
 
-    def _run_reduction(self):
+    def _run_reduction(self, temp=None):
         if self._bucket_store.num_elements_in_bucket() > 0:
             self._bucket_store.build_grad_in_bucket()
 
@@ -581,6 +583,8 @@ class HybridZeroOptimizer(BaseOptimizer):
         for rank, grad_list in enumerate(origin_grad_list):
             sync_tensor(flat_grad_list[rank], grad_list)
             for grad in grad_list:
+                if grad == None:
+                    print("_update_unpartitoned_grad grad None", flush=True)
                 param_id = self._bucket_store.get_param_id_of_grad(grad)
                 self._add_grad(grad, self._world_size, group_id, param_id, rank)
 
@@ -604,7 +608,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         param_id: int,
         rank: int = 0,
     ) -> None:
-        if len(self._grad_store.get_partitioned_gradients_by_param_id(group_id, param_id)) < partition_num:
+        if len(self._grad_store.get_partitioned_gradients_by_param_id(group_id, param_id, "_add_grad")) < partition_num:
             self._grad_store.append_gradients_by_param_id(grad, group_id, param_id)
         else:
             self._grad_store.add_gradients_by_param_id(grad, rank, group_id, param_id)
@@ -620,7 +624,7 @@ class HybridZeroOptimizer(BaseOptimizer):
             self._bucket_store.num_elements_in_bucket() + param_size > self._reduce_bucket_size
             or group_id != self._bucket_store.current_group_id
         ):
-            self._run_reduction()
+            self._run_reduction("_add_to_bucket")
 
         padding_size = self._param_store.get_param_padding_size(param)
         self._bucket_store.add_param_grad(group_id, param, padding_size)
@@ -632,68 +636,40 @@ class HybridZeroOptimizer(BaseOptimizer):
     def backward(self, loss, retain_graph=False):
         assert not (
             self._partition_grads and not self.require_grad_sync
-        ), "ZeRO2(partition_grads) and no_sync are not compatible"
+        ), "ZeRO2(partition_grads) and no_sync are not compatible"     
         
-        
-
         loss = self.loss_scale * loss
 
         loss.backward(retain_graph=retain_graph)
         
-        # for group_id, param_group in enumerate(self.optim.param_groups):
-        #     for param in param_group["params"]:
-        #         print(f"grad1: {param.grad}", flush=True)
-        #         break
-        # for group_id, param_group in enumerate(self.optim.param_groups):
-        #     for param in self._master_param_groups_of_current_rank[group_id]:
-        #         print(f"grad1: {param.grad}", flush=True)
-        #         break
-            
-        # for group_id in range(self.num_param_groups):
-        #     param_group = self._working_param_groups[group_id]
-        #     for param in param_group:
-        #         print(f"grad3: {param.grad}", flush=True)
-        #         break
-            
 
         if not self.require_grad_sync:
             return
 
         self._reduce_grad(self._partition_grads)
         
-        # for group_id, param_group in enumerate(self.optim.param_groups):
-        #     for param in param_group["params"]:
-        #         print(f"grad2: {param.grad}", flush=True)
-        #         break
-        
-        # for group_id in range(self.num_param_groups):
-        #     param_group = self._working_param_groups[group_id]
-        #     for param in param_group:
-        #         print(f"grad4: {param.grad}", flush=True)
-        #         break
 
         # clear reduced grads
         if self._overlap_communication:
             torch.cuda.synchronize()
         self.zero_grad()
 
-    # def backward_by_grad(self, tensor, grad):
-    #     print("backward_by_grad", flush=True)
-    #     assert not (
-    #         self._partition_grads and not self.require_grad_sync
-    #     ), "ZeRO2(partition_grads) and gradient accumulation(no_sync) are not compatible"
+    def backward_by_grad(self, tensor, grad):
+        assert not (
+            self._partition_grads and not self.require_grad_sync
+        ), "ZeRO2(partition_grads) and gradient accumulation(no_sync) are not compatible"
 
-    #     torch.autograd.backward(tensor, grad)
+        torch.autograd.backward(tensor, grad)
 
-    #     if not self.require_grad_sync:
-    #         return
-    #     self._reduce_grad(self._partition_grads)
+        if not self.require_grad_sync:
+            return
+        self._reduce_grad(self._partition_grads)
 
-    #     # clear reduced grads
-    #     if self._overlap_communication:
-    #         torch.cuda.synchronize()
+        # clear reduced grads
+        if self._overlap_communication:
+            torch.cuda.synchronize()
 
-    #     self.zero_grad()
+        self.zero_grad()
 
     def zero_grad(self, set_to_none=True):
         """
@@ -718,15 +694,13 @@ class HybridZeroOptimizer(BaseOptimizer):
     ####################
 
     def step(self, closure=None):
-        # print("enter step", flush=True)
         assert closure is None, "closure is not supported by step()"
         if not self.require_grad_sync:
             return
 
         if self.should_skip_step():
             self._grad_store.reset_all_gradients()
-            if self._verbose:
-                print("Found overflow. Skip step")
+            print("Found overflow. Skip step", flush=True)
             self.zero_grad()
             return
 
@@ -741,20 +715,26 @@ class HybridZeroOptimizer(BaseOptimizer):
         real_master_params = dict()
         real_master_grads = dict()
         grad_index = 0 if self._partition_grads else self._local_rank
-            
+        total_norms = {}
+        single_grad_partition_groups = []
+
+        
         for group_id in range(self.num_param_groups):
             master_params = self._master_param_groups_of_current_rank[group_id]
             real_working_params[group_id] = []
             real_master_params[group_id] = []
             real_master_grads[group_id] = []
+            fp32_avg_grads = []
+            
+            
             for splited_param in master_params:
                 working_param = self._param_store.master_to_working_param[id(splited_param)]
                 # if a working param requires grad and has no grad
                 # it is not 'really' working, e.g. the droped layer
                 # else the splited grad should be attached to the splited param
-                grads = self._grad_store.get_partitioned_gradients_by_param_id(group_id, id(working_param))
-                # print(f"len grads: {gpc.get_global_rank()}, {len(grads)}", flush=True)
-
+                grads = self._grad_store.get_partitioned_gradients_by_param_id(group_id, id(working_param), "working_param")
+                if len(grads) == 0:
+                    print(f"grads: {gpc.get_local_rank(ParallelMode.PIPELINE)}, len(grads): {len(grads)}, group_id: {group_id}", flush=True)
                 if len(grads) > 0:
                     # moe hybrid zero
                     if self.moe_extra_dp_pg is not None and False:
@@ -775,56 +755,58 @@ class HybridZeroOptimizer(BaseOptimizer):
                         grad = grad.to(splited_param.dtype).to(splited_param.device)
                     splited_param.grad = grad
                     grad_partition_groups.append(grad)
+                    fp32_avg_grads.append(grad)
                     real_master_params[group_id].append(splited_param)
                     real_master_grads[group_id].append(splited_param.grad)
+                 
+            
+            if fp32_avg_grads != []:
+                single_grad_partition_groups.append(flatten(fp32_avg_grads))
+                    
+                    
 
             # compute norm
-            # print(f"group_id2: {group_id}", flush=True)
-            # print(f"debug: {len(self._master_param_groups_of_current_rank)}, {len(self._bucket_store._grad_current_rank_for_group)}", flush=True)
-            
-            # param_group = self._working_param_groups[group_id]
-            # param_group = self._master_param_groups_of_current_rank[group_id]
-            # print(f"check2: {len(param_group)}, {len(real_master_params[group_id])}", flush=True)
+          
             # for param1, param2 in zip(param_group, real_master_params[group_id]):
             #     print(f"equal2: {id(param1) == id(param2)}", flush=True)
             
-            # for group_id in range(self.num_param_groups):
-            #     release_param_grad(self._master_param_groups_of_current_rank[group_id])
-            
-            # working_grads = self._grad_store.get_working_grads_by_group_id(group_id)
-            # # working_grads = self._bucket_store._grad_current_rank_for_group[group_id]
             
             # print(f"check: {len(param_group)}, {len(working_grads)}", flush=True)
             # for param, grad in zip(param_group, working_grads):
             #     print(f"equal: {param.grad}, {self._grad_store.get_param_id_for_grad(grad) == id(param)}", flush=True)
             
             
-            
             param_group = real_master_params[group_id]
             working_grads = real_master_grads[group_id]
-            
-            # if gpc.get_global_rank() == 0 and group_id == 0:
-            #     print('save new pt')
-            #     torch.save(working_grads, "/mnt/petrelfs/lijiaxing/splite_zero_2/InternEvo/new_grads.pt")
             
             # param_group = self._working_param_groups[group_id]
             # working_grads = self._grad_store.get_working_grads_by_group_id(group_id)
             
-            # print(f"len param_group: {gpc.get_global_rank()}, {type(param_group)}, {len(param_group)}", flush=True)
             # if len(param_group) > 0:
-            #     print(f"attr param_group: {hasattr(param_group[0], IS_TENSOR_ZERO_PARALLEL)}", flush=True)
-
+            #     for param, grad in zip(param_group, working_grads):
+            #         print(f"equal: {param.grad}, {self._grad_store.get_param_id_for_grad(grad) == id(param)}", flush=True)
             
+      
+            # colossalAI
             # norm_group = self._compute_grad_norm(gradients=working_grads)
-            norm_group = self._compute_norm(group_id=group_id, gradients=working_grads, parameters=param_group, zero_mode=self._broadcast_parallel_mode)
-
-            norm_groups.append(norm_group)
-
+            
+            
+            # InternEvo            
+            group_name = self.param_groups[group_id]["name"] if "name" in self.param_groups[group_id] else "default"
+            group_name = f"{group_id}_{group_name}"
+            total_norms[group_name] = self._compute_norm(group_id=group_id, gradients=working_grads, parameters=param_group, zero_mode=self._broadcast_parallel_mode)
+            
+            
+            # colossalAI modified with _compute_norm
+            # norm_group = self._compute_norm(group_id=group_id, gradients=working_grads, parameters=param_group, zero_mode=self._broadcast_parallel_mode)
+            # norm_groups.append(norm_group)
+            
+            
             self._grad_store.reset_grads_by_group_id(group_id)
 
             # update the params in the optimizer
             self.optim.param_groups[group_id]["params"] = real_master_params[group_id]
-
+            
         # update param for moe ep
         # move grad to master param and compute norm
         if len(self.working_moe_params) > 0:
@@ -844,10 +826,61 @@ class HybridZeroOptimizer(BaseOptimizer):
             norm_groups.append(norm_group)
             self.optim.param_groups[-1]["params"] = self.master_moe_params
             del moe_grads
+            
+        
+        
+        found_inf = False
+        found_nan = False
+        
+        if -1 in total_norms.values():
+            found_inf = True
 
+        if -2 in total_norms.values():
+            found_nan = True
+        
+        if gpc.config.model.dtype is not torch.float32:
+            self.grad_scaler.update(found_inf)
+        
+        # update loss scale if overflow occurs
+        if found_inf:
+            if gpc.is_rank_for_log():
+                logger.warning("Overflow occurs, please check it.")
+                send_alert_message(
+                    address=gpc.config.monitor.alert.feishu_alert_address,
+                    message="Overflow occurs, please check it.",
+                )
+            self._grad_store._averaged_gradients = dict()
+            self.zero_grad()
+            return False, total_norms
+
+        if found_nan:
+            if gpc.is_rank_for_log():
+                logger.warning("Nan grad norm occurs, please check it.")
+                send_alert_message(
+                    address=gpc.config.monitor.alert.feishu_alert_address,
+                    message="Nan grad norm  occurs, please check it.",
+                )
+            self._grad_store._averaged_gradients = dict()
+            self.zero_grad()
+            return False, total_norms
+        
+         
+        global_norm_groups = {}
+        if self._clip_grad_norm > 0:
+            for group_name, norm in total_norms.items():
+                global_norm_groups[group_name] = norm**0.5
+
+        
+        # collossalAI
         # unscale and clip grads
-        global_norm = calculate_global_norm_from_list(norm_list=norm_groups)
-        self._unscale_and_clip_grads(grad_partition_groups, global_norm)
+        # global_norm = calculate_global_norm_from_list(norm_list=norm_groups)
+        # self._unscale_and_clip_grads(grad_partition_groups, global_norm)
+        
+        
+        # InternEvo
+        self._unscale_and_clip_grads(single_grad_partition_groups, list(global_norm_groups.values()))
+        
+        
 
         # update the parameters
         self.optim.step()
@@ -869,6 +902,11 @@ class HybridZeroOptimizer(BaseOptimizer):
         device = get_current_device()
         for group_id in range(self.num_param_groups):
             master_working_param = self.optim.param_groups[group_id]["params"]
+            # master_param = self._master_param_groups_of_current_rank[group_id]
+            # print(type(master_param))
+            # print(f"len_test: {len(list(master_param))}, {len(list(master_working_param))}", flush=True)
+            # for param1, param2 in zip(master_param, master_working_param):
+            #     print(f"equal_test: {id(param1)==id(param2)}", flush=True)
             for idx, splited_param in enumerate(master_working_param):
                 working_param = real_working_params[group_id][idx]
                 if self.moe_extra_dp_pg is not None and False:
@@ -894,7 +932,11 @@ class HybridZeroOptimizer(BaseOptimizer):
                 working_param.data.copy_(flatten(all_splited_param)[: working_param.numel()].reshape_as(working_param))
             self.optim.param_groups[group_id]["params"] = self._master_param_groups_of_current_rank[group_id]
 
-        return True, global_norm
+        for group_name, global_norm in global_norm_groups.items():
+            global_norm_groups[group_name] = global_norm / self.loss_scale
+        
+        
+        return True, global_norm_groups
     
     def _compute_norm(self, group_id, gradients, parameters, zero_mode):
         # compute norm for gradients that have been reduced
@@ -902,8 +944,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         params = parameters
         grads = gradients
         params_is_padding = False
-        # print(f"len(params): {len(params)}", flush=True)
-        # assert len(params) > 0
+
         if len(params) == 0:
             return 0
             params_is_padding = True
@@ -914,10 +955,10 @@ class HybridZeroOptimizer(BaseOptimizer):
 
             if self.optim.param_groups[group_id]["name"] == "default":
                 for param in params:
-                    if self.use_isp:
-                        setattr(param, IS_WEIGHT_ZERO_PARALLEL, True)
-                    else:
-                        setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
+                    # if self.use_isp:
+                    #     setattr(param, IS_WEIGHT_ZERO_PARALLEL, True)
+                    # else:
+                    setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
             elif self.optim.param_groups[group_id]["name"] == "fp32":
                 for param in params:
                     setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
@@ -936,18 +977,18 @@ class HybridZeroOptimizer(BaseOptimizer):
             # this norm is before scaling, it will be very large
             norm = compute_norm(group_id=group_id, gradients=grads, parameters=params, zero_mode=zero_mode)
 
-        if params_is_padding:
-            for param in params:
-                if hasattr(param, IS_REPLICA_ZERO_PARALLEL):
-                    delattr(param, IS_REPLICA_ZERO_PARALLEL)
-                if hasattr(param, IS_TENSOR_DATA_PARALLEL):
-                    delattr(param, IS_TENSOR_DATA_PARALLEL)
-                if hasattr(param, IS_TENSOR_ZERO_PARALLEL):
-                    delattr(param, IS_TENSOR_ZERO_PARALLEL)
-                if hasattr(param, IS_WEIGHT_ZERO_PARALLEL):
-                    delattr(param, IS_WEIGHT_ZERO_PARALLEL)
-                if hasattr(param, IS_TENSOR_EXPERT_DATA_PARALLEL):
-                    delattr(param, IS_TENSOR_EXPERT_DATA_PARALLEL)
+        # if params_is_padding:
+        #     for param in params:
+        #         if hasattr(param, IS_REPLICA_ZERO_PARALLEL):
+        #             delattr(param, IS_REPLICA_ZERO_PARALLEL)
+        #         if hasattr(param, IS_TENSOR_DATA_PARALLEL):
+        #             delattr(param, IS_TENSOR_DATA_PARALLEL)
+        #         if hasattr(param, IS_TENSOR_ZERO_PARALLEL):
+        #             delattr(param, IS_TENSOR_ZERO_PARALLEL)
+        #         if hasattr(param, IS_WEIGHT_ZERO_PARALLEL):
+        #             delattr(param, IS_WEIGHT_ZERO_PARALLEL)
+        #         if hasattr(param, IS_TENSOR_EXPERT_DATA_PARALLEL):
+        #             delattr(param, IS_TENSOR_EXPERT_DATA_PARALLEL)
 
         return norm
         
@@ -1003,18 +1044,38 @@ class HybridZeroOptimizer(BaseOptimizer):
     # Mixed Precision Utilities #
     #############################
 
-    def _unscale_and_clip_grads(self, grad_groups_flat, total_norm):
+    def _unscale_and_clip_grads(self, grad_groups_flat, total_norm_groups):
+        
+        # colossalAI
         # compute combined scale factor for this group
-        div_scale = self.loss_scale
+        
+        # div_scale = self.loss_scale
+        # if self._clip_grad_norm > 0.0:
+        #     # norm is in fact norm*scale
+        #     clip = ((total_norm / div_scale) + 1e-6) / self._clip_grad_norm
+        #     if clip > 1:
+        #         div_scale = clip * div_scale
+
+        # for grad in grad_groups_flat:
+        #     grad.data.mul_(1.0 / div_scale)
+        
+        
+        # InternEvo        
+        combined_scale_groups = []
+        div_scale = float(self.loss_scale)
 
         if self._clip_grad_norm > 0.0:
             # norm is in fact norm*scale
-            clip = ((total_norm / div_scale) + 1e-6) / self._clip_grad_norm
-            if clip > 1:
-                div_scale = clip * div_scale
-
-        for grad in grad_groups_flat:
-            grad.data.mul_(1.0 / div_scale)
+            for group_id, total_norm in enumerate(total_norm_groups):
+                combined_scale_groups.append(div_scale)
+                clip = ((total_norm / div_scale) + 1e-6) / self._clip_grad_norm
+                if clip > 1:
+                    combined_scale_groups[group_id] = clip * div_scale
+                    
+        for group_id, grad in enumerate(grad_groups_flat):
+            grad.data.mul_(1.0 / combined_scale_groups[group_id])
+            
+        
 
     ############################
     # Gradient Synchronization #
@@ -1022,14 +1083,13 @@ class HybridZeroOptimizer(BaseOptimizer):
 
     # this method is used to sync gradient manually
     def _sync_grad(self):
-        # print(f"num_param_groups: {self.num_param_groups}", flush=True)
         for group_id in range(self.num_param_groups):
             param_group = self._working_param_groups[group_id]
             for param in param_group:
                 if param.requires_grad and param.grad is not None:
                     self._add_to_bucket(param, group_id)
-
-        self._run_reduction()
+     
+        self._run_reduction("_sync_grad")
 
     def _reduce_grad(self, partition_grad):
         # if not overlapping communication (no reduction hook is attached) when zero1
@@ -1037,7 +1097,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         if not partition_grad and not self._overlap_communication:
             self._sync_grad()
         else:
-            self._run_reduction()
+            self._run_reduction("_reduce_grad")
 
     # this context comes from pytorch DDP
     @contextmanager
