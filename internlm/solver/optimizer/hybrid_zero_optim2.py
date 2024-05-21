@@ -149,7 +149,6 @@ class HybridZeroOptimizer(BaseOptimizer):
         # partition these param groups for data parallel training
         # and add buffers to parameter store for future access
         for group_id, param_group in enumerate(self.optim.param_groups):
-            print(f"type: {type(self.optim.param_groups)}, len: {len(self.optim.param_groups)}, group_id: {group_id}, param_groups: {self.optim.param_groups}", flush=True)
             group_params = param_group["params"]
 
             # set the dtype for each param group
@@ -228,8 +227,6 @@ class HybridZeroOptimizer(BaseOptimizer):
             # set reduction state
             for param in self._fp16_param_groups[group_id]:
                 self._param_store.set_param_reduction_state(param, False)
-        
-        print(f"self._zero_world_size: {self._zero_world_size}", flush=True)
 
         assert len(self._fp16_param_groups) != 0
 
@@ -255,99 +252,7 @@ class HybridZeroOptimizer(BaseOptimizer):
     @property
     def num_param_groups(self):
         return len(self._fp16_param_groups)
-    
-    
-    # def _create_master_param_current_rank(self, param_list):
-    #     # split each param evenly by world size
-    #     params_current_rank = []
-    #     device = "cpu" if self._cpu_offload else get_accelerator().get_current_device()
 
-    #     for param in param_list:
-    #         padding_size = (self._world_size - param.numel() % self._world_size) % self._world_size
-    #         self._param_store.record_param_padding_size(param, padding_size)
-
-    #         with torch.no_grad():
-    #             if padding_size > 0:
-    #                 padding_param = torch.nn.functional.pad(param.data.view(-1), [0, padding_size])
-    #                 # reset working params' ptr when no master weights
-    #                 if self._master_weights == False:
-    #                     param.data = padding_param[: param.numel()].view(param.shape)
-    #             else:
-    #                 padding_param = param.data.view(-1)
-
-    #             if self.moe_extra_dp_pg is not None and is_moe_tensor(param):
-    #                 splited_params = padding_param.split(padding_param.numel() // self.moe_extra_dp_pg_size)
-    #                 splited_params = splited_params[self.moe_extra_dp_pg_rank]
-    #             else:
-    #                 splited_params = padding_param.split(padding_param.numel() // self._world_size)
-    #                 splited_params = splited_params[self._local_rank]
-
-    #             # use fp32 when master_weights is True
-    #             if self._master_weights is True:
-    #                 splited_param_current_rank = splited_params.detach().float().to(device)
-    #             else:
-    #                 splited_param_current_rank = splited_params
-
-    #             params_current_rank.append(splited_param_current_rank)
-    #             self._param_store.link_master_and_working_param(splited_param_current_rank, param)
-
-    #     return params_current_rank
- 
-    
-    def _partition_param_list(self, group_id, param_group):
-        device = "cpu" if self._cpu_offload else get_current_device()
-        zero_world_size = self._zero_world_size[group_id]
-        master_weights = True
-        
-        no_params_ranks = []
-        params_per_rank = [[] for _ in range(zero_world_size)]
-        numel_per_rank = [0 for _ in range(zero_world_size)]
-        self.params_per_rank_id_dict.append([[] for _ in range(zero_world_size)])
-        param_list = param_group["params"]
-        
-        for i, param in enumerate(param_list):
-            if param.requires_grad is False:
-                continue
-            
-            global_id = str(i)
-            for j in range(len(param.size())):
-                global_id = "_".join([global_id, str(param.size()[j])])
-                
-            # split tensor
-            padding_size = (zero_world_size - param.numel() % zero_world_size) % zero_world_size
-            
-            ###
-            self._param_store.record_param_padding_size(param, padding_size)
-
-            with torch.no_grad():
-                if padding_size > 0:
-                    padding_param = torch.nn.functional.pad(param.data.view(-1), [0, padding_size])
-                    # reset working params' ptr when no master weights
-                    if master_weights == False:
-                        param.data = padding_param[: param.numel()].view(param.shape)
-                else:
-                    padding_param = param.data.view(-1)
-
-    
-                splited_params_group = padding_param.split(padding_param.numel() // zero_world_size)
-                
-                for rank_to_go in range(zero_world_size):
-                    splited_params = splited_params_group[rank_to_go]
-
-                    # use fp32 when master_weights is True
-                    if master_weights is True:
-                        splited_param_current_rank = splited_params.detach().float().to(device)
-                    else:
-                        splited_param_current_rank = splited_params
-                    
-                    ###
-                    self._param_store.link_master_and_working_param(splited_param_current_rank, param)
-                    
-                    params_per_rank[rank_to_go].append(param)
-                    self.params_per_rank_id_dict[-1][rank_to_go].append(global_id)
-                    numel_per_rank[rank_to_go] += param.numel()
-            
-        
     def _partition_param_list(self, group_id, param_group):
         no_params_ranks = []
         params_per_rank = [[] for _ in range(self._zero_world_size[group_id])]
@@ -523,10 +428,6 @@ class HybridZeroOptimizer(BaseOptimizer):
         # otherwise, add the parameter into bucket.
         current_bucket.add_num_elements_in_bucket(param_size, reduce_rank)
         current_bucket.add_param(param, reduce_rank)
-        
-        padding_size = self._param_store.get_param_padding_size(param)
-        current_bucket.add_num_elements_in_bucket(padding_size, reduce_rank)
-        current_bucket.add_padding_size(padding_size, reduce_rank)
 
     def _store_and_try_reduce_grads_by_bucket(self, param, reduce_rank=None):
         param_size = param.numel()
@@ -555,10 +456,6 @@ class HybridZeroOptimizer(BaseOptimizer):
         current_bucket.add_num_elements_in_bucket(param_size, reduce_rank)
         current_bucket.add_grad(param.grad, reduce_rank)
         current_bucket.add_param(param, reduce_rank)
-        
-        padding_size = self._param_store.get_param_padding_size(param)
-        current_bucket.add_num_elements_in_bucket(padding_size, reduce_rank)
-        current_bucket.add_padding_size(padding_size, reduce_rank)
 
     def _reduce_grads_stored_in_bucket(self, current_bucket, reduce_rank=None):
         # reduce grads
@@ -706,6 +603,9 @@ class HybridZeroOptimizer(BaseOptimizer):
     def _compute_norm(self, group_id: int = 0):
         # compute norm for gradients that have been reduced
         params, grads = self._param_store.get_reduced_param_for_compute_norm(group_id=group_id)
+        # if gpc.get_global_rank() == 0 and group_id == 0:
+        #     print('save old pt')
+        #     torch.save(grads, "old_grads.pt")
         params_is_padding = False
         if len(params) == 0:
             params_is_padding = True
@@ -735,7 +635,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         norm = 0
         if self._clip_grad_norm > 0:
             # this norm is before scaling, it will be very large
-            norm = compute_norm(gradients=grads, parameters=params, zero_mode=self._broadcast_parallel_mode[group_id])
+            norm = compute_norm(group_id=group_id, gradients=grads, parameters=params, zero_mode=self._broadcast_parallel_mode[group_id])
 
         if params_is_padding:
             for param in params:
@@ -775,7 +675,6 @@ class HybridZeroOptimizer(BaseOptimizer):
 
         # we need to reduce the gradients left in the communication bucket
         for group_id in range(self.num_param_groups):
-            # print(f"group_id: {group_id}", flush=True)
             self._reduce_grads_stored_in_bucket(self._bucket_store[group_id], reduce_rank=None)
 
         # wait grads reduced and clear reduced grads

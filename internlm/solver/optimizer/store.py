@@ -383,8 +383,10 @@ import torch
 
 
 class BucketStore(BaseStore):
-    def __init__(self, torch_pg: ProcessGroup):
+    def __init__(self, torch_pg: ProcessGroup, torch_zero=ParallelMode.ZERO1):
         super().__init__(torch_pg)
+        self.zero_world_size = gpc.get_world_size(torch_zero)
+        self.zero_local_rank = gpc.get_local_rank(torch_zero)
         self.reset_all()
 
     def reset_all(self) -> None:
@@ -487,9 +489,10 @@ class BucketStore(BaseStore):
             if padding_size > 0:
                 with torch.no_grad():
                     grad = torch.nn.functional.pad(grad.view(-1), [0, padding_size])
-            grad_list = grad.split(grad.numel() // self._world_size)
+            grad_list = grad.split(grad.numel() // self.zero_world_size)
             for rank in range(self._world_size):
-                grad_current_rank = grad_list[rank].clone().detach()
+                rank_to_go = self._local_rank // (self._world_size // self.zero_world_size)
+                grad_current_rank = grad_list[rank_to_go].clone().detach()
                 self.grad_to_param_mapping[id(grad_current_rank)] = id(param)
                 self._grad_in_bucket[rank].append(grad_current_rank)
             param.grad = None
@@ -550,13 +553,13 @@ class BucketStore(BaseStore):
         self._padding_size = self._padding_size[cur_offset:]
         for _ in range(cur_offset):
             del self.grad_to_param_mapping[next(iter(self.grad_to_param_mapping))]
-        for rank in range(self._world_size):
+        for rank in range(self.zero_world_size):
             self._grad_in_bucket[rank] = self._grad_in_bucket[rank][cur_offset:]
 
 
 
 class GradientStore(BaseStore):
-    def __init__(self, *args, partition_grad: bool = False):
+    def __init__(self, *args, partition_grad: bool = False, torch_zero=ParallelMode.ZERO1):
         super().__init__(*args)
         """
         self._grads_of_params mapping the parameter and its gradient slices
@@ -567,9 +570,11 @@ class GradientStore(BaseStore):
           }
         }
         """
+        self.zero_world_size = gpc.get_world_size(torch_zero)
+        self.zero_local_rank = gpc.get_local_rank(torch_zero)
         self._grads_of_params = dict()
         # for zero2, it's `param_id: [grad_local_rank]`
-        self._working_index = 0 if partition_grad else self._local_rank
+        self._working_index = 0 if partition_grad else self.zero_local_rank
 
         self.grad_to_param_mapping = dict()
 

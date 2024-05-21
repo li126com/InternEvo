@@ -170,6 +170,7 @@ def sync_param(flat_tensor, tensor_list):
     # update the tensor data
     for p, q in zip(tensor_list, updated_params):
         p.data = q.data
+        
 
 
 def sync_tensor(flat_tensor, tensor_list):

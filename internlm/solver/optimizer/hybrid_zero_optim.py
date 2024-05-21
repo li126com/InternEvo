@@ -36,7 +36,7 @@ from internlm.solver.optimizer.utils import (
     has_inf_or_nan,
     reduce_tensor,
     release_param_grad,
-    sync_tensor,
+    sync_param,
     
 )
 
@@ -136,9 +136,13 @@ class HybridZeroOptimizer(BaseOptimizer):
         self.require_grad_sync = True
 
         # if process_group is none, will use the default one
-        self.dp_pg = gpc.get_group(ParallelMode.ZERO1)
-        self._local_rank = dist.get_rank(group=self.dp_pg)
-        self._world_size = dist.get_world_size(group=self.dp_pg)
+        self.dp_pg = gpc.get_group(ParallelMode.DATA)
+        self.zero_pg = gpc.get_group(ParallelMode.ZERO1)
+        self._local_rank = gpc.get_local_rank(ParallelMode.DATA)
+        self._world_size = gpc.get_world_size(ParallelMode.DATA)
+        self.zero_local_rank = gpc.get_local_rank(ParallelMode.ZERO1)
+        self.zero_world_size = gpc.get_world_size(ParallelMode.ZERO1)
+        
         self._broadcast_parallel_mode = ParallelMode.ZERO1
 
         # extra dp
@@ -378,7 +382,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         device = "cpu" if self._cpu_offload else get_current_device()
         
         for param in param_list:
-            padding_size = (self._world_size - param.numel() % self._world_size) % self._world_size
+            padding_size = (self.zero_world_size - param.numel() % self.zero_world_size) % self.zero_world_size
             self._param_store.record_param_padding_size(param, padding_size)
 
             with torch.no_grad():
@@ -390,8 +394,8 @@ class HybridZeroOptimizer(BaseOptimizer):
                 else:
                     padding_param = param.data.view(-1)
 
-                splited_params = padding_param.split(padding_param.numel() // self._world_size)
-                splited_params = splited_params[self._local_rank]
+                splited_params = padding_param.split(padding_param.numel() // self.zero_world_size)
+                splited_params = splited_params[self.zero_local_rank]
 
                 # use fp32 when master_weights is True
                 if self._master_weights is True:
@@ -504,6 +508,9 @@ class HybridZeroOptimizer(BaseOptimizer):
 
                         flat_grads_per_rank = flat_grads.split(flat_grads.numel() // self._world_size)
                         grad_in_bucket = self._bucket_store.get_grad()
+                        print(f"grad_in_bucket.values(): {len(grad_in_bucket.values())}", flush=True)
+                        for rank, grad_list in enumerate(grad_in_bucket.values()):
+                            print(f"debug: {rank}, {len(flat_grads_per_rank[rank])}, {len(grad_list) * len(grad_list[0])}", flush=True)
                         self._update_unpartitoned_grad(grad_in_bucket.values(), flat_grads_per_rank, group_id)
 
                     # sync extra zero group
@@ -581,7 +588,7 @@ class HybridZeroOptimizer(BaseOptimizer):
 
     def _update_unpartitoned_grad(self, origin_grad_list: List, flat_grad_list: List, group_id: int) -> None:
         for rank, grad_list in enumerate(origin_grad_list):
-            sync_tensor(flat_grad_list[rank], grad_list)
+            sync_param(flat_grad_list[rank], grad_list)
             for grad in grad_list:
                 if grad == None:
                     print("_update_unpartitoned_grad grad None", flush=True)
@@ -595,7 +602,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         group_id: int,
         partition_num: int,
     ) -> None:
-        sync_tensor(flat_grad, origin_grad_list)
+        sync_param(flat_grad, origin_grad_list)
         for grad in origin_grad_list:
             param_id = self._bucket_store.get_param_id_of_grad(grad)
             self._add_grad(grad, partition_num, group_id, param_id)
@@ -714,7 +721,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         real_working_params = dict()
         real_master_params = dict()
         real_master_grads = dict()
-        grad_index = 0 if self._partition_grads else self._local_rank
+        grad_index = 0 if self._partition_grads else self.zero_local_rank
         total_norms = {}
         single_grad_partition_groups = []
 
@@ -742,7 +749,7 @@ class HybridZeroOptimizer(BaseOptimizer):
                         if self._partition_grads:
                             grad = grads
                         else:
-                            param_slice = self._world_size // self.moe_extra_dp_pg_size
+                            param_slice = self.zero_world_size // self.moe_extra_dp_pg_size
                             grad = grads[
                                 self.moe_extra_dp_pg_rank * param_slice : (self.moe_extra_dp_pg_rank + 1) * param_slice
                             ]
@@ -810,6 +817,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         # update param for moe ep
         # move grad to master param and compute norm
         if len(self.working_moe_params) > 0:
+            assert False, "moe"
             moe_grads = []
             for master_moe_param, working_moe_param in zip(self.master_moe_params, self.working_moe_params):
                 if master_moe_param.grad is not None:
@@ -866,19 +874,25 @@ class HybridZeroOptimizer(BaseOptimizer):
         
          
         global_norm_groups = {}
+        norm_groups = []
         if self._clip_grad_norm > 0:
+            # print(f"total_norms: {len(total_norms.items())}", flush=True)
             for group_name, norm in total_norms.items():
                 global_norm_groups[group_name] = norm**0.5
+                norm_groups.append(norm**0.5)
 
         
         # collossalAI
         # unscale and clip grads
-        # global_norm = calculate_global_norm_from_list(norm_list=norm_groups)
-        # self._unscale_and_clip_grads(grad_partition_groups, global_norm)
+        global_norm = calculate_global_norm_from_list(norm_list=norm_groups)
+        self._unscale_and_clip_grads(grad_partition_groups, global_norm)
+        
+        # if gpc.is_rank_for_log():
+        #     torch.save(single_grad_partition_groups, "/mnt/petrelfs/lijiaxing/splite_zero_2/InternEvo/new_single_grad_partition_groups.pt")
         
         
         # InternEvo
-        self._unscale_and_clip_grads(single_grad_partition_groups, list(global_norm_groups.values()))
+        # self._unscale_and_clip_grads(single_grad_partition_groups, list(global_norm_groups.values()))
         
         
 
@@ -922,18 +936,18 @@ class HybridZeroOptimizer(BaseOptimizer):
                 else:
                     all_splited_param = [
                         torch.zeros(splited_param.shape, device=device, dtype=self._dtype)
-                        for _ in range(self._world_size)
+                        for _ in range(self.zero_world_size)
                     ]
                     dist.all_gather(
                         all_splited_param,
                         splited_param.to(device).to(self._dtype),
-                        group=self.dp_pg,
+                        group=self.zero_pg,
                     )
                 working_param.data.copy_(flatten(all_splited_param)[: working_param.numel()].reshape_as(working_param))
             self.optim.param_groups[group_id]["params"] = self._master_param_groups_of_current_rank[group_id]
 
-        for group_name, global_norm in global_norm_groups.items():
-            global_norm_groups[group_name] = global_norm / self.loss_scale
+        # for group_name, global_norm in global_norm_groups.items():
+        #     global_norm_groups[group_name] = global_norm / self.loss_scale
         
         
         return True, global_norm_groups
@@ -1016,7 +1030,7 @@ class HybridZeroOptimizer(BaseOptimizer):
                 device=get_current_device(),
                 dtype=torch.float,
             )
-            dist.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=self.dp_pg)
+            dist.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=self.zero_pg)
             total_norm = total_norm_cuda.item()
 
         else:
@@ -1034,7 +1048,7 @@ class HybridZeroOptimizer(BaseOptimizer):
             torch.distributed.all_reduce(
                 total_norm_exponentiated_cuda,
                 op=torch.distributed.ReduceOp.SUM,
-                group=self.dp_pg,
+                group=self.zero_pg,
             )
             total_norm = total_norm_exponentiated_cuda.item() ** (1.0 / norm_type)
 
@@ -1049,31 +1063,31 @@ class HybridZeroOptimizer(BaseOptimizer):
         # colossalAI
         # compute combined scale factor for this group
         
-        # div_scale = self.loss_scale
-        # if self._clip_grad_norm > 0.0:
-        #     # norm is in fact norm*scale
-        #     clip = ((total_norm / div_scale) + 1e-6) / self._clip_grad_norm
-        #     if clip > 1:
-        #         div_scale = clip * div_scale
+        div_scale = float(self.loss_scale)
+        if self._clip_grad_norm > 0.0:
+            # norm is in fact norm*scale
+            clip = ((total_norm_groups / div_scale) + 1e-6) / self._clip_grad_norm
+            if clip > 1:
+                div_scale = clip * div_scale
 
-        # for grad in grad_groups_flat:
-        #     grad.data.mul_(1.0 / div_scale)
+        for grad in grad_groups_flat:
+            grad.data.mul_(1.0 / div_scale)
         
         
         # InternEvo        
-        combined_scale_groups = []
-        div_scale = float(self.loss_scale)
+        # combined_scale_groups = []
+        # div_scale = float(self.loss_scale)
 
-        if self._clip_grad_norm > 0.0:
-            # norm is in fact norm*scale
-            for group_id, total_norm in enumerate(total_norm_groups):
-                combined_scale_groups.append(div_scale)
-                clip = ((total_norm / div_scale) + 1e-6) / self._clip_grad_norm
-                if clip > 1:
-                    combined_scale_groups[group_id] = clip * div_scale
+        # if self._clip_grad_norm > 0.0:
+        #     # norm is in fact norm*scale
+        #     for group_id, total_norm in enumerate(total_norm_groups):
+        #         combined_scale_groups.append(div_scale)
+        #         clip = ((total_norm / div_scale) + 1e-6) / self._clip_grad_norm
+        #         if clip > 1:
+        #             combined_scale_groups[group_id] = clip * div_scale
                     
-        for group_id, grad in enumerate(grad_groups_flat):
-            grad.data.mul_(1.0 / combined_scale_groups[group_id])
+        # for group_id, grad in enumerate(grad_groups_flat):
+        #     grad.data.mul_(1.0 / combined_scale_groups[group_id])
             
         
 
@@ -1154,9 +1168,9 @@ class HybridZeroOptimizer(BaseOptimizer):
                         dist.all_gather(gather_tensor, v.to(device), group=self.moe_extra_dp_pg)
                     else:
                         gather_tensor = [
-                            torch.zeros(v.shape, device=device, dtype=v.dtype) for _ in range(self._world_size)
+                            torch.zeros(v.shape, device=device, dtype=v.dtype) for _ in range(self.zero_world_size)
                         ]
-                        dist.all_gather(gather_tensor, v.to(device), group=self.dp_pg)
+                        dist.all_gather(gather_tensor, v.to(device), group=self.zero_pg)
                     param_state = (
                         torch.stack(gather_tensor).view(-1)[: working_param.numel()].reshape_as(working_param).cpu()
                     )
@@ -1176,7 +1190,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         for param_idx, state in zero_state_dict["state"].items():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor) and k != "step":
-                    padding_size = (self._world_size - v.numel() % self._world_size) % self._world_size
+                    padding_size = (self.zero_world_size - v.numel() % self.zero_world_size) % self.zero_world_size
                     with torch.no_grad():
                         v = v.flatten()
                         if padding_size > 0:
@@ -1185,8 +1199,8 @@ class HybridZeroOptimizer(BaseOptimizer):
                             v_list = v.split(v.numel() // self.moe_extra_dp_pg_size)
                             zero_state_dict["state"][param_idx][k] = v_list[self.moe_extra_dp_pg_rank].detach().clone()
                         else:
-                            v_list = v.split(v.numel() // self._world_size)
-                            zero_state_dict["state"][param_idx][k] = v_list[self._local_rank].detach().clone()
+                            v_list = v.split(v.numel() // self.zero_world_size)
+                            zero_state_dict["state"][param_idx][k] = v_list[self.zero_local_rank].detach().clone()
 
         self.optim.load_state_dict(zero_state_dict)
 
@@ -1225,9 +1239,9 @@ class HybridZeroOptimizer(BaseOptimizer):
                         dist.all_gather(state_tensor, v.to(device), group=self.moe_extra_dp_pg)
                     else:
                         state_tensor = [
-                            torch.zeros(v.shape, device=device, dtype=v.dtype) for _ in range(self._world_size)
+                            torch.zeros(v.shape, device=device, dtype=v.dtype) for _ in range(self.zero_world_size)
                         ]
-                        dist.all_gather(state_tensor, v.to(device), group=self.dp_pg)
+                        dist.all_gather(state_tensor, v.to(device), group=self.zero_pg)
                     state_tensor = (
                         torch.stack(state_tensor).view(-1)[: working_param.numel()].reshape_as(working_param).cpu()
                     )
@@ -1261,7 +1275,7 @@ class HybridZeroOptimizer(BaseOptimizer):
                 if self.moe_extra_dp_pg is not None and False:
                     master_param.copy_(working_param.chunk(self.extra_dp_pg_size)[self.extra_dp_pg_rank])
                 else:
-                    master_param.copy_(working_param.chunk(self._world_size)[self._local_rank])
+                    master_param.copy_(working_param.chunk(self.zero_world_size)[self.zero_local_rank])
         if hasattr(self, "master_moe_params"):
             for master_moe_param, working_moe_param in zip(self.master_moe_params, self.working_moe_params):
                 master_moe_param.copy_(working_moe_param)
