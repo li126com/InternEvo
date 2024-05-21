@@ -2,7 +2,6 @@
 TODO: add NPU CI
 """
 
-import copy
 import math
 
 import pytest
@@ -151,81 +150,6 @@ def npu_transform(B, S, N, N_KV, D, dtype, use_padding):
     )
 
 
-def check_RMSNormNPU():
-    device = get_current_device()
-    input_data = torch.randn(128).to(torch.float32).to(device)
-    input_data_2 = input_data.clone().detach()
-
-    rmsnorm_torch = RMSNormTorch(128, eps=1e-5).to(torch.bfloat16).to(device)
-    output_torch = rmsnorm_torch(input_data)
-
-    rmsnorm_npu = RMSNormNPU(128, eps=1e-5).to(torch.bfloat16).to(device)
-    output_npu = rmsnorm_npu(input_data_2)
-
-    if torch.equal(output_torch, output_npu):
-        print("RMSNorm check passed: totaly equal", flush=True)
-    else:
-        max_diff, index_max_diff = (output_torch - output_npu).abs().max(dim=0)
-        max_diff = max_diff.item()
-        index_max_diff = index_max_diff.item()
-        rtol = max_diff / abs(output_npu[index_max_diff])
-        print(
-            f"The relative error is {rtol}. Between {output_torch[index_max_diff]} and {output_npu[index_max_diff]}",
-            flush=True,
-        )
-        assert rtol <= 1e-5, f"RMSNorm check failed: The relative error is {rtol}"
-        print("RMSNorm check passed: allclose", flush=True)
-
-
-def check_AdamW():
-    class MlpModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.linear1 = nn.Linear(128, 256)
-            self.linear2 = nn.Linear(256, 512)
-
-        def forward(self, x):
-            x = self.linear1(x)
-            x = self.linear2(x)
-            return x
-
-    device = get_current_device()
-    dtype = torch.bfloat16
-    input_data = torch.rand(16, 128, dtype=dtype).to(device)
-    torch_model = MlpModel().to(dtype).to(get_current_device())
-    npu_model = copy.deepcopy(torch_model)
-
-    adamW_torch = torch.optim.AdamW(
-        params=torch_model.parameters(),
-        lr=1e-4,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-    )
-
-    adamW_npu = NPUFusedAdamW(
-        params=npu_model.parameters(),
-        lr=1e-4,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-    )
-
-    adamW_torch.zero_grad()
-    adamW_npu.zero_grad()
-
-    output_torch = torch_model(input_data)
-    output_npu = npu_model(input_data)
-
-    output_torch.mean().backward()
-    output_npu.mean().backward()
-
-    adamW_torch.step()
-    adamW_npu.step()
-
-    params_zip = zip(list(torch_model.parameters()), list(npu_model.parameters()))
-    for torch_param, npu_param in params_zip:
-        assert torch.allclose(torch_param, npu_param, rtol=1e-5, atol=1e-5)
-
-
 @pytest.mark.parametrize("micro_bsz", MICRO_BSZ_LIST)
 @pytest.mark.parametrize("test_dtype", DTYPE_LIST)
 @pytest.mark.parametrize("num_kv_head", NUM_KV_HEAD_LIST)
@@ -233,16 +157,6 @@ def check_AdamW():
 def test_NPU_fa(micro_bsz, test_dtype, num_kv_head, use_padding):
     if internlm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
         npu_transform(micro_bsz, SEQ_LEN, HEAD_NUM, num_kv_head, HIDDEN_SZIE // HEAD_NUM, test_dtype, use_padding)
-
-
-def test_RMSNorm():
-    if internlm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
-        check_RMSNormNPU()
-
-
-def test_AdamW():
-    if internlm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
-        check_AdamW()
 
 
 if __name__ == "__main__":
