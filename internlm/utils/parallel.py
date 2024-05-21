@@ -12,9 +12,6 @@ from internlm.core.context import (
     ParallelMode,
 )
 from internlm.core.context import global_context as gpc
-from internlm.model.ops.fusion_ops_import_helper import try_import_RMSNorm
-
-RMSNorm = try_import_RMSNorm()
 
 
 def is_using_sequence_parallel():
@@ -74,7 +71,6 @@ def sync_model_param(model):
     Args:
         model (:class:`torch.nn.Module`): A pyTorch model on whose parameters you check the consistency.
     """
-
     sync_moe_param = gpc.is_using_parallel_mode(ParallelMode.EXPERT_DATA)
     sync_parallel_mode = ParallelMode.WEIGHT_DATA if is_using_isp() else ParallelMode.DATA
     for param in model.parameters():

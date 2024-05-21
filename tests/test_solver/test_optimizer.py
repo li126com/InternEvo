@@ -11,8 +11,8 @@ from torch.testing import assert_close
 
 import internlm
 from internlm.accelerator import get_accelerator
-from internlm.core.communication.utils import ParamAsyncBcastHandler
 from internlm.core.context.parallel_context import Config, ParallelMode
+from internlm.core.parallel.comm.zero import ParamAsyncBcastHandler
 from internlm.solver.optimizer import HybridZeroOptimizer
 from internlm.utils.common import get_current_device
 

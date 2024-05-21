@@ -1,14 +1,27 @@
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
-from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
+from internlm.model.modules.mlp import new_feed_forward
+from internlm.model.moe.gshard_layer import GShardMOELayer
+from internlm.model.moe.megablock.megablock_dmoe import MegaBlockdMoE
+from internlm.model.moe.megablock.megablock_moe import MegaBlockMoE
 from internlm.utils.logger import get_logger
-from internlm.utils.registry import MODEL_INITIALIZER
 
 # global llm logger
 logger = get_logger(__file__)
+
+
+def new_moe_layer(moe_type: str, **kwargs):
+    if moe_type == "GShard":
+        return GShardMOELayer(**kwargs)
+    elif moe_type == "MegaBlock":
+        return MegaBlockMoE(**kwargs)
+    elif moe_type == "MegaBlock-D":
+        return MegaBlockdMoE(**kwargs)
+    else:
+        raise ValueError(f"Unsupported model type: {moe_type}")
 
 
 class MoE(torch.nn.Module):
@@ -38,7 +51,6 @@ class MoE(torch.nn.Module):
         in_features: int,
         hidden_features: int,
         out_features: int,
-        ep_cls: Optional[Callable],
         ep_group: Optional[torch.distributed.ProcessGroup],
         num_experts: int = 1,
         ep_size=1,
@@ -52,27 +64,26 @@ class MoE(torch.nn.Module):
         if not hasattr(gpc.config, "moe"):
             gpc.config.moe = dict()
 
-        self.moe_layer = MODEL_INITIALIZER.get_module(module_name=gpc.config.model.moe_type)(
+        self.moe_layer = new_moe_layer(
+            moe_type=gpc.config.model.moe_type,
             in_features=in_features,
             hidden_features=hidden_features,
             out_features=out_features,
             num_experts=num_experts,
-            ep_cls=ep_cls,
             ep_group=ep_group,
             ep_size=ep_size,
             device=device,
             dtype=dtype,
-            **(gpc.config.moe)
+            **(gpc.config.moe),
         )
 
         # residual network, see https://arxiv.org/pdf/2201.05596.pdf, seems useful for convergence
         self.use_residual = use_residual
         if self.use_residual:
-            self.residual_mlp = ep_cls(
+            self.residual_mlp = new_feed_forward(
                 in_features=in_features,
                 hidden_features=hidden_features,
                 out_features=out_features,
-                process_group=gpc.get_group(ParallelMode.TENSOR),
                 bias=False,
                 device=device,
                 dtype=dtype,

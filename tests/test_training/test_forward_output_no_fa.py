@@ -16,7 +16,11 @@ from internlm.data import build_train_loader_with_data_type
 from internlm.initialize.launch import args_sanity_check
 from internlm.model.losses import FlashGPTLMLoss
 from internlm.model.metrics import AccPerplex, SchedulerMetricHook
-from internlm.train import initialize_model, initialize_optimizer
+from internlm.train import (
+    initialize_model,
+    initialize_optimizer,
+    initialize_parallel_communicator,
+)
 from internlm.utils.common import get_current_device
 from internlm.utils.logger import get_logger
 
@@ -165,6 +169,7 @@ def train_check_output(args):
 
     # initialize model
     model = initialize_model()
+    _ = initialize_parallel_communicator(model)
 
     # initialize loss function
     criterion = FlashGPTLMLoss(parallel_output=False, label_smoothing=gpc.config.loss.label_smoothing)
@@ -228,6 +233,7 @@ def train_check_output(args):
             logger.info("Outputs are totally equal")
         else:
             logger.warning("Outputs are not totally equal")
+            print(f"tensor1: {tensor1}, tensor2: {tensor2}", flush=True)
             max_diff, index_max_diff = (tensor1 - tensor2).abs().max(dim=0)
             max_diff = max_diff.item()
             index_max_diff = index_max_diff.item()

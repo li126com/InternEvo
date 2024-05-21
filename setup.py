@@ -8,7 +8,7 @@ from setuptools.command.install import install
 pwd = os.path.dirname(__file__)
 
 def readme():
-    with open(os.path.join(pwd, 'README.md'), encoding='utf-8') as f:
+    with open(os.path.join(pwd, 'README.md')) as f:
         content = f.read()
     return content
 
@@ -17,6 +17,10 @@ def get_version():
         content = f.read()
     return content
 
+def fetch_requirements(path):
+    with open(path, 'r') as fd:
+        return [r.strip() for r in fd.readlines() if 'torch-scatter' not in r and not r.startswith('-f ')]
+
 setup(
     name='InternEvo',
     version=get_version(),
@@ -24,12 +28,14 @@ setup(
     long_description=readme(),
     long_description_content_type='text/markdown',
     packages=find_packages(),
+    install_requires=[
+        fetch_requirements('requirements/runtime.txt'),
+        'rotary_emb',
+        'xentropy',
+    ],
 
     classifiers=[
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
-        'Programming Language :: Python :: 3.11',
         'Intended Audience :: Developers',
         'Intended Audience :: Education',
         'Intended Audience :: Science/Research',

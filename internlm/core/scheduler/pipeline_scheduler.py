@@ -9,11 +9,11 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-import internlm.core.communication as comm
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.engine import Engine
 from internlm.core.naive_amp import NaiveAMPModel
+from internlm.core.scheduler import comm
 from internlm.utils.common import (
     SchedulerHook,
     check_data_is_packed,
@@ -220,16 +220,9 @@ class PipelineScheduler(BaseScheduler):
         micro_batch_data, micro_batch_label = self._load_micro_batch(
             data=self.batch_data, label=self.batch_label, offset=self.microbatch_offset, bsz_stride=self.bsz_stride
         )
-        if self.data_process_func:
-            micro_batch_data["input_ids"] = self.data_process_func(
-                micro_batch_data["input_ids"], micro_batch_data["cu_seqlens"]
-            )
-            micro_batch_label = self.data_process_func(
-                micro_batch_label, micro_batch_data["cu_seqlens"], padding_v=-100
-            )
 
-            micro_batch_data.pop("cu_seqlens")
-            micro_batch_data.pop("indexes")
+        if self.data_process_func:
+            micro_batch_data, micro_batch_label = self.data_process_func(micro_batch_data, micro_batch_label)
 
         micro_batch_data["label"] = micro_batch_label
         self.microbatch_offset += self.bsz_stride
@@ -575,7 +568,7 @@ class PipelineScheduler(BaseScheduler):
         if num_1f1b_micropairs > 0:
             if not gpc.is_first_rank(ParallelMode.PIPELINE):
                 if forward_recv_shapes is None:
-                    forward_recv_shapes = comm.recv_obj_meta(forward_recv_shapes)
+                    forward_recv_shapes = comm.recv_obj_meta()
                 input_obj = comm.recv_forward(
                     forward_recv_shapes,
                     dtype=self.dtype,
@@ -821,15 +814,7 @@ class InterleavedPipelineScheduler(PipelineScheduler):
             bsz_stride=self.bsz_stride,
         )
         if self.data_process_func:
-            micro_batch_data["input_ids"] = self.data_process_func(
-                micro_batch_data["input_ids"], micro_batch_data["cu_seqlens"]
-            )
-            micro_batch_label = self.data_process_func(
-                micro_batch_label, micro_batch_data["cu_seqlens"], padding_v=-100
-            )
-
-            micro_batch_data.pop("cu_seqlens")
-            micro_batch_data.pop("indexes")
+            micro_batch_data, micro_batch_label = self.data_process_func(micro_batch_data, micro_batch_label)
 
         micro_batch_data["label"] = micro_batch_label
         self.microbatch_offset[model_chunk_id] += self.bsz_stride
@@ -977,7 +962,7 @@ class InterleavedPipelineScheduler(PipelineScheduler):
         """
         if not gpc.is_pipeline_first_stage():
             if self._input_obj_shapes[0] is None:
-                self._input_obj_shapes[0] = comm.recv_obj_meta(self._input_obj_shapes[0])
+                self._input_obj_shapes[0] = comm.recv_obj_meta()
             self._input_objs[0].append(
                 comm.recv_forward(
                     self._input_obj_shapes[0],

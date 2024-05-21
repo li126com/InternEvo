@@ -16,9 +16,9 @@ from internlm.model.losses import FlashGPTLMLoss
 from internlm.model.metrics import AccPerplex
 from internlm.train import (
     get_scheduler_hooks,
-    initialize_isp_communicator,
     initialize_model,
     initialize_optimizer,
+    initialize_parallel_communicator,
     load_new_batch,
 )
 from internlm.utils.common import BatchSkipper, get_current_device, launch_time
@@ -75,6 +75,7 @@ def train(
     # update ckpt config
     if model_type == "INTERNLM" and tp_mode != "isp" and interleaved is False:
         config.ckpt.load_ckpt_info = dict(path=INTERNLM1_CKPT_PATH, content=("model",), ckpt_type="internlm_test")
+        config.ckpt.auto_resume = False
 
     if enable_ckpt:
         config.ckpt.enable_save_ckpt = True
@@ -133,7 +134,7 @@ def train(
     model = initialize_model()
 
     # initialize isp communicator
-    isp_communicator = initialize_isp_communicator(model)
+    isp_communicator = initialize_parallel_communicator(model)
 
     # initialize loss function
     criterion = FlashGPTLMLoss(parallel_output=True, label_smoothing=label_smoothing)

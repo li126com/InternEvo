@@ -17,12 +17,6 @@ from internlm.model.modules.multi_head_attention import (
     CrossAttention,
     SelfAttention,
 )
-from internlm.model.ops.fusion_ops_import_helper import try_import_RMSNorm
-from internlm.model.ops.norm import RMSNormNPU, RMSNormTorch
-from internlm.solver.optimizer.npu_fused_adamw import AdamW as NPUFusedAdamW
-from internlm.utils.common import get_current_device
-
-RMSNorm = try_import_RMSNorm()
 
 HEAD_NUM = 32
 HIDDEN_SZIE = 4096
@@ -92,6 +86,7 @@ def do_cmp_attn(
         softmax_scale=softmax_scale,
         attention_dropout=attention_dropout,
     ).to(dtype)
+    # TODO: 修复它.
     npu_flash_attn = AscendFlashSelfAttention(
         causal=True,
         softmax_scale=softmax_scale,

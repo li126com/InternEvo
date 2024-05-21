@@ -11,9 +11,19 @@ from internlm.accelerator import get_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context.parallel_context import Config
 from internlm.core.context.parallel_context import global_context as gpc
-from internlm.model.modeling_internlm import PackedFlashBaseLayer1D
-from internlm.model.ops.linear import RewardModelLinear, ScaleColumnParallelLinear
-from internlm.model.utils import gather_forward_split_backward
+from internlm.core.parallel.comm.tensor import (
+    HeadTensorParallelCommunicator,
+    LinearRole,
+    TensorParallelCommunicator,
+)
+from internlm.core.parallel.comm.utils import gather_forward_split_backward
+from internlm.model.modeling_internlm import InternLM1Decoder
+from internlm.model.modules.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    ScaleColumnParallelLinear,
+    new_linear,
+)
 from internlm.utils.common import get_current_device
 from tests.common_fixture import find_free_port
 
@@ -101,10 +111,18 @@ def check_block(args):
     # fix seed
     seed_all(1024)
 
+    ColumnParallelLinear.register_cls_communicator(
+        TensorParallelCommunicator(process_group=gpc.get_group(ParallelMode.TENSOR), role=LinearRole.COLUMN)
+    )
+
+    RowParallelLinear.register_cls_communicator(
+        TensorParallelCommunicator(process_group=gpc.get_group(ParallelMode.TENSOR), role=LinearRole.ROW)
+    )
+
     # define block
     blocks = nn.ModuleList(
         [
-            PackedFlashBaseLayer1D(
+            InternLM1Decoder(
                 hidden_size=4,  # 768
                 num_attention_heads=2,  # 12
                 mlp_ratio=2,
@@ -215,9 +233,12 @@ def check_head(args):
     # fix seed
     seed_all(1024)
 
+    _retain_out_sharded = gpc.config.model.get("parallel_output", True)
+    _head_comminucator = HeadTensorParallelCommunicator(ParallelMode.TENSOR, _retain_out_sharded)
+    ScaleColumnParallelLinear.register_cls_communicator(_head_comminucator)
+
     # load standard
     if is_reward:
-        head_cls = RewardModelLinear
         standard_result = torch.tensor([[3.5938], [1.0703], [3.6250], [3.6250]], dtype=torch.bfloat16).to(device)
         standard_grad = torch.tensor(
             [
@@ -229,7 +250,6 @@ def check_head(args):
             dtype=torch.bfloat16,
         ).to(device)
     else:
-        head_cls = ScaleColumnParallelLinear
         standard_result = torch.tensor(
             [
                 [3.5938, -2.2188, 2.0312, 3.5625],
@@ -250,13 +270,14 @@ def check_head(args):
         ).to(device)
 
     # define head
-    head = head_cls(
+    head = new_linear(
+        name="head",
         in_features=hidden_size,
         out_features=gpc.get_world_size(ParallelMode.TENSOR) if is_reward else vocab_size,
-        process_group=gpc.get_group(ParallelMode.TENSOR),
         bias=False,
         device=device,
         dtype=torch.bfloat16,
+        is_reward=is_reward,
         weight_scale=embed_grad_scale,
     )
 

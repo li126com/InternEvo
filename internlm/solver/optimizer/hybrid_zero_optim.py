@@ -11,7 +11,6 @@ import torch.distributed as dist
 from torch.optim import Optimizer
 
 from internlm.accelerator import get_accelerator
-from internlm.core.communication.utils import ParamAsyncBcastHandler
 from internlm.core.context import Config, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.context.parallel_context import (
@@ -21,6 +20,7 @@ from internlm.core.context.parallel_context import (
     IS_TENSOR_ZERO_PARALLEL,
     IS_WEIGHT_ZERO_PARALLEL,
 )
+from internlm.core.parallel.comm.zero import ParamAsyncBcastHandler
 from internlm.monitor import send_alert_message
 from internlm.solver.optimizer.store import (
     BucketStore,

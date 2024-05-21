@@ -3,10 +3,10 @@ import multiprocessing as mp
 import pytest
 import torch
 
-from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.context.parallel_context import Config
+from internlm.model.ops.fusion_ops_import_helper import try_import_FusedAdamW
 from internlm.utils.common import get_current_device
 from tests.test_core.utils import (
     MlpModel,
@@ -135,15 +135,7 @@ def exam_pipeline_parallel(args):
         torch_xs = torch.tensor(x_list).to(device).to(torch.float32)
         torch_ys = torch.tensor(y_list).to(device).to(torch.float32)
         torch_model = MlpModel(0, 32, "torch").to(device)
-        adam_extra_kwargs = {}
-        if get_accelerator().get_accelerator_backend() == AcceleratorType.NPU:
-            import torch_npu
-
-            internlm_adamw = torch_npu.optim.NpuFusedAdamW
-        else:
-            internlm_adamw = torch.optim.AdamW
-            if torch.__version__ >= "2.1.0":
-                adam_extra_kwargs["fused"] = True
+        adam_extra_kwargs, internlm_adamw = try_import_FusedAdamW()
 
         torch_optimizer = internlm_adamw(
             params=[{"params": torch_model.parameters(), "weight_decay": config.adam.weight_decay}],

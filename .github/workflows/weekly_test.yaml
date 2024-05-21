@@ -177,6 +177,8 @@ jobs:
         echo "::add-mask::${{env.WORKSPACE_PREFIX}}"
         echo "::add-mask::$path_prefix"
     - uses: actions/checkout@v3
+      with:
+         ref: ${{ github.event_name == 'schedule' && 'develop' || github.event_name == 'workflow_dispatch' && '' }}
 
     - name: training_8GPU_ISP
       run: |
@@ -195,6 +197,8 @@ jobs:
         echo "::add-mask::${{env.WORKSPACE_PREFIX}}"
         echo "::add-mask::$path_prefix"
     - uses: actions/checkout@v3
+      with:
+         ref: ${{ github.event_name == 'schedule' && 'develop' || github.event_name == 'workflow_dispatch' && '' }}
 
     - name: training_8GPU_ISP_CKPT
       run: |

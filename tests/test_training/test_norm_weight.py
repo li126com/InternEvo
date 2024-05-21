@@ -14,9 +14,9 @@ from internlm.model.losses import FlashGPTLMLoss
 from internlm.model.metrics import AccPerplex
 from internlm.train import (
     get_scheduler_hooks,
-    initialize_isp_communicator,
     initialize_model,
     initialize_optimizer,
+    initialize_parallel_communicator,
 )
 from internlm.utils.common import get_current_device
 from internlm.utils.logger import get_logger
@@ -74,7 +74,7 @@ def train_check_norm_weight(args):
     model = initialize_model()
 
     # initialize isp communicator
-    isp_communicator = initialize_isp_communicator(model)
+    isp_communicator = initialize_parallel_communicator(model)
 
     # initialize loss function
     criterion = FlashGPTLMLoss(parallel_output=True, label_smoothing=gpc.config.loss.label_smoothing)
@@ -106,6 +106,8 @@ def train_check_norm_weight(args):
     train_iter = iter(train_dl)
 
     for batch_count in range(total_steps):
+        if gpc.is_rank_for_log() and batch_count % 100 == 0:
+            print(f"batch_count: {batch_count}", flush=True)
         if batch_count % 100 == 0:
             internlm_accelerator.empty_cache()
             gc.collect()
@@ -180,6 +182,7 @@ def test_check_norm_msp():
         pool.join()
 
     check_result(result)
+    print("msp check pass", flush=True)
 
 
 @pytest.mark.check_norm_fsp
@@ -195,6 +198,7 @@ def test_check_norm_fsp():
         pool.join()
 
     check_result(result)
+    print("fsp check pass", flush=True)
 
 
 @pytest.mark.check_norm_isp
@@ -210,3 +214,4 @@ def test_check_norm_isp():
         pool.join()
 
     check_result(result)
+    print("isp check pass", flush=True)

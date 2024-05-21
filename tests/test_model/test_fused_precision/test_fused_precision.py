@@ -6,7 +6,8 @@ import torch
 from torch import nn
 
 from internlm.core.naive_amp import NaiveAMPModel, set_fp32_attr_to_module
-from internlm.model.modeling_internlm import PackedFlashBaseLayer1D
+from internlm.model.modeling_internlm import InternLM1Decoder
+from internlm.train.pipeline import initialize_parallel_communicator
 from internlm.train.utils import create_param_groups
 from internlm.utils.common import get_current_device
 from tests.common_fixture import find_free_port
@@ -33,7 +34,7 @@ def check_fused_precision(args):
     # fix seed
     seed_all(1024)
     # define model
-    model = PackedFlashBaseLayer1D(
+    model = InternLM1Decoder(
         hidden_size=16,  # 768
         num_attention_heads=2,  # 12
         mlp_ratio=2,
@@ -58,6 +59,7 @@ def check_fused_precision(args):
         dtype=torch.half,
         sync_buffer=False,
     )
+    _ = initialize_parallel_communicator(model)
     model.model.norm1.register_forward_pre_hook(partial(_pre_forward_hook_for_check))
     model.model.norm1.register_forward_hook(partial(_post_forward_hook_for_check))
 

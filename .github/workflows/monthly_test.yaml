@@ -23,7 +23,7 @@ jobs:
       run: |
         source activate ${evo_env_torch21_flash2}
         jobname=${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}
-        srun -p ${SLURM_PARTITION} --kill-on-bad-exit=1 --job-name=$jobname -N 1 -n 8 --gres=gpu:8 pytest -s -v --color=yes -m "check_norm_msp" ./tests/test_training/test_norm_weight.py
+        srun -p ${SLURM_PARTITION} --exclusive --kill-on-bad-exit=1 --job-name=$jobname -N 1 -n 1 --gres=gpu:8 pytest -s -v --color=yes -m "check_norm_msp" ./tests/test_training/test_norm_weight.py
         exit_code=$?
         sh ./ci_scripts/common/check_slurm_cancled.sh $exit_code $jobname
 
@@ -42,7 +42,7 @@ jobs:
       run: |
         source activate ${evo_env_torch21_flash2}
         jobname=${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}
-        srun -p ${SLURM_PARTITION} --kill-on-bad-exit=1 --job-name=$jobname -N 1 -n 8 --gres=gpu:8 pytest -s -v --color=yes -m "check_norm_fsp" ./tests/test_training/test_norm_weight.py
+        srun -p ${SLURM_PARTITION} --exclusive --kill-on-bad-exit=1 --job-name=$jobname -N 1 -n 1 --gres=gpu:8 pytest -s -v --color=yes -m "check_norm_fsp" ./tests/test_training/test_norm_weight.py
         exit_code=$?
         sh ./ci_scripts/common/check_slurm_cancled.sh $exit_code $jobname
 
@@ -61,7 +61,7 @@ jobs:
       run: |
         source activate ${evo_env_torch21_flash2}
         jobname=${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}
-        srun -p ${SLURM_PARTITION} --kill-on-bad-exit=1 --job-name=$jobname -N 1 -n 8 --gres=gpu:8 pytest -s -v --color=yes -m "check_norm_isp" ./tests/test_training/test_norm_weight.py
+        srun -p ${SLURM_PARTITION} --exclusive --kill-on-bad-exit=1 --job-name=$jobname -N 1 -n 1 --gres=gpu:8 pytest -s -v --color=yes -m "check_norm_isp" ./tests/test_training/test_norm_weight.py
         exit_code=$?
         sh ./ci_scripts/common/check_slurm_cancled.sh $exit_code $jobname
 

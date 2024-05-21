@@ -22,7 +22,7 @@ from internlm.core.scheduler import (
 )
 from internlm.core.scheduler.pipeline_scheduler import get_tensor_shape
 from internlm.core.trainer import Trainer
-from internlm.data.utils import unpack_data
+from internlm.data.utils import packed_data_normalizer, unpack_data
 from internlm.solver.optimizer.hybrid_zero_optim import BaseOptimizer
 from internlm.solver.schedulers.beta2_scheduler import Beta2Scheduler
 from internlm.utils.common import SchedulerHook, get_current_device
@@ -79,10 +79,9 @@ def initialize_trainer(
 
     # initialize scheduler for trainer
     scheduler = None
-    if gpc.config.data.use_packed_dataset:
-        data_fn = None
-    else:
-        data_fn = unpack_data
+
+    data_fn = packed_data_normalizer if gpc.config.data.use_packed_dataset else unpack_data
+
     if gpc.is_using_parallel_mode(ParallelMode.PIPELINE):
         gpc.config.NUM_MICRO_BATCHES = gpc.config.data.micro_num
         tensor_shape = get_tensor_shape()

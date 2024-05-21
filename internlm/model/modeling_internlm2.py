@@ -3,11 +3,8 @@ import math
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
-from einops import rearrange
 from torch import nn
 
-from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
 from internlm.initialize.initialize_tensor import (
@@ -16,467 +13,29 @@ from internlm.initialize.initialize_tensor import (
     scaled_init_method_uniform,
     uniform_,
 )
-from internlm.model.modules.embedding import (
-    DynamicNTKScalingRotaryEmbedding,
-    Embedding1D,
-    RotaryEmbedding,
-)
-from internlm.model.modules.mlp import get_mlp_cls
-from internlm.model.modules.multi_head_attention import (
-    _update_kv_cache,
-    get_gqa_attn_cls,
-)
-from internlm.model.ops.fusion_ops_import_helper import try_import_RMSNorm
-from internlm.model.ops.linear import (
-    RewardModelLinear,
-    ScaleColumnParallelLinearWithNormHead,
-    get_linear_cls,
-)
+from internlm.model.modules.embedding import Embedding1D
+from internlm.model.modules.linear import new_linear
+from internlm.model.modules.mha import GQA
+from internlm.model.modules.mlp import new_feed_forward
+from internlm.model.modules.norm import new_layer_norm
 from internlm.model.utils import (
-    gather_forward_split_backward,
-    pack_output_after_attn,
-    split_forward_gather_backward,
-    unpack_qkv_before_attn,
+    convert_attn_args_to_kwargs,
+    convert_attn_kwargs_to_args,
 )
 from internlm.solver.activation_checkpoint import activation_checkpoint
-from internlm.solver.pipeline_utils import partition_uniform
-from internlm.utils.common import filter_kwargs, get_current_device
 from internlm.utils.logger import get_logger
-from internlm.utils.registry import MODEL_INITIALIZER
-
-MODEL_TYPE = "INTERNLM2_PUBLIC"
 
 logger = get_logger(__file__)
-RMSNorm = try_import_RMSNorm()
-internlm_accelerator = get_accelerator()
 
 
-class MHA(nn.Module):
+class InternLM2Decoder(nn.Module):
     """
-    Multi-head self-attention and cross-attention.
-
-    Args:
-        embed_dim (int): The dimention of hidden state.
-        num_heads (int): The number of attention heads.
-        num_kv_heads (int): The number of attention heads for key and value.
-        process_group (torch.distributed.ProcessGroup): The group of the current device for `parallel_mode`.
-        sequence_process_group (torch.distributed.ProcessGroup): The process group for attention calculation.
-        bias (bool): Whether the bias is needed for linears. Will be used when initializing QKV matrix and
-                     output projection. False by default.
-        dropout (float): The dropout rate for cross attention and self attention. 0.0 by default.
-        softmax_scale (float): The temperature to use for the softmax attention.
-        causal (boolean): Whether to apply causal attention mask. False by default.
-        layer_idx (int): The index of current layer. None by default.
-        rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
-        rotary_emb_dim (int): The dimention of Rotary Embedding. 0 by default.
-        rotary_emb_scale_base (int): The scaling factor of Rotary Embedding. If scale_base > 0, this implements
-                                    XPos(Sun et al., https://arxiv.org/abs/2212.10554). 0 by default.
-        use_flash_attn (bool): Whether to use flash attention or not.If False, vanilla attention module will be used.
-                               False by default.
-        device (Optional[Union[str, torch.device]]): The device will be used.
-        dtype (Optional[torch.dtype]): The type of data.
-        rot_embed_HF_impl (Optional[bool]): Whether to use the rotary embedding implementation from HuggingFace.
-                                            True by default.
-        tp_mode (str): The string value of tensor parallel mode, should be in ["mtp", "msp", "fsp", "isp"],
-                       "mtp" by default.
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        process_group: Optional[torch.distributed.ProcessGroup],
-        sequence_process_group: Optional[torch.distributed.ProcessGroup],
-        max_position_embeddings: int = 2048,
-        bias: bool = False,
-        dropout: float = 0.0,
-        softmax_scale: float = None,
-        causal: bool = False,
-        layer_idx: int = None,
-        use_dynamic_ntk_rope: bool = False,
-        use_flash_attn: bool = True,
-        rope_base: int = 10000,
-        rotary_emb_dim: int = 0,
-        rotary_emb_scale_base: int = 0,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-        rot_embed_HF_impl: Optional[bool] = True,
-        tp_mode: str = "mtp",
-    ) -> None:
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        assert self.embed_dim % num_heads == 0, "embedding dim must be divisible by num_heads"
-
-        self.head_dim = self.embed_dim // num_heads
-        self.num_kv_heads = num_kv_heads
-        self.kv_dim = self.head_dim * num_kv_heads
-        self.causal = causal
-        self.layer_idx = layer_idx
-        self.rotary_emb_dim = rotary_emb_dim
-        self.use_flash_attn = use_flash_attn
-        self.dtype = dtype
-
-        self.q_per_kv = num_heads // num_kv_heads
-
-        self.rot_embed_HF_impl = rot_embed_HF_impl
-        sequence_parallel = gpc.config.parallel.get("sequence_parallel", False)
-
-        self.max_position_embeddings = max_position_embeddings
-        self.use_dynamic_ntk_rope = use_dynamic_ntk_rope
-        self.tp_mode = tp_mode
-
-        if self.rotary_emb_dim > 0:
-            if self.use_dynamic_ntk_rope:
-                self.rotary_emb = DynamicNTKScalingRotaryEmbedding(
-                    self.rotary_emb_dim,
-                    base=rope_base,
-                    scale_base=rotary_emb_scale_base,
-                    device=device,
-                    max_position_embeddings=max_position_embeddings,
-                    scaling_factor=1.0,  # Currently do not support dynamic scaling.
-                )
-            else:
-                self.rotary_emb = RotaryEmbedding(
-                    self.rotary_emb_dim, base=rope_base, scale_base=rotary_emb_scale_base, device=device
-                )
-
-        Wqkv_cls = get_linear_cls(self.tp_mode, "column")
-        self.wqkv = Wqkv_cls(
-            embed_dim,
-            embed_dim + 2 * self.kv_dim,
-            process_group,
-            bias=bias,
-            sequence_parallel=sequence_parallel,
-            **factory_kwargs,
-        )
-
-        self.inner_attn, self.inner_cross_attn = get_gqa_attn_cls(
-            use_flash_attn, self.tp_mode, causal, softmax_scale, dropout, sequence_process_group
-        )
-        self.inner_cross_attn_causal = causal
-        self.inner_cross_attn_softmax_scale = softmax_scale
-        self.inner_cross_attn_dropout = dropout
-
-        wo_cls = get_linear_cls(self.tp_mode, "row")
-        self.wo = wo_cls(
-            embed_dim,
-            embed_dim,
-            process_group,
-            bias=bias,
-            sequence_parallel=sequence_parallel,
-            **factory_kwargs,
-        )
-
-    def forward(self, x, seqlen=None, inference_params=None, **kwargs):
-        if kwargs.get("indexes", None) is not None:
-            return self._packed_forward(x=x, inference_params=inference_params, **kwargs)
-        else:
-            return self._forward(x=x, seqlen=seqlen, inference_params=inference_params, **kwargs)
-
-    def _forward(self, x, seqlen=None, inference_params=None, **kwargs):  # pylint: disable=W0613
-        """
-        Arguments:
-            x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if seqlen=None.
-                If seqlen is not None, x is (batch * seqlen, hidden_dim). This is so that when we
-                split x during sequence parallel, we split the batch * seqlen dimension
-                (in case batch is small).
-        """
-        bsz, _, _ = x.shape
-        qkv = self.wqkv(x)
-
-        if seqlen is None:
-            qkv = rearrange(qkv, "b s (h gs d) -> b s h gs d", gs=self.q_per_kv + 2, d=self.head_dim)
-        else:
-            qkv = rearrange(qkv, "(b s) (h gs d) -> b s h gs d", s=seqlen, gs=self.q_per_kv + 2, d=self.head_dim)
-
-        q, k, v = (qkv[..., : self.q_per_kv, :], qkv[..., -2, :], qkv[..., -1, :])
-
-        q = rearrange(q, "b s h gs d -> b s (h gs) d")
-
-        if not self.rot_embed_HF_impl:
-            q = torch.cat([q[..., ::2], q[..., 1::2]], dim=-1)
-            k = torch.cat([k[..., ::2], k[..., 1::2]], dim=-1)
-
-        if inference_params is None:
-            if self.rotary_emb_dim > 0:
-                q = self.rotary_emb._single_eval_forward(q)
-                k = self.rotary_emb._single_eval_forward(k)
-            kv = torch.concat([k.unsqueeze(2), v.unsqueeze(2)], dim=2)
-            if self.dtype is torch.float32 and self.use_flash_attn:
-                if q.dtype not in [torch.float16, torch.bfloat16]:
-                    q = q.to(torch.bfloat16)
-                if kv.dtype not in [torch.float16, torch.bfloat16]:
-                    kv = kv.to(torch.bfloat16)
-                with internlm_accelerator.amp.autocast(dtype=torch.bfloat16):
-                    context = self.inner_cross_attn(q=q, kv=kv).to(self.dtype)
-            else:
-                context = self.inner_cross_attn(q=q, kv=kv)
-
-        else:
-            assert self.rotary_emb_dim > 0
-            if hasattr(inference_params, "attention_mask") and inference_params.attention_mask is not None:
-                empties = inference_params.attention_mask[..., -1].sum(dim=-1)
-                moved_q = q.clone()
-                moved_k = k.clone()
-                if inference_params.sequence_len_offset == 0:
-                    for i in range(len(empties)):
-                        if empties[i] != 0:
-                            moved_q[i][: -empties[i]] = q[i][empties[i] :]
-                            moved_k[i][: -empties[i]] = k[i][empties[i] :]
-                    moved_q = self.rotary_emb._single_eval_forward(
-                        moved_q, seqlen_offset=inference_params.sequence_len_offset
-                    )
-                    moved_k = self.rotary_emb._single_eval_forward(
-                        moved_k, seqlen_offset=inference_params.sequence_len_offset
-                    )
-                    for i in range(len(empties)):
-                        if empties[i] != 0:
-                            q[i][empties[i] :] = moved_q[i][: -empties[i]]
-                            k[i][empties[i] :] = moved_k[i][: -empties[i]]
-                        else:
-                            q[i] = moved_q[i]
-                            k[i] = moved_k[i]
-                else:
-                    q = self.rotary_emb._single_forward(
-                        q,
-                        inference_params.sequence_len_offset * torch.ones(q.size(0), dtype=torch.int, device=q.device)
-                        - empties,
-                    )
-                    k = self.rotary_emb._single_forward(
-                        k,
-                        inference_params.sequence_len_offset * torch.ones(k.size(0), dtype=torch.int, device=k.device)
-                        - empties,
-                    )
-            else:
-                raise NotImplementedError(
-                    "You should make sure you are aware that you are changing the method of generating."
-                    "According to your generation function instead of inference/seq_generator_module.py, "
-                    "You may implement here for normal running."
-                )
-
-            kv = torch.stack([k, v], dim=2)
-
-            assert self.layer_idx is not None, "Generation requires layer_idx in the constructor"
-            if hasattr(inference_params, "window_size") and inference_params.window_size is not None:
-                if inference_params.window_size <= inference_params.sequence_len_offset:
-                    assert kv.size(1) == 1, "update kv lenth more than 1"
-                    inference_params.key_value_memory_dict[self.layer_idx][
-                        :, inference_params.keep_first : inference_params.window_size - 1, ...
-                    ] = inference_params.key_value_memory_dict[self.layer_idx][
-                        :, -(inference_params.window_size - 1 - inference_params.keep_first) :, ...
-                    ].clone()
-                    inference_params.real_sequence_len_offset = inference_params.sequence_len_offset
-                    inference_params.sequence_len_offset = inference_params.window_size - 1
-
-                    kv = _update_kv_cache(kv, inference_params, self.layer_idx)
-
-                    inference_params.sequence_len_offset = inference_params.real_sequence_len_offset
-                else:
-                    kv = _update_kv_cache(kv, inference_params, self.layer_idx)
-            else:
-                kv = _update_kv_cache(kv, inference_params, self.layer_idx)
-
-            # When using FP16, there is a high probability of NAN in the KV.
-            # Since NAN cannot be removed by multiplying with and 0, it needs
-            # to be removed manually here.
-            kv = torch.where(torch.isnan(kv), 0, kv)
-
-            if hasattr(inference_params, "attention_mask") and inference_params.attention_mask is not None:
-                from flash_attn import flash_attn_varlen_kvpacked_func
-
-                if inference_params.sequence_len_offset == 0:  # First entrance, attnmask (bs*seqlen*seqlen)
-                    attn_mask = inference_params.attention_mask[:, None, ...]
-                    attn_mask = torch.logical_or(
-                        torch.ones_like(attn_mask, dtype=torch.bool).triu(diagonal=1), attn_mask
-                    )
-                    attn_mask4flsh = ~attn_mask[:, :, -1, :].view(bsz, -1)
-                    cu_seqlens = torch.concat(
-                        [
-                            torch.tensor([0], dtype=torch.int32, device=attn_mask4flsh.device),
-                            attn_mask4flsh.sum(dim=-1).to(dtype=torch.int32),
-                        ],
-                        dim=0,
-                    )
-                    cu_seqlens = cu_seqlens.cumsum(dim=0, dtype=torch.int32)
-                    max_seqlen_q = attn_mask4flsh.shape[-1]
-                    max_seqlen_k = attn_mask4flsh.shape[-1]
-                    total_q = q.masked_select(attn_mask4flsh.view(bsz, -1, 1, 1)).view(-1, q.shape[-2], q.shape[-1])
-                    total_kv = kv.masked_select(attn_mask4flsh.view(bsz, -1, 1, 1, 1)).view(
-                        -1, kv.shape[-3], kv.shape[-2], kv.shape[-1]
-                    )
-                    if self.dtype is torch.float32:
-                        if total_q.dtype not in [torch.float16, torch.bfloat16]:
-                            total_q = total_q.to(torch.bfloat16)
-                        if total_kv.dtype not in [torch.float16, torch.bfloat16]:
-                            total_kv = total_kv.to(torch.bfloat16)
-                        with internlm_accelerator.amp.autocast(dtype=torch.bfloat16):
-                            output = flash_attn_varlen_kvpacked_func(
-                                q=total_q,
-                                kv=total_kv,
-                                cu_seqlens_q=cu_seqlens,
-                                cu_seqlens_k=cu_seqlens,
-                                max_seqlen_q=max_seqlen_q,
-                                max_seqlen_k=max_seqlen_k,
-                                dropout_p=0.0,
-                                causal=True,
-                            ).to(self.dtype)
-                    else:
-                        output = flash_attn_varlen_kvpacked_func(
-                            q=total_q,
-                            kv=total_kv,
-                            cu_seqlens_q=cu_seqlens,
-                            cu_seqlens_k=cu_seqlens,
-                            max_seqlen_q=max_seqlen_q,
-                            max_seqlen_k=max_seqlen_k,
-                            dropout_p=0.0,
-                            causal=True,
-                        )
-
-                    context = torch.zeros_like(q)
-                    context = context.masked_scatter_(attn_mask4flsh.view(bsz, -1, 1, 1), output)
-
-                else:
-                    attn_mask = inference_params.attention_mask[:, -1, :].view(bsz, 1, 1, -1)
-                    if hasattr(inference_params, "window_size") and inference_params.window_size is not None:
-                        if inference_params.window_size <= inference_params.sequence_len_offset:
-                            attn_mask = torch.concat(
-                                [
-                                    attn_mask[..., : inference_params.keep_first],
-                                    attn_mask[..., -(inference_params.window_size - inference_params.keep_first) :],
-                                ],
-                                dim=-1,
-                            )
-
-                    k, v = torch.chunk(kv, 2, dim=2)
-                    k = k.squeeze(2)
-                    v = v.squeeze(2)
-                    sp = k.shape
-                    expansion = q.size(2) // k.size(2)
-                    scores = torch.einsum(
-                        "blhd,bnhd->bhln",
-                        q,
-                        k.unsqueeze(3).expand(-1, -1, -1, expansion, -1).reshape(sp[0], sp[1], q.size(2), sp[3]),
-                    ) / math.sqrt(q.size(-1))
-                    scores = scores.masked_fill(attn_mask, -65000.0)
-                    scores = F.softmax(scores, dim=-1)  # bsz x h x L x L
-                    context = torch.einsum(
-                        "bhmn,bnhd->bmhd",
-                        scores,
-                        v.unsqueeze(3).expand(-1, -1, -1, expansion, -1).reshape(sp[0], sp[1], q.size(2), sp[3]),
-                    )
-            else:
-                if self.dtype is torch.float32 and self.use_flash_attn:
-                    if q.dtype not in [torch.float16, torch.bfloat16]:
-                        q = q.to(torch.bfloat16)
-                    if kv.dtype not in [torch.float16, torch.bfloat16]:
-                        kv = kv.to(torch.bfloat16)
-                    with internlm_accelerator.amp.autocast(dtype=torch.bfloat16):
-                        context = self.inner_cross_attn(q=q, kv=kv, causal=True).to(self.dtype)
-                else:
-                    context = self.inner_cross_attn(q=q, kv=kv, causal=True)
-
-        if seqlen is None:
-            context = rearrange(context, "b s h d -> b s (h d)")
-        else:
-            context = rearrange(context, "b s h d -> (b s) (h d)")
-
-        out = self.wo(context)
-        return out
-
-    def _packed_forward(self, x, inference_params=None, **kwargs):
-        """
-        Arguments:
-            x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if seqlen=None.
-                If seqlen is not None, x is (batch * seqlen, hidden_dim). This is so that when we
-                split x during sequence parallel, we split the batch * seqlen dimension
-                (in case batch is small).
-        """
-        assert self.use_flash_attn is True
-
-        qkv = self.wqkv(x)
-
-        qkv = rearrange(qkv, "b t (h gs d) -> b t h gs d", gs=self.q_per_kv + 2, d=self.head_dim)
-
-        q, k, v = (qkv[..., : self.q_per_kv, :], qkv[..., -2, :], qkv[..., -1, :])
-
-        q = rearrange(q, "b t h gs d -> b t (h gs) d")
-
-        # qkv shift
-        # the rotary embedding in flash attention module in performed by separating the front and back parts, while
-        # most of others are done by odd-even methods.
-        if not self.rot_embed_HF_impl:
-            q = torch.cat([q[..., ::2], q[..., 1::2]], dim=-1)
-            k = torch.cat([k[..., ::2], k[..., 1::2]], dim=-1)
-
-        indexes = kwargs.pop("indexes")
-
-        q = self.rotary_emb._single_forward(q, indexes=indexes)
-        k = self.rotary_emb._single_forward(k, indexes=indexes)
-
-        if inference_params is None:
-            kv = torch.concat([k.unsqueeze(2), v.unsqueeze(2)], dim=2)
-            # for packed data, batch dimension with a size of 1 should be directly squeezed off.
-            if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
-                q = q.squeeze(0)
-                kv = kv.squeeze(0)
-            # since torch_npu only supports fa with no packed data currently, qkv should be unpacked
-            elif internlm_accelerator.get_accelerator_backend() in [AcceleratorType.NPU, AcceleratorType.DIPU]:
-                q = unpack_qkv_before_attn(q, kwargs["cu_seqlens"])
-                kv = unpack_qkv_before_attn(kv, kwargs["cu_seqlens"])
-
-            if self.dtype is torch.float32:
-                if q.dtype not in [torch.float16, torch.bfloat16]:
-                    q = q.to(torch.bfloat16)
-                if kv.dtype not in [torch.float16, torch.bfloat16]:
-                    kv = kv.to(torch.bfloat16)
-                with internlm_accelerator.amp.autocast(dtype=torch.bfloat16):
-                    context = self.inner_attn(
-                        q=q,
-                        kv=kv,
-                        cu_seqlens_q=kwargs["cu_seqlens"],
-                        cu_seqlens_k=kwargs["cu_seqlens"],
-                        max_seqlen_q=kwargs["max_seqlen"],
-                        max_seqlen_k=kwargs["max_seqlen"],
-                        dropout_p=self.inner_cross_attn_dropout,
-                        softmax_scale=self.inner_cross_attn_softmax_scale,
-                        causal=self.inner_cross_attn_causal,
-                    ).to(self.dtype)
-            else:
-                context = self.inner_attn(
-                    q=q,
-                    kv=kv,
-                    cu_seqlens_q=kwargs["cu_seqlens"],
-                    cu_seqlens_k=kwargs["cu_seqlens"],
-                    max_seqlen_q=kwargs["max_seqlen"],
-                    max_seqlen_k=kwargs["max_seqlen"],
-                    dropout_p=self.inner_cross_attn_dropout,
-                    softmax_scale=self.inner_cross_attn_softmax_scale,
-                    causal=self.inner_cross_attn_causal,
-                )
-        else:
-            raise RuntimeError("Not support this right now")
-
-        if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
-            context = rearrange(context, "s h d -> s (h d)")  # recover the shape
-            context = context.unsqueeze(0)  # restore bsz dimension
-        elif internlm_accelerator.get_accelerator_backend() in [AcceleratorType.NPU, AcceleratorType.DIPU]:
-            context = rearrange(context, "b s h d -> b s (h d)")  # recover the shape
-            context = pack_output_after_attn(context, kwargs["cu_seqlens"])
-
-        out = self.wo(context)
-        return out
-
-
-class PackedFlashLlamaLayer1D(nn.Module):
-    """
-    InternLM2 layer.
+    InternLM2 Decoder layer.
 
     Args:
         hidden_size (int): The hidden size of model. 768 by default.
         num_attention_heads (int): The number of attention heads. 12 by default.
+        num_kv_attention_heads (int): The number of key/value attention heads. Defaults to 12.
         mlp_ratio (int): The ratio of MLP layers. 4 by default.
         attn_drop_rate (float): The dropout rate of attention module. 0 by default.
         drop_rate (float): The dropout rate of the input hidden state. 0.0 by default.
@@ -488,10 +47,16 @@ class PackedFlashLlamaLayer1D(nn.Module):
         use_dynamic_ntk_rope (bool): Whether to use dynamic ntk rope. False by default.
         residual_in_fp32 (bool): Whether to use residual in fp32. False by default.
         device (Optional[Union[str, torch.device]]): The device will be used.
+        apply_post_layer_norm (bool): Whether to apply layer normalization after the attention and mlp.
+                                        Defaults to False.
+        fused_dropout_add_ln (bool): Whether to fuse dropout, residual addition, and layer normalization.
+                                        Defaults to True.
+        no_bias (bool): Whether to exclude bias in attention and feed-forward networks. Defaults to False.
         norm_type (str): Use RMS norm or layernorm."rmsnorm" by default.
-        use_flash_attn (bool): Whether use flash-attn. True by default.
-        tp_mode (str): The string value of tensor parallel mode, should be in ["mtp", "msp", "fsp", "isp"],
-                       "mtp" by default.
+        qk_interleaved (bool): Whether the odd and even columns of the wq and wk are normally interleaved.
+        dropout_selective_checkpoint (bool): Whether to selectively checkpoint dropout layers only.
+        use_scaled_init (bool): Whether to use scaled initialization for weights.
+        use_swiglu (bool): Whether to use SwiGLU activation in the mlp module.
         attn_wqkv_init_std (float): std used to init attn_wqkv weight. 0.02 by default,
         attn_other_init_std (float): std used to init attn_other weight. 0.02 by default,
         ffn_uplayer_init_std (float): std used to init w1, w2 weight in ffn when using glu
@@ -499,6 +64,8 @@ class PackedFlashLlamaLayer1D(nn.Module):
         ffn_other_init_std (float): std used to init ffn_other weight. 0.02 by default,
         init_type (str): Initialization type. Use uniform or normal. "normal" by default,
         rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
+        mlp_layer_fusion (bool): Whether to fuse layers in the mlp module for optimization.
+        multiple_of (int): Ensures mlp dimensions are multiples of this value for efficient hardware utilization.
     """
 
     def __init__(
@@ -521,12 +88,10 @@ class PackedFlashLlamaLayer1D(nn.Module):
         fused_dropout_add_ln: bool = True,
         no_bias: bool = False,
         norm_type: str = "rmsnorm",
-        adapt_hf: bool = True,
+        qk_interleaved: bool = False,
         dropout_selective_checkpoint: bool = True,
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
-        use_flash_attn: bool = True,
-        tp_mode: str = "mtp",
         attn_wqkv_init_std: float = 0.02,
         attn_other_init_std: float = 0.02,
         ffn_uplayer_init_std: float = 0.02,
@@ -541,7 +106,6 @@ class PackedFlashLlamaLayer1D(nn.Module):
         # dropout selective checkpoint can only be enabled when checkpoint is disabled.
         self.dropout_selective_checkpoint = dropout_selective_checkpoint is True and checkpoint is False
         self.layer_idx = layer_idx
-        self.use_flash_attn = use_flash_attn
         self.prenorm = not apply_post_layer_norm
         assert not fused_dropout_add_ln, "dropout_add_layer_norm can not be used here"
         self.fused_dropout_add_ln = fused_dropout_add_ln
@@ -552,16 +116,12 @@ class PackedFlashLlamaLayer1D(nn.Module):
 
         self.max_position_embeddings = max_position_embeddings
         self.use_dynamic_ntk_rope = use_dynamic_ntk_rope
-        self.tp_mode = tp_mode
-        parallel_mode = ParallelMode.WEIGHT if self.tp_mode == "isp" else ParallelMode.TENSOR
 
         head_dim = hidden_size // num_attention_heads
-        self.attention = MHA(
+        self.attention = GQA(
             embed_dim=hidden_size,
             num_heads=num_attention_heads,
             num_kv_heads=num_kv_attention_heads,
-            process_group=gpc.get_group(parallel_mode),
-            sequence_process_group=gpc.get_group(ParallelMode.TENSOR),
             dropout=attn_drop_rate,
             max_position_embeddings=max_position_embeddings,
             softmax_scale=1 / math.sqrt(head_dim),
@@ -570,39 +130,32 @@ class PackedFlashLlamaLayer1D(nn.Module):
             use_dynamic_ntk_rope=use_dynamic_ntk_rope,
             rotary_emb_dim=head_dim,
             rotary_emb_scale_base=0,
-            use_flash_attn=use_flash_attn,
             device=device,
             dtype=dtype,
-            rot_embed_HF_impl=adapt_hf,
+            qk_interleaved=qk_interleaved,
             bias=not no_bias,
             rope_base=rope_base,
-            tp_mode=self.tp_mode,
+            enable_qkv_fusion=True,
         )
 
         self.dropout1 = nn.Dropout(drop_rate)
-        if norm_type == "rmsnorm":
-            self.attention_norm = RMSNorm(hidden_size, eps=layer_norm_epsilon)
-            self.ffn_norm = RMSNorm(hidden_size, eps=layer_norm_epsilon)
-        else:
-            self.attention_norm = nn.LayerNorm(hidden_size, eps=layer_norm_epsilon)
-            self.ffn_norm = nn.LayerNorm(hidden_size, eps=layer_norm_epsilon)
+        self.dropout2 = nn.Dropout(drop_rate)
+        self.attention_norm = new_layer_norm(norm_type, hidden_size, eps=layer_norm_epsilon)
+        self.ffn_norm = new_layer_norm(norm_type, hidden_size, eps=layer_norm_epsilon)
 
-        sequence_parallel = gpc.config.parallel.get("sequence_parallel", False)
-        self.feed_forward = get_mlp_cls(self.tp_mode)(
+        self.feed_forward = new_feed_forward(
             hidden_size,
             int(hidden_size * mlp_ratio),
             out_features=hidden_size,
-            process_group=gpc.get_group(parallel_mode),
             bias=False,
             device=device,
             dtype=dtype,
             mlp_layer_fusion=mlp_layer_fusion,
-            sequence_parallel=sequence_parallel,
             multiple_of=multiple_of,
+            # TODO: to support more activation functions
+            activation_type="swiglu" if use_swiglu else "swiglu",
         )
 
-        assert use_swiglu is True, "InternLM2 only support swiglu."
-        self.dropout2 = nn.Dropout(drop_rate)
         self.use_swiglu = use_swiglu
         self.use_scaled_init = use_scaled_init
         self.residual_in_fp32 = residual_in_fp32  # only make sense when using prenorm
@@ -646,19 +199,15 @@ class PackedFlashLlamaLayer1D(nn.Module):
                             param.data
                         )
 
-    def forward(
-        self, hidden_states, residual=None, cu_seqlens=None, indexes=None, inference_params=None, max_seqlen=None
-    ):
+    def forward(self, hidden_states, residual=None, **kwargs):
         if self.checkpoint and self.training:
-            return activation_checkpoint(
-                self._forward, False, hidden_states, residual, cu_seqlens, indexes, inference_params, max_seqlen
-            )
+            # NOTICE: activation_checkpiont do not support kwargs when use_reentrant = True.
+            args = convert_attn_kwargs_to_args(kwargs)
+            return activation_checkpoint(self._forward, False, hidden_states, residual, *args)
         else:
-            return self._forward(hidden_states, residual, cu_seqlens, indexes, inference_params, max_seqlen)
+            return self._forward(hidden_states, residual, **kwargs)
 
-    def _forward(
-        self, hidden_states=None, residual=None, cu_seqlens=None, indexes=None, inference_params=None, max_seqlen=None
-    ):
+    def _forward(self, hidden_states, residual, *args, **kwargs):
         r"""Pass the input through the encoder layer.
 
         Args:
@@ -683,13 +232,9 @@ class PackedFlashLlamaLayer1D(nn.Module):
 
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
-            mixer_kwargs = {
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
-                "indexes": indexes,
-                "inference_params": inference_params,
-            }
-            hidden_states = self.attention(hidden_states, **mixer_kwargs)
+
+            attn_kwargs = convert_attn_args_to_kwargs(args, kwargs)
+            hidden_states = self.attention(hidden_states, **attn_kwargs)
 
             if not isinstance(self.feed_forward, nn.Identity):
                 if not self.fused_dropout_add_ln:
@@ -715,13 +260,8 @@ class PackedFlashLlamaLayer1D(nn.Module):
             return hidden_states + residual
         else:
             assert residual is None
-            mixer_kwargs = {
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
-                "indexes": indexes,
-                "inference_params": inference_params,
-            }
-            mixer_out = self.attention(hidden_states, **mixer_kwargs)
+
+            mixer_out = self.attention(hidden_states, **kwargs)
             if self.return_residual:  # mixer out is actually a pair here
                 mixer_out, hidden_states = mixer_out
             hidden_states = self.attention_norm(self.dropout1(mixer_out) + hidden_states).to(
@@ -737,28 +277,26 @@ class PackedFlashLlamaLayer1D(nn.Module):
             return hidden_states
 
 
-class PackedFlashLlama1D(nn.Module):
+class InternLM2(nn.Module):
     """
-    1D Packed Flash InternLM2.
+    InternLM2 Model.
 
     Args:
-        num_layers (int): The number of layer. 12 by default.
-        hidden_size (int): The size of hidden state. 768 by default.
-        num_attention_heads (int): The number of attention head. 12 by default.
+        num_layers (int): The number of layer. 48 by default.
+        hidden_size (int): The size of hidden state. 2048 by default.
+        num_attention_heads (int): The number of attention head. 32 by default.
+        num_kv_attention_heads (int): The number of key/value attention heads. Defaults to 32.
         vocab_size (int): The size of vocabulary. 50304 by default.
         mlp_ratio (int): The ratio of MLP layers. 4 by default.
         attn_drop_rate (float): The dropout rate of attention module. 0.0 by default.
         drop_rate (float): The dropout rate of input hidden state. 0.0 by default.
         max_position_embeddings (int): The maximum position embeddings. 2048 by default.
         dtype (torch.dtype): The type of data. torch.float by default.
-        checkpoint (bool): Whether to use checkpointing to save VRAM. True by default.
-        checkpoint_fraction (float): The proportion of layers that need to be checkpointed compared to the total number
-                                    of layers. 1.0 by default.
+        checkpoint (float): The proportion of layers that need to be checkpointed compared to the total number
+                            of layers. 0.0 by default.
         layer_norm_epsilon (float): A value added to the denominator for numerical stability. 1e-6 by default.
         first (bool): Whether input embedding layer or not. False by default.
         last (bool): Whether output embedding layer or not. False by default.
-        embed_split_hidden (bool): Split the embedding layer in the hidden state dimention or vocabulary dimention.
-                                    True by default.
         embed_grad_scale (float): Refer to GLM-130B, for training stability. 0.1 by default.
         parallel_output (bool): If it is necessary to collect the output of parallel computing. True by default.
         start_layer_idx (int): The index of start layer in the pipeline. 0 by default.
@@ -766,7 +304,10 @@ class PackedFlashLlama1D(nn.Module):
         device (Optional[Union[str, torch.device]]): The device will be used. None by default.
         residual_in_fp32 (bool): Whether to use residual in fp32. False by default.
         norm_type (str): Normalization type. Use RMSNorm or LayerNorm. "rmsnorm" by default.
-        use_flash_attn (bool): Whether to use flash-attn. True by default.
+        qk_interleaved (bool): Whether the odd and even columns of the wq and wk are normally interleaved.
+        dropout_selective_checkpoint (bool): Whether to selectively checkpoint dropout and norm layers.
+        use_scaled_init (bool): Whether to use scaled initialization for weights.
+        use_swiglu (bool): Whether to use SwiGLU activation in the mlp module.
         embedding_init_std (float): std used to init embedding weight. 0.02 by default,
         attn_wqkv_init_std (float): std used to init attn_wqkv weight. 0.02 by default,
         attn_other_init_std (float): std used to init attn_other weight. 0.02 by default,
@@ -777,28 +318,26 @@ class PackedFlashLlama1D(nn.Module):
         init_type (str): Initialization type. Use uniform or normal. "normal" by default,
         rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
         norm_head (bool): Whether to use norm head. False by default.
-        tp_mode (str): The string value of tensor parallel mode, should be in ["mtp", "msp", "fsp", "isp"],
-                       "mtp" by default.
+        mlp_layer_fusion (bool): Whether to fuse layers in the mlp module for optimization.
+        multiple_of (int): Ensures mlp dimensions are multiples of this value for efficient hardware utilization.
     """
 
     def __init__(
         self,
-        num_layers: int = 12,
-        hidden_size: int = 768,
-        num_attention_heads: int = 12,
-        num_kv_attention_heads: int = 12,
+        num_layers: int = 48,
+        hidden_size: int = 2048,
+        num_attention_heads: int = 32,
+        num_kv_attention_heads: int = 32,
         vocab_size: int = 50304,
-        mlp_ratio: int = 4,
+        mlp_ratio: float = 4.0,
         attn_drop_rate: float = 0.0,
         drop_rate: float = 0.0,
         max_position_embeddings: int = 2048,
         dtype: torch.dtype = torch.float,
-        checkpoint: bool = False,
-        checkpoint_fraction: float = 1.0,
+        checkpoint: float = 0.0,
         layer_norm_epsilon: float = 1e-5,
         first: bool = False,
         last: bool = False,
-        embed_split_hidden: bool = False,
         embed_grad_scale: float = 0.1,
         parallel_output: bool = True,
         start_layer_idx: int = 0,
@@ -808,12 +347,11 @@ class PackedFlashLlama1D(nn.Module):
         no_bias=False,
         residual_in_fp32: bool = False,
         norm_type: str = "rmsnorm",
-        adapt_hf: bool = True,
+        qk_interleaved: bool = False,
         is_reward: bool = False,
         dropout_selective_checkpoint: bool = True,
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
-        use_flash_attn: bool = True,
         embedding_init_std: float = 0.02,
         attn_wqkv_init_std: float = 0.02,
         attn_other_init_std: float = 0.02,
@@ -823,44 +361,27 @@ class PackedFlashLlama1D(nn.Module):
         init_type: str = "normal",
         rope_base: int = 10000,
         norm_head: bool = False,
-        tp_mode: str = "mtp",
         mlp_layer_fusion: bool = False,
         multiple_of: int = 256,
     ):
         super().__init__()
 
-        self.use_flash_attn = use_flash_attn
-
-        if checkpoint_fraction <= 0:
-            checkpoint = False
-        if not checkpoint:
-            checkpoint_fraction = 0
-        checkpoint_layer_num = num_layers * checkpoint_fraction
-
-        self.tp_mode = tp_mode
-        if isinstance(gpc.config.parallel["tensor"], dict):
-            self.tp_mode = gpc.config.parallel["tensor"].get("mode", "mtp")
-
-        if is_reward:
-            head_cls = RewardModelLinear
-        else:
-            head_cls = ScaleColumnParallelLinearWithNormHead
+        checkpoint_layer_num = int(num_layers * checkpoint)
+        self.embed_grad_scale = embed_grad_scale
+        self.parallel_output = parallel_output
 
         if first:
-            self.tok_embeddings = Embedding1D(
-                num_embeddings=vocab_size, embedding_dim=hidden_size, embed_split_hidden=embed_split_hidden
-            )
+            self.tok_embeddings = Embedding1D(num_embeddings=vocab_size, embedding_dim=hidden_size)
+
             for _, param in self.tok_embeddings.named_parameters():
                 if init_type == "normal":
                     normal_(std=embedding_init_std)(param)
                 else:
                     uniform_(std=embedding_init_std)(param)
 
-        self.embed_grad_scale = embed_grad_scale
-
         self.layers = nn.ModuleList(
             [
-                PackedFlashLlamaLayer1D(
+                InternLM2Decoder(
                     hidden_size=hidden_size,
                     num_attention_heads=num_attention_heads,
                     num_kv_attention_heads=num_kv_attention_heads,
@@ -882,14 +403,12 @@ class PackedFlashLlama1D(nn.Module):
                     dropout_selective_checkpoint=dropout_selective_checkpoint,
                     use_scaled_init=use_scaled_init,
                     use_swiglu=use_swiglu,
-                    use_flash_attn=use_flash_attn,
-                    adapt_hf=adapt_hf,
+                    qk_interleaved=qk_interleaved,
                     attn_wqkv_init_std=attn_wqkv_init_std,
                     attn_other_init_std=attn_other_init_std,
                     ffn_uplayer_init_std=ffn_uplayer_init_std,
                     ffn_other_init_std=ffn_other_init_std,
                     init_type=init_type,
-                    tp_mode=self.tp_mode,
                     rope_base=rope_base,
                     mlp_layer_fusion=mlp_layer_fusion,
                     multiple_of=multiple_of,
@@ -900,23 +419,16 @@ class PackedFlashLlama1D(nn.Module):
 
         if last:
             if not apply_post_layer_norm:
-                if norm_type == "rmsnorm":
-                    self.norm = RMSNorm(hidden_size, eps=layer_norm_epsilon)
-                else:
-                    self.norm = nn.LayerNorm(hidden_size, eps=layer_norm_epsilon)
+                self.norm = new_layer_norm(norm_type, hidden_size, eps=layer_norm_epsilon)
 
-            if norm_head and not issubclass(head_cls, ScaleColumnParallelLinearWithNormHead):
-                raise TypeError(
-                    "Parameter ``norm_head`` should only be True when head_cls is "
-                    f"``ScaleColumnParallelLinearWithNormHead``, instead of {head_cls}."
-                )
-            self.output = head_cls(  # pylint: disable=E1123
+            self.output = new_linear(
+                name="output",
                 in_features=hidden_size,
                 out_features=gpc.get_world_size(ParallelMode.TENSOR) if is_reward else vocab_size,
-                process_group=gpc.get_group(ParallelMode.TENSOR),
                 bias=False,
                 device=device,
                 dtype=dtype,
+                is_reward=is_reward,
                 weight_scale=embed_grad_scale,
                 norm_head=norm_head,
             )
@@ -926,9 +438,7 @@ class PackedFlashLlama1D(nn.Module):
                 else:
                     uniform_(std=out_head_init_std)(param)
 
-        self.parallel_output = parallel_output
-
-    def forward(self, hidden_states=None, cu_seqlens=None, input_ids=None, indexes=None, inference_params=None):
+    def forward(self, hidden_states=None, input_ids=None, **kwargs):
         # attention_mask: compute attention on the places where the value is 1
         if hasattr(self, "tok_embeddings") and input_ids is not None:
             hidden_states = self.tok_embeddings(input_ids)
@@ -936,210 +446,13 @@ class PackedFlashLlama1D(nn.Module):
                 hidden_states = (
                     self.embed_grad_scale * hidden_states + (1 - self.embed_grad_scale) * hidden_states.detach()
                 )
-        if isinstance(cu_seqlens, list):
-            assert len(cu_seqlens) == 1
-            cu_seqlens = cu_seqlens[0].to(hidden_states.device)
-
-        if cu_seqlens is not None:
-            cu_seqlens = cu_seqlens.squeeze(0)
-
-        if indexes is not None:
-            assert len(indexes) == 1
-            # The indexes are used to indicate the actual position IDs of each token in the packed input.
-            indexes = indexes[0]
-            # if the sequence parallel mode is 'isp', the indexes should also be split in sequence dimension.
-            if gpc.config.parallel.sequence_parallel and self.tp_mode == "isp":
-                indexes = split_forward_gather_backward(indexes, ParallelMode.TENSOR, dim=0)
-
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() if cu_seqlens is not None else None
 
         for _, block in enumerate(self.layers):
-            hidden_states = block(
-                hidden_states,
-                residual=None,
-                cu_seqlens=cu_seqlens,
-                indexes=indexes,
-                inference_params=inference_params,
-                max_seqlen=max_seqlen,
-            )
+            hidden_states = block(hidden_states, residual=None, **kwargs)
 
         if hasattr(self, "norm"):
             hidden_states = self.norm(hidden_states.float())
         if hasattr(self, "output"):
-            hidden_states = self.output(hidden_states, gather_dim=1, tp_mode=self.tp_mode)
-
-        if not self.parallel_output and gpc.is_pipeline_last_stage():
-            hidden_states = gather_forward_split_backward(hidden_states, ParallelMode.TENSOR, dim=-1)
+            hidden_states = self.output(hidden_states)
 
         return hidden_states
-
-
-def _build_generic_model_1d(num_layers, num_chunks, **kwargs):
-    """
-    build generic model 1d
-
-    Args:
-        num_layers (int): The number of layer.
-        num_chunks (int): The number of partitions in pipeline parallel.
-        device (Optional[Union[str, torch.device]]): The device will be used. internlm_accelerator.device() by default.
-
-    """
-    device = get_current_device()
-    pipeline_size = gpc.get_world_size(ParallelMode.PIPELINE)
-    pipeline_rank = gpc.get_local_rank(ParallelMode.PIPELINE)
-
-    all_parts = partition_uniform(num_layers, pipeline_size, num_chunks)
-    parts = all_parts[pipeline_rank]
-    if gpc.is_rank_for_log():
-        logger.info(f"The layer sharding is {all_parts}.")
-
-    models = []
-    kwargs["checkpoint_fraction"] = float(kwargs.get("checkpoint", False))
-    start_idx, end_idx = 0, 0
-    for start, end in parts:
-        start_idx, end_idx = start, end
-        kwargs["num_layers"] = end - start
-        kwargs["first"] = start == 0
-        # If there is no content in the final layer, assign the last layer.
-        kwargs["last"] = end == num_layers and len(all_parts[-1]) != 0
-        kwargs["device"] = device
-        kwargs["start_layer_idx"] = start
-        chunk = PackedFlashLlama1D(**filter_kwargs(PackedFlashLlama1D.__init__, kwargs)).to(device)
-
-        models.append(chunk)
-    torch.distributed.barrier()
-    if len(models) == 1:
-        model = models[0]
-    else:
-        model = nn.ModuleList(models)
-    setattr(model, "first_layer", start_idx)
-    setattr(model, "last_layer", end_idx)
-    return model
-
-
-@MODEL_INITIALIZER.register_module(module_name=MODEL_TYPE)
-def build_model_with_cfg(
-    num_chunks=1,
-    checkpoint=False,
-    dtype=torch.float,
-    embed_split_hidden=False,
-    num_layers=48,
-    hidden_size=2048,
-    vocab_size=50304,
-    embed_grad_scale=1,
-    parallel_output=True,
-    num_attention_heads=32,
-    num_kv_attention_heads=None,
-    mlp_ratio=4.0,
-    residual_in_fp32=False,
-    norm_type="rmsnorm",
-    adapt_hf=True,
-    drop_rate=0,
-    attn_drop_rate=0,
-    apply_post_layer_norm=False,  # pylint: disable=W0613
-    no_bias=False,
-    deepnorm=False,
-    layer_norm_epsilon=1e-5,
-    is_reward=False,
-    dropout_selective_checkpoint=True,
-    use_scaled_init: bool = True,
-    use_swiglu: bool = True,
-    use_flash_attn: bool = True,
-    embedding_init_std: float = 0.02,
-    attn_wqkv_init_std: float = 0.02,
-    attn_other_init_std: float = 0.02,
-    ffn_uplayer_init_std: float = 0.02,
-    ffn_other_init_std: float = 0.02,
-    out_head_init_std: float = 0.02,
-    init_type: str = "normal",
-    rope_base: int = 10000,
-    norm_head: bool = False,
-    max_position_embeddings=2048,
-    use_dynamic_ntk_rope=False,
-    mlp_layer_fusion: bool = False,
-    multiple_of: int = 256,
-):
-    """
-    Builde model with config
-
-    Args:
-        num_chunks (int): The number of partitions in pipeline parallel. 1 by default.
-        checkpoint (bool): Whether to use checkpointing to save VRAM. False by default.
-        dtype (torch.dtype): The type of data. torch.float by default.
-        embed_split_hidden (bool): Split the embedding layer in the hidden state dimention or vocabulary dimention.
-                                    False by default.
-        num_layers (int): The number of layer. 48 by default.
-        hidden_size (int): The size of hidden state. 2048 by default.
-        vocab_size (int): The size of vocabulary. 50304 by default.
-        embed_grad_scale (float): Refer to GLM-130B, for training stability. 0.1 by default.
-        parallel_output (bool): If it is necessary to collect the output of parallel computing. True by default.
-        num_attention_heads (int): The number of attention head. 32 by default.
-        mlp_ratio (int): The ratio of MLP layers. 4.0 by default.
-        residual_in_fp32 (bool): Whether to use residual in fp32. False by default. It cannot be used temporarily
-                                 because this parameter requires inconsistent data types to be passed between pipelines,
-                                 which requires significant modifications to internlm.
-        norm_type (str): Normalization type. Use RMSNorm or LayerNorm. "rmsnorm" by default.
-        drop_rate (float): The dropout rate of input hidden state. 0 by default.
-        attn_drop_rate (float): The dropout rate of attention module. 0 by default.
-        apply_post_layer_norm (bool): Whether to apply post layer norm. False by default.
-        layer_norm_epsilon (float): A value added to the denominator for numerical stability. 1e-5 by default.
-        is_reward (bool): Whether to use reward model. False by default.
-        dropout_selective_checkpoint (bool): It can only be enabled when checkpoint is disabled. True by default.
-        use_scaled_init (bool): Whether to use scaled init. True by default.
-        use_swiglu (bool): Whether to use swiglu. True by default.
-        use_flash_attn (bool): Whether to use flash-attn. True by default.
-        embedding_init_std (float): std used to init embedding weight. 0.02 by default,
-        attn_wqkv_init_std (float): std used to init attn_wqkv weight. 0.02 by default,
-        attn_other_init_std (float): std used to init attn_other weight. 0.02 by default,
-        ffn_uplayer_init_std (float): std used to init w1, w2 weight in ffn when using glu
-            otherwise init fc1 weight in ffn. 0.02 by default,
-        ffn_other_init_std (float): std used to init ffn_other weight. 0.02 by default,
-        out_head_init_std (float): std used to init output lmhead weight. 0.02 by default,
-        init_type (str): Initialization type. Use uniform or normal. "normal" by default,
-        rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
-        max_position_embeddings (int): The maximum position embeddings. 2048 by default.
-        use_dynamic_ntk_rope (bool): Whether to use dynamic ntk rope. False by default.
-    """
-    if deepnorm:
-        raise AssertionError("deepnorm will not be supported in future versions." "Use early versions if necessary.")
-
-    cfg = dict(
-        hidden_size=hidden_size,
-        num_attention_heads=num_attention_heads,
-        num_kv_attention_heads=num_kv_attention_heads if num_kv_attention_heads else num_attention_heads,
-        checkpoint=checkpoint,
-        dtype=dtype,
-        embed_split_hidden=embed_split_hidden,
-        vocab_size=vocab_size,
-        embed_grad_scale=embed_grad_scale,
-        parallel_output=parallel_output,
-        mlp_ratio=mlp_ratio,
-        apply_post_layer_norm=apply_post_layer_norm,
-        no_bias=no_bias,
-        residual_in_fp32=residual_in_fp32,
-        norm_type=norm_type,
-        adapt_hf=adapt_hf,
-        drop_rate=drop_rate,
-        attn_drop_rate=attn_drop_rate,
-        layer_norm_epsilon=layer_norm_epsilon,
-        is_reward=is_reward,
-        dropout_selective_checkpoint=dropout_selective_checkpoint,
-        use_scaled_init=use_scaled_init,
-        use_swiglu=use_swiglu,
-        use_flash_attn=use_flash_attn,
-        embedding_init_std=embedding_init_std,
-        attn_wqkv_init_std=attn_wqkv_init_std,
-        attn_other_init_std=attn_other_init_std,
-        ffn_uplayer_init_std=ffn_uplayer_init_std,
-        ffn_other_init_std=ffn_other_init_std,
-        out_head_init_std=out_head_init_std,
-        init_type=init_type,
-        rope_base=rope_base,
-        norm_head=norm_head,
-        max_position_embeddings=max_position_embeddings,
-        use_dynamic_ntk_rope=use_dynamic_ntk_rope,
-        mlp_layer_fusion=mlp_layer_fusion,
-        multiple_of=multiple_of,
-    )
-
-    return _build_generic_model_1d(num_layers=num_layers, num_chunks=num_chunks, **cfg)

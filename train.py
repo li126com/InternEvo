@@ -26,10 +26,10 @@ from internlm.monitor import initialize_monitor_manager, send_alert_message
 from internlm.monitor.monitor import monitor_manager as mm
 from internlm.train import (
     get_scheduler_hooks,
-    initialize_isp_communicator,
     initialize_llm_profile,
     initialize_model,
     initialize_optimizer,
+    initialize_parallel_communicator,
     load_new_batch,
     record_current_batch_training_metrics,
 )
@@ -53,6 +53,7 @@ logger = logging.getLogger(__file__)
 
 
 def main(args):
+    very_begining_time = time.time()
     enable_pytorch_expandable_segments()
 
     # init setting
@@ -87,7 +88,7 @@ def main(args):
     model = initialize_model()
 
     # initialize isp communicator
-    isp_communicator = initialize_isp_communicator(model)
+    isp_communicator = initialize_parallel_communicator(model)
 
     with open(args.config, "r") as f:
         config_lines = f.readlines()
@@ -253,6 +254,7 @@ def main(args):
                 beta2_scheduler=beta2_scheduler,
                 trainer=trainer,
                 start_time=start_time,
+                very_begining_time=very_begining_time,
                 loss=loss,
                 moe_loss=moe_loss,
                 grad_norm=grad_norm_groups,

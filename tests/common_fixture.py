@@ -9,7 +9,7 @@ import internlm
 from internlm.accelerator import get_accelerator
 from internlm.core.context import global_context as gpc
 from internlm.core.context.parallel_context import Config
-from internlm.data.utils import unpack_data
+from internlm.data.utils import unpack_type_ids
 from internlm.initialize.launch import args_sanity_check
 
 internlm_accelerator = get_accelerator()
@@ -36,6 +36,7 @@ config_7B = Config(
             diag_outlier_ratio=1.1,
             train_folder=None,
             valid_folder=None,
+            num_worker=0,
         ),
         model=dict(
             checkpoint=False,
@@ -148,6 +149,6 @@ def load_new_batch(train_dl, train_iter):
     if batch[0].get("type_ids", None) is not None:
         # if use_flash_attn is False, we need to unpack type_ids
         if not gpc.config.model.use_flash_attn:
-            batch[0]["type_ids"] = unpack_data(batch[0]["type_ids"], batch[0]["cu_seqlens"], is_type_ids=True)
+            batch[0]["type_ids"] = unpack_type_ids(batch[0]["type_ids"], batch[0]["cu_seqlens"])
 
     return batch, train_iter

@@ -1,9 +1,7 @@
 from typing import Optional, Tuple
 
 import numpy as np
-import stk
 import torch
-from megablocks import ops
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
@@ -11,10 +9,15 @@ from internlm.model.moe.base_layer import BaseMoELayer
 from internlm.model.moe.megablock.megablock_moe import MegaBlockMoE
 from internlm.model.moe.megablock.mlp import MegaBlockGroupedFeedForward
 from internlm.model.moe.megablock.utils import promote_scalar
-from internlm.utils.registry import MODEL_INITIALIZER
+
+try:
+    import stk
+    from megablocks import ops
+except (ModuleNotFoundError, ImportError):
+    stk = None
+    megablocks = None
 
 
-@MODEL_INITIALIZER.register_module(module_name="MegaBlock-D")
 class MegaBlockdMoE(MegaBlockMoE):
     """
     Built on the paper and library Megablocks as described in
@@ -111,7 +114,7 @@ class MegaBlockdMoE(MegaBlockMoE):
         offsets_t = torch.cat([zero, nnz_per_column])
         return column_indices_t, offsets_t, block_offsets_t
 
-    def topology(self, x: torch.Tensor, padded_bins: torch.Tensor) -> stk.Matrix:
+    def topology(self, x: torch.Tensor, padded_bins: torch.Tensor):
         padded_tokens, _ = x.size()
         assert padded_tokens % self.blocking == 0
         assert self.ffn_dim_per_row % self.blocking == 0

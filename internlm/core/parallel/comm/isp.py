@@ -1,18 +1,62 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
+"""
+communication for isp parallel.
+"""
 
+from abc import ABC, abstractmethod
 from functools import partial
-from typing import Any, Callable, Dict, List, Union
+from typing import Any, Callable, Dict, List, Tuple, Union
 
 import torch
 from torch import distributed as dist
 from torch import nn
 
+from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
-from internlm.core.naive_amp import NaiveAMPModel
-from internlm.model.ops.linear import ISPLinear
-from internlm.model.utils import all_gather_raw, reduce_scatter_raw
+from internlm.core.naive_amp import unwrap_naive_amp
+from internlm.core.parallel.comm.utils import (
+    DUMMY_HANDLE_CONST,
+    AsyncCommHandle,
+    all_gather_raw,
+    reduce_scatter_raw,
+)
+from internlm.model.modules.linear import ParallelLinearWithCommExt
 from internlm.utils.common import SchedulerHook, get_current_device
+from internlm.utils.utils import (
+    CuSeqlenType,
+    QKVPackType,
+    check_attention_argument,
+    params_dispatch_with_condition,
+)
+
+
+# not really useful, only for code hint.
+class WPCommunicator(ABC):
+    """
+    Common communicator interface for weight parallel
+    """
+
+    @abstractmethod
+    def communication_mode(self) -> str:
+        """
+        communication mode of communictor
+        """
+        pass
+
+    @abstractmethod
+    def weight_hook(self, tensor: torch.Tensor, async_op: bool = False, **kwargs) -> torch.Tensor:
+        """
+        communication for weight when forward/backward.
+        """
+        pass
+
+    @abstractmethod
+    def grad_hook(self, tensor: torch.Tensor, async_op: bool = False, **kwargs) -> Tuple[torch.Tensor, AsyncCommHandle]:
+        """
+        communication for grad when backward.
+        """
+        pass
 
 
 class ISPCommModelConfig:
@@ -148,7 +192,7 @@ class ISPOverlapState:
         self.bias_global_output: Dict[str, torch.Tensor] = {}
 
 
-class ISPCommunicator:
+class ISPCommunicator(WPCommunicator):
     """
     ISP Communicator for managing the all-gather and reduce_scatter of Intern Sequence Parallel.
     """
@@ -195,16 +239,11 @@ class ISPCommunicator:
 
         # init overlap states if necessary.
         if self.overlap:
-            # just want to share same for loop for modulelist and module.
-            model = model if isinstance(model, nn.ModuleList) else [model]
             # build overlap states for every chunk.
-            for chunk_id, chunk in enumerate(model):
-                if isinstance(chunk, NaiveAMPModel):
-                    chunk = chunk.model
+            for chunk_id, chunk in enumerate(unwrap_naive_amp(model)):
                 self._parse_model_structure(chunk_id, chunk)
-            # register overlap hooks for every chunk.
-            for chunk_id in range(len(model)):
                 self.switch_current_model_chunk(chunk_id)
+                # register overlap hooks for every chunk.
                 self._register_sync_parameters_hook()
             # switch to chunk 0 at first.
             self.switch_current_model_chunk(0)
@@ -232,7 +271,7 @@ class ISPCommunicator:
                             if name in ["out_proj", "wo"]:
                                 self._overlap_states[cid].isp_outs.append(child)
                                 self._overlap_states[cid].module_to_index[child] = idx
-                            if isinstance(child, ISPLinear):
+                            if isinstance(child, ParallelLinearWithCommExt):
                                 if name not in self._module_shapes:
                                     origin_shape = tuple(
                                         [child.weight.shape[0] * gpc.weight_parallel_size]
@@ -436,6 +475,9 @@ class ISPCommunicator:
                 device=self.model_conf.device,
             ).contiguous()
 
+    def communication_mode(self) -> str:
+        return "wp"
+
     def switch_current_model_chunk(self, chunk_id: int) -> None:
         self._isp_outs = self._overlap_states[chunk_id].isp_outs
         self._isp_modules = self._overlap_states[chunk_id].isp_modules
@@ -478,44 +520,51 @@ class ISPCommunicator:
 
     # communication operation interfaces
 
-    def all_gather(self, tensor: torch.Tensor, module: nn.Module, is_bias: bool = False):
+    def weight_hook(
+        self, tensor: torch.Tensor, async_op: bool = False, module: nn.Module = None, is_bias: bool = False
+    ) -> torch.Tensor:
         if dist.get_world_size(self.process_group) <= 1:
             return tensor
 
         if not self.overlap:
-            result, _ = all_gather_raw(tensor, self.process_group, async_op=False)
+            result, _ = all_gather_raw(tensor, self.process_group, async_op=async_op)
         elif is_bias:
+            assert module is not None, "The module parameter must be specified"
             result = self._bias_global_output[module]
         else:
+            assert module is not None, "The module parameter must be specified"
             result = self._weight_global_output[module]
 
         return result
 
-    def reduce_scatter(
+    def grad_hook(
         self,
         tensor: torch.Tensor,
-        model: nn.Module,
-        op: dist.ReduceOp,
+        async_op: bool = False,
+        module: nn.Module = None,
+        reduce_op: dist.ReduceOp = dist.ReduceOp.AVG,
         is_bias: bool = False,
-    ):
+    ) -> Tuple[torch.Tensor, AsyncCommHandle]:
         if dist.get_world_size(self.process_group) <= 1:
-            return tensor, None
+            return tensor, DUMMY_HANDLE_CONST
 
         if not self.overlap:
-            result, handle = reduce_scatter_raw(tensor, self.process_group, op=op, async_op=True)
+            result, handle = reduce_scatter_raw(tensor, self.process_group, op=reduce_op, async_op=async_op)
         else:
+            assert module is not None, "The module parameter must be specified"
+
             if is_bias:
-                assert hasattr(model.bias, "isp_reduce_scatter_name")
-                key = getattr(model.bias, "isp_reduce_scatter_name")
+                assert hasattr(module.bias, "isp_reduce_scatter_name")
+                key = getattr(module.bias, "isp_reduce_scatter_name")
             else:
-                assert hasattr(model.weight, "isp_reduce_scatter_name")
-                key = getattr(model.weight, "isp_reduce_scatter_name")
+                assert hasattr(module.weight, "isp_reduce_scatter_name")
+                key = getattr(module.weight, "isp_reduce_scatter_name")
 
             self.reduce_scatter_handlers[key] = reduce_scatter_raw(
                 tensor,
                 self.process_group,
-                op=op,
-                async_op=True,
+                op=reduce_op,
+                async_op=async_op,
                 memory_pool_allocator=(
                     self.memory_pool.allocate_reduce_scatter_memory if self.enable_memory_pool else None
                 ),
@@ -528,7 +577,7 @@ class ISPCommunicator:
                         *tensor.shape[1:],
                     )
                 ),
-                None,
+                DUMMY_HANDLE_CONST,
             )
 
         return result, handle
@@ -543,33 +592,190 @@ class ISPCommunicatorSchedulerHook(SchedulerHook):
         self._isp_communicator = overlap_handler
         self._zero_optim = zero_optim
 
-    def before_forward(self, scheduler, inputs) -> None:
+    def before_forward(self, scheduler, inputs) -> None:  # pylint: disable=W0613
         self._isp_communicator.is_forward = True
         # switch model chunk before forward
         chunk_id = 0 if gpc.virtual_pipeline_parallel_rank is None else gpc.virtual_pipeline_parallel_rank
         self._isp_communicator.switch_current_model_chunk(chunk_id)
 
-    def after_forward(self, scheduler, outputs) -> None:
+    def after_forward(self, scheduler, outputs) -> None:  # pylint: disable=W0613
         pass
 
-    def before_criterion(self, scheduler, outputs, label) -> None:
+    def before_criterion(self, scheduler, outputs, label) -> None:  # pylint: disable=W0613
         pass
 
-    def after_criterion(self, scheduler, loss) -> None:
+    def after_criterion(self, scheduler, loss) -> None:  # pylint: disable=W0613
         pass
 
-    def before_backward(self, scheduler, outputs, outputs_grad) -> None:
+    def before_backward(self, scheduler, outputs, outputs_grad) -> None:  # pylint: disable=W0613
         self._isp_communicator.is_forward = False
         # switch model chunk before backward
         chunk_id = 0 if gpc.virtual_pipeline_parallel_rank is None else gpc.virtual_pipeline_parallel_rank
         self._isp_communicator.switch_current_model_chunk(chunk_id)
 
-    def after_backward(self, scheduler, inputs_grad) -> None:
+    def after_backward(self, scheduler, inputs_grad) -> None:  # pylint: disable=W0613
         # accumulate left gradients in last bucket after backward.
         self._zero_optim.accumulate_left_grads_after_backward()
         # reset lazy memory pools for reduce scatter after every micro step.
         if self._isp_communicator and self._isp_communicator.enable_memory_pool:
             self._isp_communicator.memory_pool.reset_lazy_pools()
 
-    def post_helper_func(self, scheduler, outputs, label) -> None:
+    def post_helper_func(self, scheduler, outputs, label) -> None:  # pylint: disable=W0613
         pass
+
+
+# adpated from https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/sequence/layer.py
+class _SeqAllToAll(torch.autograd.Function):
+    "sequence alltoall function"
+
+    @staticmethod
+    def forward(ctx, group: dist.ProcessGroup, input_: torch.Tensor, scatter_idx: int, gather_idx: int) -> torch.Tensor:
+        ctx.group = group
+        ctx.scatter_idx = scatter_idx
+        ctx.gather_idx = gather_idx
+
+        if dist.get_world_size(group) <= 1:
+            return input_
+
+        seq_world_size = dist.get_world_size(group)
+
+        input_list = [t.contiguous() for t in torch.tensor_split(input_, seq_world_size, scatter_idx)]
+        output_list = [torch.empty_like(input_list[0]) for _ in range(seq_world_size)]
+        # TODO: use all_to_all_single instead
+        dist.all_to_all(output_list, input_list, group=group)
+        return torch.cat(output_list, dim=gather_idx).contiguous()
+
+    @staticmethod
+    def backward(ctx, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None]:
+        if dist.get_world_size(ctx.group) <= 1:
+            return (None, *grad_output, None, None)
+
+        return (None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None)
+
+
+# adpated from https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/sequence/layer.py
+class DistributedAttention(nn.Module):
+    """Initialization.
+
+    Arguments:
+        local_attention (Module): local self-attention module
+        sequence_process_group (ProcessGroup): sequence parallel process group
+    """
+
+    def __init__(
+        self,
+        local_attention: nn.Module,
+        sequence_process_group: dist.ProcessGroup,
+    ) -> None:
+        super().__init__()
+        self.local_attn = local_attention
+        self.spg = sequence_process_group
+
+    @params_dispatch_with_condition(condition=check_attention_argument)
+    def forward(self) -> torch.Tensor:
+        assert False, "Should never arrive"
+
+    @forward.register(conditions=(str(QKVPackType.QKVPACKED), str(CuSeqlenType.With)))
+    @forward.register(conditions=(str(QKVPackType.QKVPACKED), str(CuSeqlenType.WithOut)))
+    def _(self, qkv: torch.Tensor, **kwargs) -> torch.Tensor:
+        """forward
+
+        Arguments:
+            qkv (Tensor): packed qkv input to the layer
+            kwargs: other args
+
+        Returns:
+            * output (Tensor): context output
+        """
+        # qkv shape: [1, packlen, 3, n_head, head_dim] or [batch, seqlen, 3, n_head, head_dim]
+        # scatter in n_head and gather in seqlen(packlen)
+        qkv = _SeqAllToAll.apply(self.spg, qkv, 3, 1)
+
+        context = self.local_attn(qkv, **kwargs)
+
+        # context shape: [1, packlen, n_head, head_dim] or [batch, seqlen, n_head, head_dim]
+        # scatter in seqlen(packlen) and gather in n_head
+        context = _SeqAllToAll.apply(self.spg, context, 1, 2)
+
+        return context
+
+    @forward.register(conditions=(str(QKVPackType.KVPACKED), str(CuSeqlenType.With)))
+    @forward.register(conditions=(str(QKVPackType.KVPACKED), str(CuSeqlenType.WithOut)))
+    def _(self, q: torch.Tensor, kv: torch.Tensor, **kwargs) -> torch.Tensor:
+        """forward
+
+        Arguments:
+            q (Tensor): q input to the layer
+            kv (Tensor): packed kv input to the layer
+            kwargs: other args
+
+        Returns:
+            output (Tensor): context output
+        """
+        # q shpae: [1, packlen, n_head, head_dim] or [batch, seqlen, n_head, head_dim]
+        # scatter in n_head and gather in seqlen(packlen)
+        q = _SeqAllToAll.apply(self.spg, q, 2, 1)
+        # kv shape: [1, packlen, 2, n_head, head_dim] or [batch, seqlen, 2, n_head, head_dim]
+        # scatter in n_head and gather in seqlen(packlen)
+        kv = _SeqAllToAll.apply(self.spg, kv, 3, 1)
+
+        context = self.local_attn(q, kv, **kwargs)
+
+        # context shape: [1, packlen, n_head, head_dim] or [batch, seqlen, n_head, head_dim]
+        # scatter in seqlen(packlen) and gather in n_head
+        context = _SeqAllToAll.apply(self.spg, context, 1, 2)
+
+        return context
+
+    @forward.register(conditions=(str(QKVPackType.QKVSPLITED), str(CuSeqlenType.With)))
+    @forward.register(conditions=(str(QKVPackType.QKVSPLITED), str(CuSeqlenType.WithOut)))
+    def _(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs) -> torch.Tensor:
+        """forward
+
+        Arguments:
+            q (Tensor): q input to the layer
+            k (Tensor): k input to the layer
+            v (Tensor): v input to the layer
+            kwargs: other args
+
+        Returns:
+            * output (Tensor): context output
+        """
+        # self._scatter_gather_idx["q"] = [1, 0]  # q/k/v shape: [sequence, head, head_dim]
+        # q shpae: [1, packlen, n_head, head_dim] or [batch, seqlen, n_head, head_dim]
+        # scatter in n_head and gather in seqlen(packlen)
+        q = _SeqAllToAll.apply(self.spg, q, 2, 1)
+        # k shpae: [1, packlen, n_head, head_dim] or [batch, seqlen, n_head, head_dim]
+        # scatter in n_head and gather in seqlen(packlen)
+        k = _SeqAllToAll.apply(self.spg, k, 2, 1)
+        # v shpae: [1, packlen, n_head, head_dim] or [batch, seqlen, n_head, head_dim]
+        # scatter in n_head and gather in seqlen(packlen)
+        v = _SeqAllToAll.apply(self.spg, v, 2, 1)
+
+        context = self.local_attn(q, k, v, **kwargs)
+
+        # context shape: [1, packlen, n_head, head_dim] or [batch, seqlen, n_head, head_dim]
+        # scatter in seqlen(packlen) and gather in n_head
+        context = _SeqAllToAll.apply(self.spg, context, 1, 2)
+
+        return context
+
+
+def auto_wrap_distributed_attention(cls: nn.Module) -> Callable[[bool, Any, float], nn.Module]:
+    """
+    Wrap a local attention module to a distributed one, which will be used in the ISP parallelism.
+    """
+
+    # should we impl distributed attention as a metaclass?
+    def _attetion_constructor(
+        local_attn_cls: type, causal=False, softmax_scale=None, attention_dropout=0.0
+    ) -> nn.Module:
+        if gpc.config.parallel["tensor"].get("mode", "mtp") != "isp":
+            return local_attn_cls(causal, softmax_scale, attention_dropout)
+        else:
+            return DistributedAttention(
+                local_attention=local_attn_cls(causal, softmax_scale, attention_dropout),
+                sequence_process_group=gpc.get_group(ParallelMode.TENSOR),
+            )
+
+    return partial(_attetion_constructor, local_attn_cls=cls)

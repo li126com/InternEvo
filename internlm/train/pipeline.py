@@ -1,28 +1,15 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
-import functools
 import math
 import time
-from typing import Callable, Iterable, List, Optional, Union
+from typing import Callable, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import torch
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    BackwardPrefetch,
-    ShardingStrategy,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 
 from internlm.accelerator import AcceleratorType, get_accelerator
-from internlm.core.communication.isp import (
-    ISPCommModelConfig,
-    ISPCommunicator,
-    ISPCommunicatorSchedulerHook,
-)
-from internlm.core.communication.utils import ParamAsyncBcastHandler
 from internlm.core.context import (
     IS_REPLICA_ZERO_PARALLEL,
     IS_TENSOR_DATA_PARALLEL,
@@ -33,34 +20,51 @@ from internlm.core.context import (
 )
 from internlm.core.context import global_context as gpc
 from internlm.core.context.random import set_mode
-from internlm.core.naive_amp import NaiveAMPModel, set_fp32_attr_to_module
+from internlm.core.naive_amp import (
+    NaiveAMPModel,
+    set_fp32_attr_to_module,
+    unwrap_naive_amp,
+)
+from internlm.core.parallel.comm.isp import (
+    ISPCommModelConfig,
+    ISPCommunicator,
+    ISPCommunicatorSchedulerHook,
+)
+from internlm.core.parallel.comm.tensor import (
+    EmbbedingSequenceParallelCommunicator,
+    EmbbedingTensorParallelCommunicator,
+    HeadSequenceParallelCommunicator,
+    HeadTensorParallelCommunicator,
+    LinearRole,
+    MoESequenceParallelCommunicator,
+    SequenceParallelCommunicator,
+    TensorParallelCommunicator,
+)
+from internlm.core.parallel.comm.zero import ParamAsyncBcastHandler
 from internlm.core.trainer import TrainState
-from internlm.data.utils import unpack_data
+from internlm.data.utils import unpack_type_ids
+from internlm.model.builder import create_model
 from internlm.model.metrics import SchedulerMetricHook
 from internlm.model.modules.embedding import Embedding1D
-from internlm.model.modules.mlp import FeedForward
-from internlm.model.modules.multi_head_attention import MHA
+from internlm.model.modules.linear import (
+    ColumnParallelLinear,
+    ParallelLinearWithCommExt,
+    RewardModelLinear,
+    RowParallelLinear,
+    ScaleColumnParallelLinear,
+)
+from internlm.model.modules.utils import is_moe_param
 from internlm.model.moe.megablock.mlp import (
     MegaBlockFeedForward,
     MegaBlockGroupedFeedForward,
 )
 from internlm.model.moe.moe import MoE
-from internlm.model.ops.fusion_ops_import_helper import (
-    try_import_FusedAdamW,
-    try_import_RMSNorm,
-)
-from internlm.model.ops.linear import (
-    BaseScaleColumnParallelLinear,
-    ColumnParallelLinearTorch,
-    ISPLinear,
-    RewardModelLinear,
-    RowParallelLinearTorch,
-    ScaleColumnParallelLinear,
-)
-from internlm.model.utils import is_moe_param
+from internlm.model.ops.norm import RMSNorm
+from internlm.model.registry import register_model_initializer
 from internlm.monitor import set_env_var
 from internlm.monitor.monitor import monitor_manager as mm
 from internlm.solver.optimizer import FSDPadaptOptimizer, HybridZeroOptimizer
+from internlm.solver.optimizer.compatible_adamw import new_compatible_adamw
 from internlm.solver.schedulers.beta2_scheduler import Beta2Scheduler
 from internlm.solver.schedulers.lr_scheduler import FineTuneCosineAnnealingWarmupLR
 from internlm.train.utils import create_param_groups
@@ -77,7 +81,6 @@ from internlm.utils.parallel import (
     sync_model_param,
     sync_model_replica_param_group,
 )
-from internlm.utils.registry import MODEL_INITIALIZER
 from internlm.utils.timeout import llm_timeout
 
 try:
@@ -85,7 +88,6 @@ try:
 except (ImportError, ModuleNotFoundError):
     pass
 
-RMSNorm = try_import_RMSNorm()
 logger = get_logger(__file__)
 internlm_accelerator = get_accelerator()
 
@@ -112,9 +114,8 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
                 setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
         # embedding and head
-        embedding_head_cls = (Embedding1D, BaseScaleColumnParallelLinear)
 
-        if isinstance(module, embedding_head_cls):
+        if isinstance(module, (Embedding1D, ScaleColumnParallelLinear)):
             for param in module.parameters():
                 if gpc.is_initialized(ParallelMode.TENSOR) and is_using_isp():
                     setattr(param, IS_TENSOR_DATA_PARALLEL, True)
@@ -124,7 +125,7 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
         # for linear module
         if isinstance(
             module,
-            (ColumnParallelLinearTorch, RowParallelLinearTorch, MegaBlockFeedForward, MegaBlockGroupedFeedForward),
+            (ParallelLinearWithCommExt, MegaBlockFeedForward, MegaBlockGroupedFeedForward),
         ):
             for param in module.parameters():
                 if gpc.is_initialized(ParallelMode.EXPERT_DATA) and is_moe_param(param):
@@ -138,18 +139,9 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
         # for vit and vit project
         if "vision_tower" in name.lower() or "vision_proj" in name.lower():
             for param in module.parameters():
-                if gpc.is_initialized(ParallelMode.TENSOR) and is_using_isp():
-                    setattr(param, IS_TENSOR_DATA_PARALLEL, True)
-                elif gpc.is_initialized(ParallelMode.TENSOR) and not is_using_isp():
-                    setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
+                setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
-    if not isinstance(model, nn.ModuleList):
-        model = [model]
-
-    for _chunk in model:
-        if isinstance(_chunk, NaiveAMPModel):
-            _chunk = _chunk.model
-
+    for _chunk in unwrap_naive_amp(model):
         # set param parallel attribute
         for name, module in _chunk.named_modules():
             _check_module(name, module)
@@ -175,7 +167,11 @@ def initialize_model(pre_process_func: Optional[Callable] = None, post_process_f
     """
     if pre_process_func:
         pre_process_output = pre_process_func()
-    model = MODEL_INITIALIZER.get_module(module_name=gpc.config.model_type)(**(gpc.config.model))
+
+    register_model_initializer()
+
+    model = create_model(model_type=gpc.config.model_type, **(gpc.config.model))
+
     if post_process_func:
         post_process_func(pre_process_output)
 
@@ -218,47 +214,22 @@ def initialize_model(pre_process_func: Optional[Callable] = None, post_process_f
     random_mode = ParallelMode.WEIGHT_DATA if is_using_isp() else ParallelMode.DATA
     set_mode(random_mode)
 
-    # if fsdp enabled, wrap the model
-    model = wrap_FSDP_model(model)
-
     return model
 
 
-def wrap_FSDP_model(model: Union[nn.Module, nn.ModuleList]):
-    if gpc.config.parallel.zero1.fsdp and gpc.config.model.use_flash_attn:
-        from flash_attn.modules.embedding import ParallelGPT2Embeddings
-
-        # set wrap_policy for fsdp wrap
-        transformer_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                Embedding1D,
-                ParallelGPT2Embeddings,
-                MHA,
-                RMSNorm,
-                FeedForward,
-                RewardModelLinear,
-                ScaleColumnParallelLinear,
-            },
-        )
-
-        # wrap the model
-        grp = gpc.get_group(ParallelMode.ZERO1)
-        model = FSDP(  # pylint: disable=unexpected-keyword-arg
-            module=model,
-            process_group=grp,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            auto_wrap_policy=transformer_wrap_policy,
-            forward_prefetch=True,
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            limit_all_gathers=True,
-            use_orig_params=True,
-        )
-
-    return model
+_T = TypeVar("_T")
 
 
-def initialize_isp_communicator(model: Union[nn.Module, nn.ModuleList]):
+def _submodule_filter(model: Union[nn.Module, nn.ModuleList], target_cls: Union[_T, Tuple[_T]]) -> Iterable[_T]:
+    for _chunk in unwrap_naive_amp(model):
+        for _module in _chunk.modules():
+            if not isinstance(_module, target_cls):
+                continue
+
+            yield _module
+
+
+def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
     """
     Initialize communicator for isp tensor parallel mode.
 
@@ -269,6 +240,8 @@ def initialize_isp_communicator(model: Union[nn.Module, nn.ModuleList]):
         An isp communicator for managing comp/comm overlap and memory pool.
     """
     isp_communicator = None
+    _retain_out_sharded = gpc.config.model.get("parallel_output", True)
+
     if is_using_isp():
         isp_communicator = ISPCommunicator(
             model,
@@ -281,8 +254,73 @@ def initialize_isp_communicator(model: Union[nn.Module, nn.ModuleList]):
             gpc.config.parallel.weight.memory_pool,
             gpc.get_group(ParallelMode.WEIGHT),
         )
-        # register communicator for isp linear.
-        ISPLinear.register_communicator(isp_communicator)
+        # register communicator for isp column parallel linear.
+        ColumnParallelLinear.register_cls_communicator(isp_communicator)
+        # row parallel linear will not be used.
+        RowParallelLinear.register_cls_communicator(None)
+        _head_communicator = HeadSequenceParallelCommunicator(ParallelMode.TENSOR, _retain_out_sharded)
+        _embedding_communicator = EmbbedingSequenceParallelCommunicator(ParallelMode.TENSOR)
+
+    # register communictor for mtp/msp/fsp linear.
+
+    # tensor parallel
+    if gpc.config.parallel.tensor.mode == "mtp":
+        ColumnParallelLinear.register_cls_communicator(
+            TensorParallelCommunicator(process_group=gpc.get_group(ParallelMode.TENSOR), role=LinearRole.COLUMN)
+        )
+        RowParallelLinear.register_cls_communicator(
+            TensorParallelCommunicator(process_group=gpc.get_group(ParallelMode.TENSOR), role=LinearRole.ROW)
+        )
+        _head_communicator = HeadTensorParallelCommunicator(ParallelMode.TENSOR, _retain_out_sharded)
+        _embedding_communicator = EmbbedingTensorParallelCommunicator(ParallelMode.TENSOR)
+    # sequence parallel
+    if gpc.config.parallel.tensor.mode in ("msp", "fsp"):
+        save_total_input_as_activation = gpc.config.parallel.tensor.mode == "msp"
+
+        ColumnParallelLinear.register_cls_communicator(
+            SequenceParallelCommunicator(
+                process_group=gpc.get_group(ParallelMode.TENSOR),
+                role=LinearRole.COLUMN,
+                save_total_input_as_activation=save_total_input_as_activation,
+            )
+        )
+        RowParallelLinear.register_cls_communicator(
+            SequenceParallelCommunicator(
+                gpc.get_group(ParallelMode.TENSOR),
+                role=LinearRole.ROW,
+                save_total_input_as_activation=save_total_input_as_activation,
+            )
+        )
+
+        _head_communicator = HeadSequenceParallelCommunicator(
+            ParallelMode.TENSOR, _retain_out_sharded, save_total_input_as_activation
+        )
+        _embedding_communicator = EmbbedingSequenceParallelCommunicator(ParallelMode.TENSOR)
+
+        # MoE sequence parallel
+        if gpc.config.model.get("num_experts", 1) > 1:
+            _column_communicator = TensorParallelCommunicator(
+                process_group=gpc.get_group(ParallelMode.TENSOR), role=LinearRole.COLUMN
+            )
+            _row_communicator = TensorParallelCommunicator(
+                process_group=gpc.get_group(ParallelMode.TENSOR), role=LinearRole.ROW
+            )
+            for moe in _submodule_filter(model, MoE):
+                # 1. the linear in MoE degrades the parallel communication pattern from sp to tp
+                for column_linear in _submodule_filter(moe, ColumnParallelLinear):
+                    column_linear.register_communicator(_column_communicator)
+                for row_linear in _submodule_filter(moe, RowParallelLinear):
+                    row_linear.register_communicator(_row_communicator)
+                # 2. register MoESequenceParallelCommunicator for MoE layer
+                MoESequenceParallelCommunicator(ParallelMode.TENSOR).register_module_hook(moe)
+
+    # register communitorc for embedding layer.
+    for embedding in _submodule_filter(model, Embedding1D):
+        _embedding_communicator.register_module_hook(embedding)
+
+    # register communictor for head layer.
+    ScaleColumnParallelLinear.register_cls_communicator(_head_communicator)
+    RewardModelLinear.register_cls_communicator(_head_communicator)
 
     return isp_communicator
 
@@ -305,15 +343,11 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
 
     params = create_param_groups(model, adam_cfg.weight_decay)
 
-    # TODO(caikun): add DIPU backend adamw
-    adam_extra_kwargs, internlm_adamw = try_import_FusedAdamW()
-
-    naive_optimizer = internlm_adamw(
+    naive_optimizer = new_compatible_adamw(
         params=params,
         lr=adam_cfg.lr,
         betas=(adam_cfg.adam_beta1, adam_cfg.adam_beta2),
         eps=adam_cfg.adam_eps,
-        **adam_extra_kwargs,
     )
 
     if (
@@ -411,7 +445,7 @@ def load_new_batch(train_dl: DataLoader, train_iter: Iterable, train_state: Trai
     if batch[0].get("type_ids", None) is not None:
         # if use_packed_dataset is False, we need to unpack type_ids
         if not gpc.config.data.use_packed_dataset:
-            batch[0]["type_ids"] = unpack_data(batch[0]["type_ids"], batch[0]["cu_seqlens"], is_type_ids=True)
+            batch[0]["type_ids"] = unpack_type_ids(batch[0]["type_ids"], batch[0]["cu_seqlens"])
 
     return batch, train_iter
 
@@ -474,6 +508,7 @@ def record_current_batch_training_metrics(
     beta2_scheduler,
     trainer,
     start_time,
+    very_begining_time,
     loss,
     moe_loss,
     grad_norm,
@@ -512,7 +547,7 @@ def record_current_batch_training_metrics(
         tgs_statistic = train_state.tgs_statistic
         tgs_statistic["sum_step"] += 1
         tgs_statistic["sum_tg"] += tk_per_gpu
-        tgs_statistic["sum_time"] += time_cost
+        tgs_statistic["total_time"] = time.time() - very_begining_time
         tgs_statistic["sum_last_tg_10"] += tk_per_gpu
         tgs_statistic["sum_last_time_10"] += time_cost
         tgs_statistic["sum_last_tg_50"] += tk_per_gpu
@@ -543,7 +578,7 @@ def record_current_batch_training_metrics(
         last_tgs_10 = tgs_statistic["last_tgs_10"]
         last_tgs_50 = tgs_statistic["last_tgs_50"]
 
-        tgs_all = round(tgs_statistic["sum_tg"] / tgs_statistic["sum_time"], 2)
+        tgs_all = round(tgs_statistic["sum_tg"] / tgs_statistic["total_time"], 2)
         tgs_avg = round(tgs_statistic["sum_tgs"] / tgs_statistic["sum_step"], 2)
         tgs_SMA = round(tgs_statistic["SMA_tg_50"] / tgs_statistic["SMA_time_50"], 2)
 

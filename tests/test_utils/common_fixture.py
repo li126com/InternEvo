@@ -7,6 +7,9 @@ import torch
 
 from internlm.core.context import global_context as gpc
 from internlm.core.context.parallel_context import Config
+from internlm.core.naive_amp import NaiveAMPModel
+from internlm.model.builder import create_model
+from internlm.model.registry import register_model_initializer
 from internlm.solver.optimizer.hybrid_zero_optim import HybridZeroOptimizer
 from internlm.train.utils import create_param_groups
 from internlm.utils.storage_manager import SingletonMeta
@@ -87,13 +90,8 @@ init_config = Config(
 
 
 def init_naive_model():
-    # let MODEL_INITIALIZER to work
-    import internlm.model.modeling_internlm  # noqa # pylint: disable=unused-import
-    import internlm.model.modeling_moe  # noqa # pylint: disable=unused-import
-    from internlm.core.naive_amp import NaiveAMPModel
-    from internlm.utils.registry import MODEL_INITIALIZER
-
-    model = MODEL_INITIALIZER.get_module(module_name=gpc.config.model_type)(**(init_config.model))
+    register_model_initializer()
+    model = create_model(model_type=gpc.config.model_type, **(init_config.model))
     model = NaiveAMPModel(
         model=model,
         output_to_fp32=False,

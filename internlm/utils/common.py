@@ -45,45 +45,15 @@ def move_norm_to_cuda(norm: Union[float, torch.Tensor]) -> Union[float, torch.Te
     return norm
 
 
-def _move_tensor(element):
-    if not torch.is_tensor(element):
-        # we expecte the data type if a list of dictionaries
-        for idx, item in enumerate(element):
-            if isinstance(item, dict):
-                for key, value in item.items():
-                    assert value.device.type == "cpu"
-                    item[key] = value.to(get_current_device()).detach()
-            elif isinstance(item, list):
-                for index, value in enumerate(item):
-                    assert value.device.type == "cpu"
-                    item[index] = value.to(get_current_device()).detach()
-            elif torch.is_tensor(item):
-                if item.device.type == "cpu":
-                    element[idx] = item.to(get_current_device()).detach()
-            else:
-                assert False, f"{type(item)}, {item}"
-    else:
-        assert torch.is_tensor(element), f"element should be of type tensor, but got {type(element)}"
-        if element.device.type == "cpu":
-            element = element.to(get_current_device()).detach()
-    return element
-
-
 def move_to_device(data):
     if isinstance(data, torch.Tensor):
-        data = data.to(get_current_device())
+        if data.device.type == "cpu":
+            data = data.to(get_current_device()).detach()
     elif isinstance(data, (list, tuple)):
-        data_to_return = []
-        for element in data:
-            if isinstance(element, dict):
-                data_to_return.append({k: _move_tensor(v) for k, v in element.items()})
-            else:
-                data_to_return.append(_move_tensor(element))
-        data = data_to_return
+        data = [move_to_device(x) for x in data]
     elif isinstance(data, dict):
-        data = {k: _move_tensor(v) for k, v in data.items()}
-    else:
-        raise TypeError(f"Expected batch data to be of type torch.Tensor, list, tuple, or dict, but got {type(data)}")
+        data = {k: move_to_device(v) for k, v in data.items()}
+
     return data
 
 
@@ -247,10 +217,14 @@ def get_megatron_flops(
 
 def enable_pytorch_expandable_segments():
     if torch.__version__ >= "2.1.0" and AcceleratorType.GPU == internlm_accelerator.get_accelerator_backend():
-        _alloc_setting = "expandable_segments:True"
-        if os.getenv("PYTORCH_CUDA_ALLOC_CONF", None) is not None:
-            _alloc_setting = os.getenv("PYTORCH_CUDA_ALLOC_CONF") + "," + _alloc_setting
-        internlm_accelerator.memory._set_allocator_settings(_alloc_setting)
+        _expandable_segments_conf = "expandable_segments:True"
+        _alloc_conf = os.getenv("PYTORCH_CUDA_ALLOC_CONF", None)
+        if _alloc_conf is None:
+            _alloc_conf = _expandable_segments_conf
+        elif "max_split_size_mb" not in _alloc_conf:
+            _alloc_conf = _alloc_conf + "," + _expandable_segments_conf
+
+        internlm_accelerator.memory._set_allocator_settings(_alloc_conf)
     else:
         logger.warning("To support the 'expandable_segments' configuration, please upgrade torch to version 2.1.0.")
 

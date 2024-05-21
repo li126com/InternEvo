@@ -22,7 +22,11 @@ from internlm.eval.evaluation import switch_evaluation_mode
 from internlm.initialize.launch import args_sanity_check
 from internlm.model.losses import FlashGPTLMLoss
 from internlm.model.metrics import AccPerplex, SchedulerMetricHook
-from internlm.train import initialize_model, initialize_optimizer
+from internlm.train import (
+    initialize_model,
+    initialize_optimizer,
+    initialize_parallel_communicator,
+)
 from internlm.utils.common import get_current_device
 from internlm.utils.logger import get_logger
 
@@ -266,6 +270,7 @@ def exam_loss(args):
 
     # initialize model
     model = initialize_model()
+    _ = initialize_parallel_communicator(model)
 
     # initialize loss function
     criterion = FlashGPTLMLoss(parallel_output=True, label_smoothing=gpc.config.loss.label_smoothing)

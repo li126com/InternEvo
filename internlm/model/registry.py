@@ -1,6 +1,14 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
+from typing import Callable
+
+from internlm.model.modeling_internlm import InternLM1
+from internlm.model.modeling_internlm2 import InternLM2
+from internlm.model.modeling_llama import Llama2
+from internlm.model.modeling_llava import Llava
+from internlm.model.modeling_moe import Internlm1MoE
+
 
 class Registry:
     """This is a registry class used to register classes and modules so that a universal
@@ -12,13 +20,13 @@ class Registry:
 
     def __init__(self, name: str):
         self._name = name
-        self._registry = dict()
+        self._registry = {}
 
     @property
     def name(self):
         return self._name
 
-    def register_module(self, module_name: str):
+    def register_module(self, module_name: str, func: Callable):
         """Registers a module represented in `module_class`.
 
         Args:
@@ -31,11 +39,7 @@ class Registry:
 
         assert module_name not in self._registry, f"{module_name} already registered in {self.name}"
 
-        def decorator_wrapper(original_func):
-            self._registry[module_name] = original_func
-            return original_func
-
-        return decorator_wrapper
+        self._registry[module_name] = func
 
     def get_module(self, module_name: str):
         """Retrieves a module with name `module_name` and returns the module if it has
@@ -68,4 +72,12 @@ class Registry:
         return found_flag
 
 
-MODEL_INITIALIZER = Registry("model_initializer")
+model_initializer = Registry("model_initializer")
+
+
+def register_model_initializer() -> None:
+    model_initializer.register_module("INTERNLM", InternLM1)
+    model_initializer.register_module("INTERNLM2_PUBLIC", InternLM2)
+    model_initializer.register_module("LLAMA2", Llama2)
+    model_initializer.register_module("INTERNLM_MoE", Internlm1MoE)
+    model_initializer.register_module("LLAVA", Llava)
