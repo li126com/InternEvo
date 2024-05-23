@@ -383,15 +383,22 @@ import torch
 
 
 class BucketStore(BaseStore):
-    def __init__(self, torch_pg: ProcessGroup, torch_zero=ParallelMode.ZERO1):
-        super().__init__(torch_pg)
-        self.zero_world_size = gpc.get_world_size(torch_zero)
-        self.zero_local_rank = gpc.get_local_rank(torch_zero)
+    def __init__(self, group_id, dp_parallel_mode: ProcessGroup, zero_mode=ParallelMode.ZERO1):
+        super().__init__(dp_parallel_mode)
+        self.zero_world_size = gpc.get_world_size(zero_mode)
+        self.zero_local_rank = gpc.get_local_rank(zero_mode)
+        self._dp_parallel_mode = dp_parallel_mode
+        self._group_id = group_id
         self.reset_all()
+    
+    def get_param_group_id(self):
+        return self._group_id
+    
+    def get_dp_parallel_mode(self):
+        return self._dp_parallel_mode
 
     def reset_all(self) -> None:
         # init
-        self.current_group_id = 0
         self._num_elements_in_bucket = 0
         # mapping gradient slices and parameter
         self.grad_to_param_mapping = dict()
@@ -406,7 +413,7 @@ class BucketStore(BaseStore):
         
         self._param_list = []
         self._padding_size = []
-        for rank in range(self._world_size):
+        for rank in range(self.zero_world_size):
             self._grad_in_bucket[rank] = []
 
         # offset_list records number of tensors in the bucket before each reduction
@@ -426,7 +433,7 @@ class BucketStore(BaseStore):
 
         self._num_elements_in_bucket = 0
 
-    def add_param_grad(self, group_id: int, param: Tensor, padding_size: int):
+    def add_param_grad(self, param: Tensor, padding_size: int):
         """Add a param to bucket and record the padding size of a param for gradient padding
 
         Args:
@@ -450,7 +457,6 @@ class BucketStore(BaseStore):
          
         self._padding_size.append(padding_size)
         self._num_elements_in_bucket += param.numel() + padding_size
-        self.current_group_id = group_id
 
         # number of tensors in current bucket
         self.offset_list[-1] += 1
@@ -480,7 +486,6 @@ class BucketStore(BaseStore):
         #             self._grad_current_rank_for_group[group_id] = []
         #         self._grad_current_rank_for_group[group_id].append(grad_current_rank)
         #     self.offset_list_for_group[group_id].append(0)
-
         
         for param, padding_size in zip(self._param_list, self._padding_size):
             if param.grad == None:
@@ -490,9 +495,8 @@ class BucketStore(BaseStore):
                 with torch.no_grad():
                     grad = torch.nn.functional.pad(grad.view(-1), [0, padding_size])
             grad_list = grad.split(grad.numel() // self.zero_world_size)
-            for rank in range(self._world_size):
-                rank_to_go = self._local_rank // (self._world_size // self.zero_world_size)
-                grad_current_rank = grad_list[rank_to_go].clone().detach()
+            for rank in range(self.zero_world_size):
+                grad_current_rank = grad_list[rank].clone().detach()
                 self.grad_to_param_mapping[id(grad_current_rank)] = id(param)
                 self._grad_in_bucket[rank].append(grad_current_rank)
             param.grad = None
@@ -509,6 +513,9 @@ class BucketStore(BaseStore):
         """
 
         return self._grad_in_bucket
+    
+    def get_param(self):
+        return self._param_list
 
     def get_flatten_grad(self) -> Tensor:
         """Return the flattened gradients slices in the bucket, the data organization of the flattened tensor:
@@ -559,7 +566,7 @@ class BucketStore(BaseStore):
 
 
 class GradientStore(BaseStore):
-    def __init__(self, *args, partition_grad: bool = False, torch_zero=ParallelMode.ZERO1):
+    def __init__(self, *args, partition_grad: bool = False, zero_mode=ParallelMode.ZERO1):
         super().__init__(*args)
         """
         self._grads_of_params mapping the parameter and its gradient slices
@@ -570,8 +577,8 @@ class GradientStore(BaseStore):
           }
         }
         """
-        self.zero_world_size = gpc.get_world_size(torch_zero)
-        self.zero_local_rank = gpc.get_local_rank(torch_zero)
+        self.zero_world_size = gpc.get_world_size(zero_mode)
+        self.zero_local_rank = gpc.get_local_rank(zero_mode)
         self._grads_of_params = dict()
         # for zero2, it's `param_id: [grad_local_rank]`
         self._working_index = 0 if partition_grad else self.zero_local_rank
@@ -688,8 +695,8 @@ class GradientStore(BaseStore):
 
 
 class ParameterStore(BaseStore):
-    def __init__(self, torch_pg: ProcessGroup):
-        super().__init__(torch_pg)
+    def __init__(self, dp_parallel_mode: ProcessGroup):
+        super().__init__(dp_parallel_mode)
 
         # record the padding size of each param
         self._padding_map = dict()

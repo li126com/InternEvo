@@ -32,7 +32,6 @@ from internlm.solver.optimizer.store import (
 from internlm.solver.optimizer.utils import (
     DynamicGradScaler,
     flatten,
-    get_grad_accumulate_object,
     has_inf_or_nan,
     reduce_tensor,
     release_param_grad,
@@ -43,12 +42,10 @@ from internlm.solver.optimizer.utils import (
 from internlm.utils.parallel import is_using_isp, is_using_sequence_parallel
 
 
-
 from internlm.utils.common import get_current_device
 from internlm.utils.logger import get_logger
 from internlm.monitor import send_alert_message
 
-from abc import ABC, abstractmethod
 from torch import Tensor
 import math
 
@@ -61,14 +58,10 @@ def calculate_global_norm_from_list(norm_list):
     return math.sqrt(total_norm)
 
 
-
-
 from torch.optim import Optimizer
-from typing import Union
 
 
-
-from internlm.core.context import Config, ParallelMode
+from internlm.core.context import ParallelMode
 from .base_optimizer import BaseOptimizer
 
 logger = get_logger(__file__)
@@ -86,10 +79,8 @@ class HybridZeroOptimizer(BaseOptimizer):
         isp_communicator,
         verbose: bool = False,
         communication_dtype: Optional[torch.dtype] = None,
-        overlap_communication: bool = False,
         partition_grad: bool = False,  # stage 2 flag
         cpu_offload: bool = False,  # cpu offload
-        dp_process_group: Optional[ProcessGroup] = None,  # the dp pg for comm
         forced_dtype: Optional[torch.dtype] = None,
         moe_extra_dp_process_group: Optional[ProcessGroup] = None,
         master_weights: bool = True,  # master weights
@@ -122,7 +113,6 @@ class HybridZeroOptimizer(BaseOptimizer):
         
         super(HybridZeroOptimizer, self).__init__(optim=optimizer)
         
-        self.use_isp = False
 
         self._dtype = self.optim.param_groups[0]["params"][0].dtype
         self._verbose = verbose
@@ -160,7 +150,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         self._master_param_groups_of_current_rank = dict()
 
         # communication params
-        self._overlap_communication = overlap_communication
+        self._overlap_communication = zero_cfg.overlap_sync_grad
         self._reduce_bucket_size = reduce_bucket_size
         self._communication_dtype = communication_dtype
         
@@ -200,7 +190,8 @@ class HybridZeroOptimizer(BaseOptimizer):
         parallel_mode = ParallelMode.WEIGHT_DATA if self.use_isp else ParallelMode.DATA
         self._param_store = ParameterStore(ParallelMode.ZERO1)
         self._grad_store = GradientStore(parallel_mode, partition_grad=partition_grad)
-        self._bucket_store = BucketStore(parallel_mode)
+        self._bucket_store: List[BucketStore] = []
+        self._accum_grad_buckets: List[BucketStore] = []
 
         # moe param should not be stored in working_groups
         # because they have different parallel strategy
@@ -224,6 +215,7 @@ class HybridZeroOptimizer(BaseOptimizer):
             group_params = list()
             for param in param_group["params"]:
                 if param.requires_grad:
+                    setattr(param, "group_id", group_id)
                     group_params.append(param)
 
             # add the working params to working_param_groups for bookkeeping
@@ -235,6 +227,16 @@ class HybridZeroOptimizer(BaseOptimizer):
             # so that when the optimizer calls step(), it only updates the tensors
             # managed by this data parallel rank
             param_group["params"] = master_param_current_rank
+            
+            if self._is_moe_group(param_group):
+                grad_reduce_mode = ParallelMode.EXPERT_DATA
+            elif param_group["name"] != "embed_head" and self.use_isp:
+                grad_reduce_mode = ParallelMode.WEIGHT_DATA
+            else:
+                grad_reduce_mode = ParallelMode.DATA
+                
+            self._bucket_store.append(BucketStore(group_id, grad_reduce_mode))
+            self._accum_grad_buckets.append(BucketStore(group_id, grad_reduce_mode))
 
         # if there are moe params, store in addtional group in optim
         if len(self.working_moe_params) > 0:
@@ -263,47 +265,9 @@ class HybridZeroOptimizer(BaseOptimizer):
         ### todo    
         self.skip_grad_reduce = False
 
-        # reduction hook is only used if overlapping communication
-        # or stage 2 is used
-        # if it is stage 1 without overlapping, no hook will be attached
-        # colossalAI hook, not currently used
-        if self._overlap_communication or self._partition_grads:
-            print("_attach_reduction_hook", flush=True)
-            self._attach_reduction_hook()
-        
         # InternEvo origin hook    
-        self._attach_reduction_hook_2()
-        
-        
-
-        # initialize mixed precision mixin
-        # self.mixed_precision_mixin = LowLevelZeroFP16MixedPrecisionMixin(
-        #         self.num_param_groups,
-        #         self._grad_store,
-        #         initial_scale=initial_scale,
-        #         min_scale=min_scale,
-        #         growth_factor=growth_factor,
-        #         backoff_factor=backoff_factor,
-        #         growth_interval=growth_interval,
-        #         hysteresis=hysteresis,
-        #         max_scale=max_scale,
-        #     )
-        # if self._dtype is torch.float16:
-        #     print("torch.float16", flush=True)
-        #     self.mixed_precision_mixin = LowLevelZeroFP16MixedPrecisionMixin(
-        #         self.num_param_groups,
-        #         self._grad_store,
-        #         initial_scale=initial_scale,
-        #         min_scale=min_scale,
-        #         growth_factor=growth_factor,
-        #         backoff_factor=backoff_factor,
-        #         growth_interval=growth_interval,
-        #         hysteresis=hysteresis,
-        #         max_scale=max_scale,
-        #     )
-        # elif self._dtype is torch.bfloat16:
-        #     print("torch.bfloat16", flush=True)
-        #     self.mixed_precision_mixin = BF16MixedPrecisionMixin()
+        self._attach_reduction_hook()        
+    
 
     @property
     def dtype(self):
@@ -316,6 +280,53 @@ class HybridZeroOptimizer(BaseOptimizer):
     @property
     def loss_scale(self) -> float:
         return self.grad_scaler.scale.item()
+    
+    def _is_moe_group(self, param_group):
+        return "moe" in param_group.keys() and param_group["moe"]
+    
+    def _wait_reduce_scatter_and_accumulate_grads(self, param):
+        param_size = param.numel()
+
+        group_id = getattr(param, "group_id")
+        current_bucket = self._accum_grad_buckets[group_id]
+
+        # check if the bucket is full
+        # if full, will reduce the grads already in the bucket
+        # after reduction, the bucket will be empty
+        if current_bucket.num_elements_in_bucket() + param_size > self._reduce_bucket_size:
+            self._accum_grads_store_in_bucket(current_bucket)
+            
+        # otherwise, add the parameter into bucket.
+        current_bucket._num_elements_in_bucket += param.numel()
+        current_bucket._param_list.append(param)
+        
+    def _accum_grads_store_in_bucket(self, bucket: BucketStore) -> None:
+        for _param in bucket.get_param():
+            if not hasattr(_param, "isp_reduce_scatter_name"):
+                continue
+
+            # wait and accumulate gardient.
+            _key = getattr(_param, "isp_reduce_scatter_name")
+            _grad, _comm_handle = self._isp_communicator.reduce_scatter_handlers[_key]
+            _comm_handle.wait()
+            _param.grad.add_(_grad)
+
+            # release cuda memory.
+            if self._isp_communicator.enable_memory_pool:
+                self._isp_communicator.memory_pool.free_reduce_scatter_memory(
+                    key=tuple(_grad.size()), index=_grad.index
+                )
+            _grad = None
+            self._isp_communicator.reduce_scatter_handlers[_key] = None
+
+        bucket.reset_all()
+        
+    def accumulate_left_grads_after_backward(self):
+        if self._isp_communicator is None or self._isp_communicator.overlap is False:
+            return
+        
+        for group_id in range(self.num_param_groups):
+            self._accum_grads_store_in_bucket(self._accum_grad_buckets[group_id])
     
     def should_skip_step(self) -> bool:
         found_inf = self.check_overflow()
@@ -374,7 +385,6 @@ class HybridZeroOptimizer(BaseOptimizer):
             value = getattr(origin_param, IS_TENSOR_EXPERT_DATA_PARALLEL)
             setattr(splited_param_current_rank, IS_TENSOR_EXPERT_DATA_PARALLEL, value)
                 
-        
 
     def _create_master_param_current_rank(self, param_list):
         # split each param evenly by world size
@@ -411,180 +421,161 @@ class HybridZeroOptimizer(BaseOptimizer):
 
         return params_current_rank
 
-    ###########################
-    # Backward Reduction Hook #
-    ###########################
-
-    def _grad_handler(self, group_id, param):
-        # if run with no_sync context, would not sync grad when backward
-        if self.require_grad_sync:
-            self._add_to_bucket(param, group_id)
-
-    def _attach_reduction_hook(self):
-        # we iterate over the working params
-        # on each param, we register a hook to its AccumulateGrad object
-        for group_id in range(self.num_param_groups):
-            param_group = self._working_param_groups[group_id]
-            for param in param_group:
-                if param.requires_grad:
-                    param.register_post_accumulate_grad_hook(partial(self._grad_handler, group_id))
-
     #######################
     # Reduction Functions #
     #######################
 
-    def _run_reduction(self, temp=None):
-        if self._bucket_store.num_elements_in_bucket() > 0:
-            self._bucket_store.build_grad_in_bucket()
-
-            if self.moe_extra_dp_pg is None:
-                flat_grads = self._bucket_store.get_flatten_grad()
-                flat_grads /= self._world_size
-            else:
-                # record moe and non moe param
-                moe_list = []
-
-
-                # divide them into different groups
-                moe_grad_list = []
-                non_moe_grad_list = []
-                for grad_list in self._bucket_store._grad_in_bucket.values():
-                    non_moe_cur_grad = []
-                    moe_cur_grad = []
-                    for i in range(len(grad_list)):
-                        if moe_list[i] == True:
-                            moe_cur_grad.append(grad_list[i])
-                        else:
-                            non_moe_cur_grad.append(grad_list[i])
-                    if len(moe_cur_grad) > 0:
-                        moe_grad_list.append(moe_cur_grad)
-                    if len(non_moe_cur_grad) > 0:
-                        non_moe_grad_list.append(non_moe_cur_grad)
-
-                if len(non_moe_grad_list) > 0:
-                    non_moe_flat_grads = []
-                    for grad_list in non_moe_grad_list:
-                        non_moe_flat_grads.append(_flatten_dense_tensors(grad_list))
-                    non_moe_flat_grads = _flatten_dense_tensors(non_moe_flat_grads)
-                    non_moe_flat_grads /= self._world_size
-
-                if len(moe_grad_list) > 0:
-                    moe_flat_grads = []
-                    for grad_list in moe_grad_list:
-                        moe_flat_grads.append(_flatten_dense_tensors(grad_list))
-                    moe_flat_grads = _flatten_dense_tensors(moe_flat_grads)
-
-            # ready to add other tensors to bucket
-            self._bucket_store.reset_num_elements_in_bucket()
-
-            if self._overlap_communication:
-                stream = self._comm_stream
-                # in case of the memory being reused in the default stream
-                if self.moe_extra_dp_pg is None:
-                    flat_grads.record_stream(stream)
-                else:
-                    if len(non_moe_grad_list) > 0:
-                        non_moe_flat_grads.record_stream(stream)
-                    if len(moe_grad_list) > 0:
-                        moe_flat_grads.record_stream(stream)
-                # waiting for ops in the default stream finishing
-                stream.wait_stream(torch.cuda.current_stream())
-            else:
-                stream = torch.cuda.current_stream()
-
-            with torch.cuda.stream(stream):
-                group_id = self._bucket_store.current_group_id
+    def _run_reduction(self):
+        for group_id in range(self.num_param_groups):
+            current_bucket = self._bucket_store[group_id]
+            if current_bucket.num_elements_in_bucket() > 0:
+                current_bucket.build_grad_in_bucket()
 
                 if self.moe_extra_dp_pg is None:
-                    grad_dtype = flat_grads.dtype
-                    if self._communication_dtype is not None:
-                        flat_grads = flat_grads.to(self._communication_dtype)
-
-                if not self._partition_grads:
-                    if self.moe_extra_dp_pg is None:
-                        dist.all_reduce(flat_grads, group=self.dp_pg)
-                        if flat_grads.dtype != grad_dtype:
-                            flat_grads = flat_grads.to(grad_dtype)
-
-                        flat_grads_per_rank = flat_grads.split(flat_grads.numel() // self._world_size)
-                        grad_in_bucket = self._bucket_store.get_grad()
-                        print(f"grad_in_bucket.values(): {len(grad_in_bucket.values())}", flush=True)
-                        for rank, grad_list in enumerate(grad_in_bucket.values()):
-                            print(f"debug: {rank}, {len(flat_grads_per_rank[rank])}, {len(grad_list) * len(grad_list[0])}", flush=True)
-                        self._update_unpartitoned_grad(grad_in_bucket.values(), flat_grads_per_rank, group_id)
-
-                    # sync extra zero group
-                    else:
-                        # sync non moe param in global dp group
-                        if len(non_moe_grad_list) > 0:
-                            dist.all_reduce(non_moe_flat_grads, group=self.dp_pg)
-                            flat_grads_per_rank = non_moe_flat_grads.split(
-                                non_moe_flat_grads.numel() // self._world_size
-                            )
-                            self._update_unpartitoned_grad(non_moe_grad_list, flat_grads_per_rank, group_id)
-
-                        # sync moe param only in zero group
-                        if len(moe_grad_list) > 0:
-                            dist.all_reduce(moe_flat_grads, group=self.moe_extra_dp_pg)
-                            flat_grads_per_rank = moe_flat_grads.split(moe_flat_grads.numel() // self._world_size)
-                            self._update_unpartitoned_grad(moe_grad_list, flat_grads_per_rank, group_id)
-
+                    flat_grads = current_bucket.get_flatten_grad()
+                    flat_grads /= self._world_size
                 else:
-                    if self.moe_extra_dp_pg is None:
-                        flat_grads_list = list(flat_grads.split(len(flat_grads) // self._world_size))
-                        recieved_grad = torch.zeros_like(flat_grads_list[0])
-                        dist.reduce_scatter(recieved_grad, flat_grads_list, group=self.dp_pg)
+                    # record moe and non moe param
+                    moe_list = []
 
-                        if recieved_grad.dtype != grad_dtype:
-                            recieved_grad = recieved_grad.to(grad_dtype)
 
-                        grad_in_bucket_current_rank = self._bucket_store.get_grad()[self._local_rank]
-                        self._update_partitoned_grad(grad_in_bucket_current_rank, recieved_grad, group_id, 1)
-                    else:
-                        # categorize moe and non moe param
-                        grad_in_bucket_current_rank = self._bucket_store.get_grad()[self._local_rank]
-                        moe_grad_in_bucket_current_rank = []
-                        non_moe_grad_in_bucket_current_rank = []
-                        for idx, grad in enumerate(grad_in_bucket_current_rank):
-                            if moe_list[idx] == True:
-                                moe_grad_in_bucket_current_rank.append(grad)
+                    # divide them into different groups
+                    moe_grad_list = []
+                    non_moe_grad_list = []
+                    for grad_list in current_bucket._grad_in_bucket.values():
+                        non_moe_cur_grad = []
+                        moe_cur_grad = []
+                        for i in range(len(grad_list)):
+                            if moe_list[i] == True:
+                                moe_cur_grad.append(grad_list[i])
                             else:
-                                non_moe_grad_in_bucket_current_rank.append(grad)
+                                non_moe_cur_grad.append(grad_list[i])
+                        if len(moe_cur_grad) > 0:
+                            moe_grad_list.append(moe_cur_grad)
+                        if len(non_moe_cur_grad) > 0:
+                            non_moe_grad_list.append(non_moe_cur_grad)
 
+                    if len(non_moe_grad_list) > 0:
+                        non_moe_flat_grads = []
+                        for grad_list in non_moe_grad_list:
+                            non_moe_flat_grads.append(_flatten_dense_tensors(grad_list))
+                        non_moe_flat_grads = _flatten_dense_tensors(non_moe_flat_grads)
+                        non_moe_flat_grads /= self._world_size
+
+                    if len(moe_grad_list) > 0:
+                        moe_flat_grads = []
+                        for grad_list in moe_grad_list:
+                            moe_flat_grads.append(_flatten_dense_tensors(grad_list))
+                        moe_flat_grads = _flatten_dense_tensors(moe_flat_grads)
+
+                # ready to add other tensors to bucket
+                current_bucket.reset_num_elements_in_bucket()
+
+                if self._overlap_communication:
+                    stream = self._comm_stream
+                    # in case of the memory being reused in the default stream
+                    if self.moe_extra_dp_pg is None:
+                        flat_grads.record_stream(stream)
+                    else:
                         if len(non_moe_grad_list) > 0:
-                            flat_grads_list = list(
-                                non_moe_flat_grads.split(len(non_moe_flat_grads) // self._world_size)
-                            )
+                            non_moe_flat_grads.record_stream(stream)
+                        if len(moe_grad_list) > 0:
+                            moe_flat_grads.record_stream(stream)
+                    # waiting for ops in the default stream finishing
+                    stream.wait_stream(torch.cuda.current_stream())
+                else:
+                    stream = torch.cuda.current_stream()
+
+                with torch.cuda.stream(stream):
+                    group_id = current_bucket.get_param_group_id()
+
+                    if self.moe_extra_dp_pg is None:
+                        grad_dtype = flat_grads.dtype
+                        if self._communication_dtype is not None:
+                            flat_grads = flat_grads.to(self._communication_dtype)
+
+                    if not self._partition_grads:
+                        if self.moe_extra_dp_pg is None:
+                            dist.all_reduce(flat_grads, group=self.dp_pg)
+                            if flat_grads.dtype != grad_dtype:
+                                flat_grads = flat_grads.to(grad_dtype)
+
+                            flat_grads_per_rank = flat_grads.split(flat_grads.numel() // self.zero_world_size)
+                            grad_in_bucket = current_bucket.get_grad()
+                            self._update_unpartitoned_grad(grad_in_bucket.values(), flat_grads_per_rank, group_id)
+
+                        # sync extra zero group
+                        else:
+                            # sync non moe param in global dp group
+                            if len(non_moe_grad_list) > 0:
+                                dist.all_reduce(non_moe_flat_grads, group=self.dp_pg)
+                                flat_grads_per_rank = non_moe_flat_grads.split(
+                                    non_moe_flat_grads.numel() // self._world_size
+                                )
+                                self._update_unpartitoned_grad(non_moe_grad_list, flat_grads_per_rank, group_id)
+
+                            # sync moe param only in zero group
+                            if len(moe_grad_list) > 0:
+                                dist.all_reduce(moe_flat_grads, group=self.moe_extra_dp_pg)
+                                flat_grads_per_rank = moe_flat_grads.split(moe_flat_grads.numel() // self.zero_world_size)
+                                self._update_unpartitoned_grad(moe_grad_list, flat_grads_per_rank, group_id)
+
+                    else:
+                        if self.moe_extra_dp_pg is None:
+                            flat_grads_list = list(flat_grads.split(len(flat_grads) // self._world_size))
                             recieved_grad = torch.zeros_like(flat_grads_list[0])
                             dist.reduce_scatter(recieved_grad, flat_grads_list, group=self.dp_pg)
-                            self._update_partitoned_grad(
-                                non_moe_grad_in_bucket_current_rank,
-                                recieved_grad,
-                                group_id,
-                                1,
-                            )
 
-                        if len(moe_grad_list) > 0:
-                            flat_grads_list = list(
-                                moe_flat_grads.split(len(moe_flat_grads) // self.moe_extra_dp_pg_size)
-                            )
-                            recieved_grad = torch.zeros_like(flat_grads_list[0])
-                            dist.reduce_scatter(
-                                recieved_grad,
-                                flat_grads_list,
-                                group=self.moe_extra_dp_pg,
-                            )
-                            param_slice = self._world_size // self.moe_extra_dp_pg_size
-                            recieved_grad = list(recieved_grad.split(len(recieved_grad) // param_slice))
-                            for split_recieved_grad in recieved_grad:
-                                split_recieved_grad = _unflatten_dense_tensors(
-                                    split_recieved_grad, moe_grad_in_bucket_current_rank
+                            if recieved_grad.dtype != grad_dtype:
+                                recieved_grad = recieved_grad.to(grad_dtype)
+
+                            grad_in_bucket_current_rank = current_bucket.get_grad()[self._local_rank]
+                            self._update_partitoned_grad(grad_in_bucket_current_rank, recieved_grad, group_id, 1)
+                        else:
+                            # categorize moe and non moe param
+                            grad_in_bucket_current_rank = current_bucket.get_grad()[self._local_rank]
+                            moe_grad_in_bucket_current_rank = []
+                            non_moe_grad_in_bucket_current_rank = []
+                            for idx, grad in enumerate(grad_in_bucket_current_rank):
+                                if moe_list[idx] == True:
+                                    moe_grad_in_bucket_current_rank.append(grad)
+                                else:
+                                    non_moe_grad_in_bucket_current_rank.append(grad)
+
+                            if len(non_moe_grad_list) > 0:
+                                flat_grads_list = list(
+                                    non_moe_flat_grads.split(len(non_moe_flat_grads) // self._world_size)
                                 )
-                                for real_grad, grad in zip(split_recieved_grad, moe_grad_in_bucket_current_rank):
-                                    param_id = self._bucket_store.get_param_id_of_grad(grad)
-                                    self._add_grad(real_grad, param_slice, group_id, param_id)
+                                recieved_grad = torch.zeros_like(flat_grads_list[0])
+                                dist.reduce_scatter(recieved_grad, flat_grads_list, group=self.dp_pg)
+                                self._update_partitoned_grad(
+                                    non_moe_grad_in_bucket_current_rank,
+                                    recieved_grad,
+                                    group_id,
+                                    1,
+                                )
 
-                self._bucket_store.reset()
+                            if len(moe_grad_list) > 0:
+                                flat_grads_list = list(
+                                    moe_flat_grads.split(len(moe_flat_grads) // self.moe_extra_dp_pg_size)
+                                )
+                                recieved_grad = torch.zeros_like(flat_grads_list[0])
+                                dist.reduce_scatter(
+                                    recieved_grad,
+                                    flat_grads_list,
+                                    group=self.moe_extra_dp_pg,
+                                )
+                                param_slice = self._world_size // self.moe_extra_dp_pg_size
+                                recieved_grad = list(recieved_grad.split(len(recieved_grad) // param_slice))
+                                for split_recieved_grad in recieved_grad:
+                                    split_recieved_grad = _unflatten_dense_tensors(
+                                        split_recieved_grad, moe_grad_in_bucket_current_rank
+                                    )
+                                    for real_grad, grad in zip(split_recieved_grad, moe_grad_in_bucket_current_rank):
+                                        param_id = current_bucket.get_param_id_of_grad(grad)
+                                        self._add_grad(real_grad, param_slice, group_id, param_id)
+
+                    current_bucket.reset()
 
     def _update_unpartitoned_grad(self, origin_grad_list: List, flat_grad_list: List, group_id: int) -> None:
         for rank, grad_list in enumerate(origin_grad_list):
@@ -592,8 +583,8 @@ class HybridZeroOptimizer(BaseOptimizer):
             for grad in grad_list:
                 if grad == None:
                     print("_update_unpartitoned_grad grad None", flush=True)
-                param_id = self._bucket_store.get_param_id_of_grad(grad)
-                self._add_grad(grad, self._world_size, group_id, param_id, rank)
+                param_id = self._bucket_store[group_id].get_param_id_of_grad(grad)
+                self._add_grad(grad, self.zero_world_size, group_id, param_id, rank)
 
     def _update_partitoned_grad(
         self,
@@ -604,7 +595,7 @@ class HybridZeroOptimizer(BaseOptimizer):
     ) -> None:
         sync_param(flat_grad, origin_grad_list)
         for grad in origin_grad_list:
-            param_id = self._bucket_store.get_param_id_of_grad(grad)
+            param_id = self._bucket_store[group_id].get_param_id_of_grad(grad)
             self._add_grad(grad, partition_num, group_id, param_id)
 
     def _add_grad(
@@ -628,13 +619,13 @@ class HybridZeroOptimizer(BaseOptimizer):
         # or got a grad of param from another group
         # after reduction, the bucket will be empty
         if (
-            self._bucket_store.num_elements_in_bucket() + param_size > self._reduce_bucket_size
-            or group_id != self._bucket_store.current_group_id
+            self._bucket_store[group_id].num_elements_in_bucket() + param_size > self._reduce_bucket_size
+            or group_id != self._bucket_store[group_id].get_param_group_id()
         ):
-            self._run_reduction("_add_to_bucket")
+            self._run_reduction()
 
         padding_size = self._param_store.get_param_padding_size(param)
-        self._bucket_store.add_param_grad(group_id, param, padding_size)
+        self._bucket_store[group_id].add_param_grad(param, padding_size)
 
     ################################
     # torch.optim.Optimizer methods
@@ -652,7 +643,8 @@ class HybridZeroOptimizer(BaseOptimizer):
 
         if not self.require_grad_sync:
             return
-
+        
+        self.accumulate_left_grads_after_backward()
         self._reduce_grad(self._partition_grads)
         
 
@@ -670,6 +662,8 @@ class HybridZeroOptimizer(BaseOptimizer):
 
         if not self.require_grad_sync:
             return
+        
+        self.accumulate_left_grads_after_backward()
         self._reduce_grad(self._partition_grads)
 
         # clear reduced grads
@@ -694,7 +688,8 @@ class HybridZeroOptimizer(BaseOptimizer):
                     if param.grad is not None:
                         param.grad.detach()
                         param.grad.zero_()
-        self._bucket_store.reset_all()
+        for group_id in range(self.num_param_groups):                
+            self._bucket_store[group_id].reset_all()
 
     ####################
     # Update Parameter #
@@ -768,47 +763,18 @@ class HybridZeroOptimizer(BaseOptimizer):
                  
             
             if fp32_avg_grads != []:
-                single_grad_partition_groups.append(flatten(fp32_avg_grads))
+                # single_grad_partition_groups.append(flatten(fp32_avg_grads))
+                single_grad_partition_groups.append(fp32_avg_grads)           
                     
-                    
-
-            # compute norm
-          
-            # for param1, param2 in zip(param_group, real_master_params[group_id]):
-            #     print(f"equal2: {id(param1) == id(param2)}", flush=True)
-            
-            
-            # print(f"check: {len(param_group)}, {len(working_grads)}", flush=True)
-            # for param, grad in zip(param_group, working_grads):
-            #     print(f"equal: {param.grad}, {self._grad_store.get_param_id_for_grad(grad) == id(param)}", flush=True)
-            
-            
+            # compute norm   
             param_group = real_master_params[group_id]
-            working_grads = real_master_grads[group_id]
-            
-            # param_group = self._working_param_groups[group_id]
-            # working_grads = self._grad_store.get_working_grads_by_group_id(group_id)
-            
-            # if len(param_group) > 0:
-            #     for param, grad in zip(param_group, working_grads):
-            #         print(f"equal: {param.grad}, {self._grad_store.get_param_id_for_grad(grad) == id(param)}", flush=True)
-            
-      
-            # colossalAI
-            # norm_group = self._compute_grad_norm(gradients=working_grads)
-            
+            working_grads = real_master_grads[group_id]        
             
             # InternEvo            
             group_name = self.param_groups[group_id]["name"] if "name" in self.param_groups[group_id] else "default"
             group_name = f"{group_id}_{group_name}"
             total_norms[group_name] = self._compute_norm(group_id=group_id, gradients=working_grads, parameters=param_group, zero_mode=self._broadcast_parallel_mode)
-            
-            
-            # colossalAI modified with _compute_norm
-            # norm_group = self._compute_norm(group_id=group_id, gradients=working_grads, parameters=param_group, zero_mode=self._broadcast_parallel_mode)
-            # norm_groups.append(norm_group)
-            
-            
+        
             self._grad_store.reset_grads_by_group_id(group_id)
 
             # update the params in the optimizer
@@ -835,7 +801,6 @@ class HybridZeroOptimizer(BaseOptimizer):
             self.optim.param_groups[-1]["params"] = self.master_moe_params
             del moe_grads
             
-        
         
         found_inf = False
         found_nan = False
@@ -880,20 +845,15 @@ class HybridZeroOptimizer(BaseOptimizer):
             for group_name, norm in total_norms.items():
                 global_norm_groups[group_name] = norm**0.5
                 norm_groups.append(norm**0.5)
-
+                
         
         # collossalAI
         # unscale and clip grads
         global_norm = calculate_global_norm_from_list(norm_list=norm_groups)
         self._unscale_and_clip_grads(grad_partition_groups, global_norm)
         
-        # if gpc.is_rank_for_log():
-        #     torch.save(single_grad_partition_groups, "/mnt/petrelfs/lijiaxing/splite_zero_2/InternEvo/new_single_grad_partition_groups.pt")
-        
-        
-        # InternEvo
+        # # InternEvo
         # self._unscale_and_clip_grads(single_grad_partition_groups, list(global_norm_groups.values()))
-        
         
 
         # update the parameters
@@ -916,11 +876,6 @@ class HybridZeroOptimizer(BaseOptimizer):
         device = get_current_device()
         for group_id in range(self.num_param_groups):
             master_working_param = self.optim.param_groups[group_id]["params"]
-            # master_param = self._master_param_groups_of_current_rank[group_id]
-            # print(type(master_param))
-            # print(f"len_test: {len(list(master_param))}, {len(list(master_working_param))}", flush=True)
-            # for param1, param2 in zip(master_param, master_working_param):
-            #     print(f"equal_test: {id(param1)==id(param2)}", flush=True)
             for idx, splited_param in enumerate(master_working_param):
                 working_param = real_working_params[group_id][idx]
                 if self.moe_extra_dp_pg is not None and False:
@@ -946,114 +901,26 @@ class HybridZeroOptimizer(BaseOptimizer):
                 working_param.data.copy_(flatten(all_splited_param)[: working_param.numel()].reshape_as(working_param))
             self.optim.param_groups[group_id]["params"] = self._master_param_groups_of_current_rank[group_id]
 
-        # for group_name, global_norm in global_norm_groups.items():
-        #     global_norm_groups[group_name] = global_norm / self.loss_scale
-        
+        for group_name, global_norm in global_norm_groups.items():
+            global_norm_groups[group_name] = global_norm / self.loss_scale
         
         return True, global_norm_groups
     
     def _compute_norm(self, group_id, gradients, parameters, zero_mode):
         # compute norm for gradients that have been reduced
-        # params, grads = self._param_store.get_reduced_param_for_compute_norm(group_id=group_id)
         params = parameters
         grads = gradients
-        params_is_padding = False
 
         if len(params) == 0:
             return 0
-            params_is_padding = True
-            # dtype = self.param_groups[group_id]["dtype"]
-            dtype = self._dtype
-            grads = [self.padding_grad.to(dtype)]
-            params = [self.padding_tensor.to(dtype)]
-
-            if self.optim.param_groups[group_id]["name"] == "default":
-                for param in params:
-                    # if self.use_isp:
-                    #     setattr(param, IS_WEIGHT_ZERO_PARALLEL, True)
-                    # else:
-                    setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
-            elif self.optim.param_groups[group_id]["name"] == "fp32":
-                for param in params:
-                    setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
-            elif self.optim.param_groups[group_id]["name"] == "embed_head":
-                # should be isp mode
-                for param in params:
-                    setattr(param, IS_TENSOR_DATA_PARALLEL, True)
-            # elif self._is_moe_group(self.optim.param_groups[group_id]):
-            #     for param in params:
-            #         setattr(param, IS_TENSOR_EXPERT_DATA_PARALLEL, True)
-            else:
-                raise NotImplementedError("unrecognized parameter group.")
 
         norm = 0
         if self._clip_grad_norm > 0:
             # this norm is before scaling, it will be very large
             norm = compute_norm(group_id=group_id, gradients=grads, parameters=params, zero_mode=zero_mode)
 
-        # if params_is_padding:
-        #     for param in params:
-        #         if hasattr(param, IS_REPLICA_ZERO_PARALLEL):
-        #             delattr(param, IS_REPLICA_ZERO_PARALLEL)
-        #         if hasattr(param, IS_TENSOR_DATA_PARALLEL):
-        #             delattr(param, IS_TENSOR_DATA_PARALLEL)
-        #         if hasattr(param, IS_TENSOR_ZERO_PARALLEL):
-        #             delattr(param, IS_TENSOR_ZERO_PARALLEL)
-        #         if hasattr(param, IS_WEIGHT_ZERO_PARALLEL):
-        #             delattr(param, IS_WEIGHT_ZERO_PARALLEL)
-        #         if hasattr(param, IS_TENSOR_EXPERT_DATA_PARALLEL):
-        #             delattr(param, IS_TENSOR_EXPERT_DATA_PARALLEL)
-
         return norm
         
-
-    def _compute_grad_norm(self, gradients: List[Tensor], norm_type: int = 2) -> float:
-        r"""
-        Compute and return the gradient norm for gradient clipping.
-
-        Args:
-            gradients (List[Tensor]): The gradients to compute norm
-            norm_type (int, optional): type of the used p-norm, Can be ``'inf'`` for infinity norm. Defaults to 2.
-
-        Returns:
-            float: The total norm of given gradients
-        """
-
-        if len(gradients) == 0:
-            return 0.0
-
-        norm_type = float(norm_type)
-        if norm_type == inf:
-            total_norm = max(grad.data.abs().max() for grad in gradients)
-            total_norm_cuda = torch.tensor(
-                [float(total_norm)],
-                device=get_current_device(),
-                dtype=torch.float,
-            )
-            dist.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=self.zero_pg)
-            total_norm = total_norm_cuda.item()
-
-        else:
-            total_norm_exponentiated = 0.0
-            for grad in gradients:
-                grad_norm_exponentiated = grad.data.double().norm(norm_type) ** norm_type
-                total_norm_exponentiated += grad_norm_exponentiated
-
-            # Sum across all model parallel GPUs.
-            total_norm_exponentiated_cuda = torch.tensor(
-                [float(total_norm_exponentiated)],
-                device=get_current_device(),
-                dtype=torch.float,
-            )
-            torch.distributed.all_reduce(
-                total_norm_exponentiated_cuda,
-                op=torch.distributed.ReduceOp.SUM,
-                group=self.zero_pg,
-            )
-            total_norm = total_norm_exponentiated_cuda.item() ** (1.0 / norm_type)
-
-        return total_norm
-
     #############################
     # Mixed Precision Utilities #
     #############################
@@ -1085,9 +952,13 @@ class HybridZeroOptimizer(BaseOptimizer):
         #         clip = ((total_norm / div_scale) + 1e-6) / self._clip_grad_norm
         #         if clip > 1:
         #             combined_scale_groups[group_id] = clip * div_scale
+       
+        # if gpc.is_rank_for_log():
+        #     torch.save(grad_groups_flat[0], "grad_groups_flat.pt")
                     
-        # for group_id, grad in enumerate(grad_groups_flat):
-        #     grad.data.mul_(1.0 / combined_scale_groups[group_id])
+        # for group_id, grads in enumerate(grad_groups_flat):
+        #     for grad in grads:
+        #         grad.data.mul_(1.0 / combined_scale_groups[group_id])
             
         
 
@@ -1103,7 +974,7 @@ class HybridZeroOptimizer(BaseOptimizer):
                 if param.requires_grad and param.grad is not None:
                     self._add_to_bucket(param, group_id)
      
-        self._run_reduction("_sync_grad")
+        self._run_reduction()
 
     def _reduce_grad(self, partition_grad):
         # if not overlapping communication (no reduction hook is attached) when zero1
@@ -1111,7 +982,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         if not partition_grad and not self._overlap_communication:
             self._sync_grad()
         else:
-            self._run_reduction("_reduce_grad")
+            self._run_reduction()
 
     # this context comes from pytorch DDP
     @contextmanager
@@ -1291,7 +1162,7 @@ class HybridZeroOptimizer(BaseOptimizer):
             }
         return self._param_store.master_to_working_param
     
-    def _attach_reduction_hook_2(self):
+    def _attach_reduction_hook(self):
         # we iterate over the fp16 params
         # on each param, we register a hook to its AccumulateGrad object
         for group_id in range(self.num_param_groups):
@@ -1304,17 +1175,16 @@ class HybridZeroOptimizer(BaseOptimizer):
                 reduce_rank = None
 
                 def _define_and_attach(param, reduce_rank=None):
-                    # reduction_func = partial(
-                    #     self._store_and_try_reduce_grads_by_bucket,
-                    #     param=param,
-                    #     reduce_rank=reduce_rank,
-                    # )
-
-                    # reduce_scatter_checker = partial(
-                    #     self._wait_reduce_scatter_and_accumulate_grads,
-                    #     param=param,
-                    #     reduce_rank=reduce_rank,
-                    # )
+                    
+                    def grad_handler(group_id, param):
+                        # if run with no_sync context, would not sync grad when backward
+                        if self.require_grad_sync:
+                            self._add_to_bucket(param, group_id)
+                        
+                    reduce_scatter_checker = partial(
+                        self._wait_reduce_scatter_and_accumulate_grads,
+                        param=param,
+                    )
 
                     def reduction_layernorm_func():
                         handle = reduce_tensor(
@@ -1325,28 +1195,16 @@ class HybridZeroOptimizer(BaseOptimizer):
                         )
                         handle.wait()
 
-                    # define hook
-                    # NOT IMPORTANT BUT GOOD TO KNOW:
-                    # args here is not grad, but allow_unreacable and accumulate_grad
-                    
-                    # def reduce_grad_hook(*args):  # pylint: disable=W0613
-                    #     if self.skip_grad_reduce is False:
-                    #         reduction_func()
-
                     # define hook for real gradient accumulation.
                     
-                    # def accum_grad_hook(*args):  # pylint: disable=W0613
-                    #     reduce_scatter_checker()
+                    def accum_grad_hook(*args):  # pylint: disable=W0613
+                        reduce_scatter_checker()
 
                     # define hook for sequence_parallel
                     def extra_layernorm_reduce_grad_hook(*args):  # pylint: disable=W0613
                         if self.skip_grad_reduce is False:
                             reduction_layernorm_func()
 
-                    # get the AccumulateGrad object of the param itself
-                    # If these objects are not kept, reduction hooks may not be attached successfully.
-                    accum_grad_obj = get_grad_accumulate_object(param)
-                    # self._grad_store.add_accumulate_grad_object(accum_grad_obj)
 
                     # the grad of layernorm should be all-reduce across the global process group
                     # here is the first stage all-reduce in tp/wp process group
@@ -1356,19 +1214,19 @@ class HybridZeroOptimizer(BaseOptimizer):
                         and hasattr(param, IS_REPLICA_ZERO_PARALLEL)
                         and getattr(param, IS_REPLICA_ZERO_PARALLEL) is True
                     ):
-                        accum_grad_obj.register_hook(extra_layernorm_reduce_grad_hook)
+                        param.register_post_accumulate_grad_hook(extra_layernorm_reduce_grad_hook)
 
                     # we should not only register for parameters which have isp_reduce_scatter_name attr.
                     # we must keep up with reduce_grad_hook.
-                    # if (
-                    #     self._isp_communicator
-                    #     and self._isp_communicator.overlap
-                    #     and gpc.config.parallel.weight.size > 1
-                    # ):
-                    #     accum_grad_obj.register_hook(accum_grad_hook)
-
-                    # if self._overlap_sync_grad:
-                    #     accum_grad_obj.register_hook(reduce_grad_hook)
+                    if (
+                        self._isp_communicator
+                        and self._isp_communicator.overlap
+                        and gpc.config.parallel.weight.size > 1
+                    ):
+                        param.register_post_accumulate_grad_hook(accum_grad_hook)
+                        
+                    if self._overlap_sync_grad:
+                        param.register_post_accumulate_grad_hook(partial(grad_handler, group_id))          
 
                 _define_and_attach(param, reduce_rank)
 
