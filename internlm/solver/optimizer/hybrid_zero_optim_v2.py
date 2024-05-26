@@ -128,8 +128,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
 
         self._zero_local_rank = []
         self._zero_world_size = []
-        self._broadcast_parallel_mode = []
-        self._group_id_map_zero_mode = dict()
+        self._zero_parallel_mode = []
         
         # extra dp
         # This group is used to sync moe param, dp_world_size = moe_duplicates * extra_dp_size.
@@ -216,8 +215,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
             zero_mode = param_group["optimizer_mode"]
             self._zero_local_rank.append(gpc.get_local_rank(zero_mode))
             self._zero_world_size.append(gpc.get_world_size(zero_mode))
-            self._broadcast_parallel_mode.append(zero_mode)
-            self._group_id_map_zero_mode[group_id] = zero_mode
+            self._zero_parallel_mode.append(zero_mode)
 
             # add the working params to working_param_groups for bookkeeping
             self._working_param_groups[group_id] = group_params
@@ -343,7 +341,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
     
     def check_local_overflow(self) -> bool:
         for group_id in range(self.num_param_groups):
-            for avg_grad in self._grad_store.get_working_grads_by_group_id(group_id, self._group_id_map_zero_mode[group_id]):
+            for avg_grad in self._grad_store.get_working_grads_by_group_id(group_id, self._zero_parallel_mode[group_id]):
                 if avg_grad is not None and has_inf_or_nan(avg_grad):
                     return True
         return False
@@ -900,7 +898,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
                     dist.all_gather(
                         all_splited_param,
                         splited_param.to(device).to(self._dtype),
-                        group=gpc.get_group(self._broadcast_parallel_mode[group_id]),
+                        group=gpc.get_group(self._zero_parallel_mode[group_id]),
                     )
                 working_param.data.copy_(flatten(all_splited_param)[: working_param.numel()].reshape_as(working_param))
             self.optim.param_groups[group_id]["params"] = self._master_param_groups_of_current_rank[group_id]
@@ -921,7 +919,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
         norm = 0
         if self._clip_grad_norm > 0:
             # this norm is before scaling, it will be very large
-            norm = compute_norm(gradients=grads, parameters=params, zero_mode=self._broadcast_parallel_mode[group_id])
+            norm = compute_norm(gradients=grads, parameters=params, zero_mode=self._zero_parallel_mode[group_id])
 
         return norm
         
@@ -1046,7 +1044,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
                         # gather_tensor = [
                         #     torch.zeros(v.shape, device=device, dtype=v.dtype) for _ in range(self._zero_world_size[group_id])
                         # ]
-                    #     dist.all_gather(gather_tensor, v.to(device), group=gpc.get_group(self._broadcast_parallel_mode[group_id]))
+                    #     dist.all_gather(gather_tensor, v.to(device), group=gpc.get_group(self._zero_parallel_mode[group_id]))
                     # param_state = (
                     #     torch.stack(gather_tensor).view(-1)[: working_param.numel()].reshape_as(working_param).cpu()
                     # )
@@ -1119,7 +1117,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
                         state_tensor = [
                             torch.zeros(v.shape, device=device, dtype=v.dtype) for _ in range(self._zero_world_size[group_id])
                         ]
-                        dist.all_gather(state_tensor, v.to(device), group=gpc.get_group(self._broadcast_parallel_mode[group_id]))
+                        dist.all_gather(state_tensor, v.to(device), group=gpc.get_group(self._zero_parallel_mode[group_id]))
                     state_tensor = (
                         torch.stack(state_tensor).view(-1)[: working_param.numel()].reshape_as(working_param).cpu()
                     )
