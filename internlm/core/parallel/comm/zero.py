@@ -86,7 +86,7 @@ class ParamAsyncBcastHandler:
             self._block_all_splited_params[block_name] = []
 
         # register_forward_pre_hook for transformer/embeding/norm/xxx block
-        if not gpc.config.hybrid_zero_optimizer.new_version:
+        if "new_version" not in gpc.config.hybrid_zero_optimizer or not gpc.config.hybrid_zero_optimizer.new_version:
             self._register_sync_parameters_hook(isp_communicator)
         else:
             self._register_sync_parameters_hook_v2(isp_communicator)

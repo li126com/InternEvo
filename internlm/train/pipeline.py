@@ -345,7 +345,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
     zero_cfg = gpc.config.hybrid_zero_optimizer
     grad_scal_cfg = gpc.config.grad_scaler
 
-    if zero_cfg.new_version:
+    if "new_version" in zero_cfg and zero_cfg.new_version:
         map_param_block(model)
 
     params = create_param_groups(model, adam_cfg.weight_decay)
@@ -377,7 +377,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
         param_bcast_sync_handler = None
 
     if not gpc.config.parallel.zero1.fsdp:
-        if not gpc.config.hybrid_zero_optimizer.new_version:
+        if "new_version" not in gpc.config.hybrid_zero_optimizer or not gpc.config.hybrid_zero_optimizer.new_version:
             optimizer = HybridZeroOptimizer(
                 naive_optimizer,
                 grad_scal_cfg=grad_scal_cfg,
