@@ -118,7 +118,7 @@ class ParamAsyncBcastHandler:
 
     def _register_sync_parameters_hook_v2(self, isp_communicator: ISPCommunicator = None) -> None:
         def _pre_forward_hook(model: nn.Module, *args, **kwargs):  # pylint: disable=W0613
-            # wait all required broadcast handles to be completed
+            # for each block, wait corresponding all_gather handle to be completed
             block_name = self._block_to_name[model]
             if self._block_allgather_handles[block_name] is None:
                 return
