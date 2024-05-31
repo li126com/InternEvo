@@ -63,11 +63,15 @@ from internlm.model.ops.norm import RMSNorm
 from internlm.model.registry import register_model_initializer
 from internlm.monitor import set_env_var
 from internlm.monitor.monitor import monitor_manager as mm
-from internlm.solver.optimizer import FSDPadaptOptimizer, HybridZeroOptimizer, HybridZeroOptimizer_v2
+from internlm.solver.optimizer import (
+    FSDPadaptOptimizer,
+    HybridZeroOptimizer,
+    HybridZeroOptimizer_v2,
+)
 from internlm.solver.optimizer.compatible_adamw import new_compatible_adamw
 from internlm.solver.schedulers.beta2_scheduler import Beta2Scheduler
 from internlm.solver.schedulers.lr_scheduler import FineTuneCosineAnnealingWarmupLR
-from internlm.train.utils import create_param_groups
+from internlm.train.utils import create_param_groups, map_param_block
 from internlm.utils.common import DummyProfile, SchedulerHook, get_current_device
 from internlm.utils.logger import get_logger
 from internlm.utils.megatron_timers import megatron_timer as timer
@@ -340,6 +344,9 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
     adam_cfg = gpc.config.adam
     zero_cfg = gpc.config.hybrid_zero_optimizer
     grad_scal_cfg = gpc.config.grad_scaler
+
+    if zero_cfg.new_version:
+        map_param_block(model)
 
     params = create_param_groups(model, adam_cfg.weight_decay)
 

@@ -323,9 +323,11 @@ class TensorBucket:
                 old.copy_(new)
 
 
-
-
 class BucketStore_v2(BaseStore):
+    """
+    Bucket Store V2
+    """
+
     def __init__(self, group_id, dp_parallel_mode, zero_mode=ParallelMode.ZERO1):
         super().__init__(dp_parallel_mode)
         self.zero_world_size = gpc.get_world_size(zero_mode)
@@ -333,10 +335,10 @@ class BucketStore_v2(BaseStore):
         self._dp_parallel_mode = dp_parallel_mode
         self._group_id = group_id
         self.reset_all()
-    
+
     def get_param_group_id(self):
         return self._group_id
-    
+
     def get_dp_parallel_mode(self):
         return self._dp_parallel_mode
 
@@ -347,13 +349,13 @@ class BucketStore_v2(BaseStore):
         self.grad_to_param_mapping = dict()
 
         self._grad_in_bucket = dict()
-        
+
         self._grad_current_rank_for_group = dict()
         self._param_list_for_group = dict()
         self._padding_size_for_group = dict()
         self.grad_to_param_mapping2 = dict()
         self.offset_list_for_group = dict()
-        
+
         self._param_list = []
         self._padding_size = []
         for rank in range(self.zero_world_size):
@@ -384,8 +386,8 @@ class BucketStore_v2(BaseStore):
             param (Tensor): The parameter
             padding_size (int): The padding size of the parameter
         """
-        
-        self._param_list.append(param)        
+
+        self._param_list.append(param)
         self._padding_size.append(padding_size)
         self._num_elements_in_bucket += param.numel() + padding_size
 
@@ -401,10 +403,8 @@ class BucketStore_v2(BaseStore):
         rank1: [grad0_rank1, grad1_rank1, ...]
         }
         """
-        
+
         for param, padding_size in zip(self._param_list, self._padding_size):
-            if param.grad == None:
-                print(f"grad None: {param}", flush=True)
             grad = param.grad.clone().detach().flatten()
             if padding_size > 0:
                 with torch.no_grad():
@@ -417,7 +417,7 @@ class BucketStore_v2(BaseStore):
             param.grad = None
 
         self.offset_list.append(0)
-        
+
     def get_grad(self):
         """Return the dictionary of gradients slices, of which the keys are ranks
 
@@ -426,7 +426,7 @@ class BucketStore_v2(BaseStore):
         """
 
         return self._grad_in_bucket
-    
+
     def get_param(self):
         return self._param_list
 
@@ -457,7 +457,7 @@ class BucketStore_v2(BaseStore):
         return self.grad_to_param_mapping[id(grad)]
 
     def reset(self):
-        """Reset the bucket storage after reduction, only release the tensors have been reduced""" 
+        """Reset the bucket storage after reduction, only release the tensors have been reduced"""
         cur_offset = self.offset_list.pop(0)
         self._param_list = self._param_list[cur_offset:]
         self._padding_size = self._padding_size[cur_offset:]
@@ -467,8 +467,11 @@ class BucketStore_v2(BaseStore):
             self._grad_in_bucket[rank] = self._grad_in_bucket[rank][cur_offset:]
 
 
-
 class GradientStore_v2(BaseStore):
+    """
+    Gradient Store V2
+    """
+
     def __init__(self, *args, partition_grad: bool = False, zero_mode=ParallelMode.ZERO1):
         super().__init__(*args)
         """
@@ -488,7 +491,7 @@ class GradientStore_v2(BaseStore):
 
         self.grad_to_param_mapping = dict()
 
-    def get_partitioned_gradients_by_param_id(self, group_id: int, param_id: int, temp=None) -> List:
+    def get_partitioned_gradients_by_param_id(self, group_id: int, param_id: int) -> List:
         """Return list of gradient slices of a specific parameter
 
         Args:
@@ -548,8 +551,9 @@ class GradientStore_v2(BaseStore):
         """
         working_index = gpc.get_local_rank(zero_mode)
         grad_list = []
-        # When using LoRa and the user sets multiple param_groups, it is possible that some param_groups have no parameters with gradients.
-        if group_id not in self._grads_of_params.keys():
+        # When using LoRa and the user sets multiple param_groups
+        # it is possible that some param_groups have no parameters with gradients.
+        if group_id not in self._grads_of_params.keys():  # pylint: disable=C0201
             return grad_list
         for param_grads in self._grads_of_params[group_id].values():
             grad_list.append(param_grads[working_index])
@@ -590,8 +594,13 @@ class GradientStore_v2(BaseStore):
         """
 
         return self.grad_to_param_mapping[id(grad)]
-    
+
+
 class ParameterStore_v2(BaseStore):
+    """
+    Parameter Store V2
+    """
+
     def __init__(self, dp_parallel_mode):
         super().__init__(dp_parallel_mode)
 
@@ -601,7 +610,7 @@ class ParameterStore_v2(BaseStore):
         # mapping working param and master param
         self.master_to_working_param = dict()
         self.working_to_master_param = dict()
-        
+
         self._bucket_reduced_param = {}
         self._bucket_reduced_grad = {}
 
@@ -637,7 +646,7 @@ class ParameterStore_v2(BaseStore):
 
         self.master_to_working_param[id(master_param)] = working_param
         self.working_to_master_param[id(working_param)] = master_param
-        
+
     def add_reduced_param_for_compute_norm(self, param):
         group_id = getattr(param, "group_id")
         if group_id not in self._bucket_reduced_param:
@@ -646,7 +655,7 @@ class ParameterStore_v2(BaseStore):
 
         self._bucket_reduced_param[group_id].append(param)
         self._bucket_reduced_grad[group_id].append(param.grad)
-        
+
     def get_reduced_param_for_compute_norm(self, group_id=0):
         if group_id not in self._bucket_reduced_param:
             return [], []
@@ -654,9 +663,7 @@ class ParameterStore_v2(BaseStore):
             self._bucket_reduced_param[group_id],
             self._bucket_reduced_grad[group_id],
         )
-    
+
     def reset_reduced_data_for_compute_norm(self):
         self._bucket_reduced_param = {}
         self._bucket_reduced_grad = {}
-
-

@@ -45,6 +45,7 @@ from internlm.utils.parallel import is_using_isp, is_using_sequence_parallel
 from internlm.utils.timeout import llm_timeout
 
 from .base_optimizer import BaseOptimizer
+from .hybrid_zero_optim_v2 import HybridZeroOptimizer_v2
 from .utils import compute_norm
 
 inf = math.inf
@@ -953,3 +954,23 @@ def reload_zero_fp32_buff(optimizer):
                 )
                 # param_group["params"] is fp32 flatten optimizer states of this zero rank.
                 param_group["params"][0].data.copy_(fp16_flat_current_rank.float())
+    elif isinstance(optimizer, HybridZeroOptimizer_v2):
+        for group_id, param_group in enumerate(optimizer.optim.param_groups):
+            if len(param_group["params"]) > 0:
+                for master_param in param_group["params"]:
+                    working_param = optimizer._param_store.master_to_working_param[id(master_param)]
+                    padding_size = optimizer._param_store.get_param_padding_size(working_param)
+
+                    with torch.no_grad():
+                        if padding_size > 0:
+                            padding_param = torch.nn.functional.pad(working_param.data.view(-1), [0, padding_size])
+                        else:
+                            padding_param = working_param.data.view(-1)
+
+                        splited_params = padding_param.split(
+                            padding_param.numel() // optimizer._zero_world_size[group_id]
+                        )
+                        splited_params = splited_params[optimizer._zero_local_rank[group_id]]
+                        splited_param_current_rank = splited_params.detach().float()
+
+                    master_param.data.copy_(splited_param_current_rank)
