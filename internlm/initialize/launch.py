@@ -439,6 +439,9 @@ def args_sanity_check():
         optim_ckpt._add_item("overlap_sync_param", False)
     if "new_version" not in optim_ckpt:
         optim_ckpt._add_item("new_version", False)
+    elif optim_ckpt.new_version and "all_gather_size" not in optim_ckpt:
+        optim_ckpt._add_item("all_gather_size", 512 * 1024 * 1024)
+
     if gpc.is_rank_for_log():
         logger.info(
             f"overlap_sync_grad:{optim_ckpt.overlap_sync_grad}, overlap_sync_param:{optim_ckpt.overlap_sync_param}"

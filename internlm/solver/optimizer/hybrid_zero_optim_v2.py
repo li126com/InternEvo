@@ -76,6 +76,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
 
         # Zero related args
         self._reduce_bucket_size = zero_cfg.reduce_bucket_size
+        self._all_gather_size = zero_cfg.all_gather_size
         self._clip_grad_norm = zero_cfg.clip_grad_norm
         self._overlap_sync_grad = zero_cfg.overlap_sync_grad
         self._overlap_sync_param = zero_cfg.overlap_sync_param
@@ -91,6 +92,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
         super().__init__(optim=optimizer)
 
         self._dtype = self.optim.param_groups[0]["params"][0].dtype
+        self._element_size = self.optim.param_groups[0]["params"][0].element_size()
 
         # stage 2
         self._partition_grads = partition_grad
@@ -249,7 +251,6 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
         pass
 
     def _sanity_checks(self):
-        # assert get_accelerator().name in ["cuda", "npu"], "device is required"
         for param_group in self.optim.param_groups:
             group_params = param_group["params"]
             for param in group_params:
@@ -329,35 +330,36 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
             dp_parallel_mode = current_bucket.get_dp_parallel_mode()
             reduce_group = gpc.get_group(dp_parallel_mode)
             world_size = gpc.get_world_size(dp_parallel_mode)
+            local_rank = gpc.get_local_rank(dp_parallel_mode)
             if current_bucket.num_elements_in_bucket() > 0:
-                current_bucket.build_grad_in_bucket()
-
-                flat_grads = current_bucket.get_flatten_grad()
-                flat_grads /= world_size
-
-                # ready to add other tensors to bucket
-                current_bucket.reset_num_elements_in_bucket()
-
                 stream = self._comm_stream
-                # in case of the memory being reused in the default stream
-                flat_grads.record_stream(stream)
-
                 # waiting for ops in the default stream finishing
                 stream.wait_stream(torch.cuda.current_stream())
-
                 with torch.cuda.stream(stream):
+                    current_bucket.build_grad_in_bucket(stream)
+
+                    flat_grads = current_bucket.get_flatten_grad()
+                    flat_grads /= world_size
+
+                    # ready to add other tensors to bucket
+                    current_bucket.reset_num_elements_in_bucket()
                     group_id = current_bucket.get_param_group_id()
 
                     grad_dtype = flat_grads.dtype
 
                     if not self._partition_grads:
-                        dist.all_reduce(flat_grads, group=reduce_group)
-                        if flat_grads.dtype != grad_dtype:
-                            flat_grads = flat_grads.to(grad_dtype)
+                        reduce_grads = torch.zeros(
+                            flat_grads.numel() // self._zero_world_size[group_id],
+                            dtype=grad_dtype,
+                            device=get_current_device(),
+                        )
+                        dist.reduce_scatter_tensor(reduce_grads, flat_grads, group=reduce_group)
 
-                        flat_grads_per_rank = flat_grads.split(flat_grads.numel() // self._zero_world_size[group_id])
-                        grad_in_bucket = current_bucket.get_grad()
-                        self._update_unpartitoned_grad(grad_in_bucket.values(), flat_grads_per_rank, group_id)
+                        if reduce_grads.dtype != grad_dtype:
+                            reduce_grads = reduce_grads.to(grad_dtype)
+
+                        grad_in_bucket_current_rank = current_bucket.get_grad()[local_rank]
+                        self._update_unpartitoned_grad(grad_in_bucket_current_rank, reduce_grads, group_id)
                     else:
                         flat_grads_list = list(flat_grads.split(len(flat_grads) // world_size))
                         recieved_grad = torch.zeros_like(flat_grads_list[0])
@@ -372,11 +374,10 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
                     current_bucket.reset()
 
     def _update_unpartitoned_grad(self, origin_grad_list: List, flat_grad_list: List, group_id: int) -> None:
-        for rank, grad_list in enumerate(origin_grad_list):
-            sync_param(flat_grad_list[rank], grad_list)
-            for grad in grad_list:
-                param_id = self._bucket_store[group_id].get_param_id_of_grad(grad)
-                self._add_grad(grad, self._zero_world_size[group_id], group_id, param_id, rank)
+        sync_param(flat_grad_list, origin_grad_list)
+        for grad in origin_grad_list:
+            param_id = self._bucket_store[group_id].get_param_id_of_grad(grad)
+            self._add_grad(grad, self._zero_world_size[group_id], group_id, param_id)
 
     def _update_partitoned_grad(
         self,
@@ -485,30 +486,23 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
             real_working_params[group_id] = []
             real_master_params[group_id] = []
             real_master_grads[group_id] = []
-            grad_index = 0 if self._partition_grads else self._zero_local_rank[group_id]
 
             for splited_param in master_params:
                 working_param = self._param_store.master_to_working_param[id(splited_param)]
-                # if a working param requires grad and has no grad
-                # it is not 'really' working, e.g. the droped layer
-                # else the splited grad should be attached to the splited param
-                grads = self._grad_store.get_partitioned_gradients_by_param_id(group_id, id(working_param))
-                if len(grads) > 0:
-                    real_working_params[group_id].append(working_param)
-                    grad = grads[grad_index]
-                    # no need to copy fp32 grad if master_weights is False
-                    if self._master_weights:
-                        grad = grad.to(splited_param.dtype).to(splited_param.device)
-                    splited_param.grad = grad
-                    grad_partition_groups.append(grad)
-                    real_master_params[group_id].append(splited_param)
-                    real_master_grads[group_id].append(splited_param.grad)
+                grad = self._grad_store.get_partitioned_gradients_by_param_id(group_id, id(working_param))
+                real_working_params[group_id].append(working_param)
+                # no need to copy fp32 grad if master_weights is False
+                if self._master_weights:
+                    grad = grad.to(splited_param.dtype).to(splited_param.device)
+                splited_param.grad = grad
+                grad_partition_groups.append(grad)
+                real_master_params[group_id].append(splited_param)
+                real_master_grads[group_id].append(splited_param.grad)
 
             # compute norm
             param_group = real_master_params[group_id]
             working_grads = real_master_grads[group_id]
 
-            # InternEvo
             group_name = self.param_groups[group_id]["name"] if "name" in self.param_groups[group_id] else "default"
             group_name = f"{group_id}_{group_name}"
             total_norms[group_name] = self._compute_norm(
@@ -520,6 +514,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
             # update the params in the optimizer
             self.optim.param_groups[group_id]["params"] = real_master_params[group_id]
 
+        # check norm
         found_inf = False
         found_nan = False
 
@@ -575,57 +570,85 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
         # update working partition updated by the current rank
         device = get_current_device()
         handles = []
-        all_splited_params_block_list = []
-        working_params_block_list = []
+        gathered_params_list = []
+        working_params_list = []
+        master_params_list = []
         for group_id in range(self.num_param_groups):
-            master_working_param = self.optim.param_groups[group_id]["params"]
+            if self._zero_world_size[group_id] > 1:
+                master_working_param = self.optim.param_groups[group_id]["params"]
 
-            if len(master_working_param) == 0:
-                continue
+                if len(master_working_param) == 0:
+                    continue
 
-            # do all_gather at block granularity
-            # so that param_overlap is available
-            block_master_params = []
-            block_working_params = []
-            for idx in range(len(master_working_param)):
-                working_param = real_working_params[group_id][idx]
-                block_name = master_working_param[idx].block_name
-                # for the same block, all params are arranged in consecutive order
-                # collect all_gather handle when enter next block
-                if idx > 0 and block_name != master_working_param[idx - 1].block_name:
-                    self.all_gather_block(
+                # do all_gather at fused block granularity
+                # In this way, param_overlap is available
+                all_gather_master_params = []
+                all_gather_working_params = []
+                sum_numel_size = 0
+                for idx in range(len(master_working_param)):
+                    working_param = real_working_params[group_id][idx]
+                    block_name = master_working_param[idx].block_name
+                    # for the same block, all params are arranged in consecutive order
+                    # when enter next block, check numel_size to determine whether to execute all_gather
+                    if idx > 0 and block_name != master_working_param[idx - 1].block_name:
+                        if sum_numel_size >= self._all_gather_size:
+                            self.all_gather_params(
+                                group_id,
+                                all_gather_master_params,
+                                all_gather_working_params,
+                                gathered_params_list,
+                                working_params_list,
+                                master_params_list,
+                                handles,
+                                device,
+                            )
+                            all_gather_master_params = []
+                            all_gather_working_params = []
+                            sum_numel_size = 0
+
+                    sum_numel_size += master_working_param[idx].numel() * self._element_size
+                    all_gather_master_params.append(master_working_param[idx])
+                    all_gather_working_params.append(working_param)
+
+                # clear the last fused block
+                if len(all_gather_master_params) > 0:
+                    self.all_gather_params(
                         group_id,
-                        block_master_params,
-                        block_working_params,
-                        all_splited_params_block_list,
-                        working_params_block_list,
+                        all_gather_master_params,
+                        all_gather_working_params,
+                        gathered_params_list,
+                        working_params_list,
+                        master_params_list,
                         handles,
                         device,
                     )
-                    block_master_params = []
-                    block_working_params = []
-                block_master_params.append(master_working_param[idx])
-                block_working_params.append(working_param)
-
-            if len(block_master_params) > 0:
-                self.all_gather_block(
-                    group_id,
-                    block_master_params,
-                    block_working_params,
-                    all_splited_params_block_list,
-                    working_params_block_list,
-                    handles,
-                    device,
-                )
-                block_master_params = []
-                block_working_params = []
+                    all_gather_master_params = []
+                    all_gather_working_params = []
+            else:
+                # if zero_world_size==1, directly update working param with master param
+                for working_param, master_param in zip(real_working_params[group_id], real_master_params[group_id]):
+                    working_param.data.copy_(master_param.reshape_as(working_param))
 
         if not self._overlap_sync_param:
-            for block_idx in range(len(handles)):
-                handles[block_idx].wait()
-                for idx in range(len(working_params_block_list[block_idx])):
-                    working_param = working_params_block_list[block_idx][idx]
-                    all_splited_param = all_splited_params_block_list[block_idx][idx]
+            for gather_idx in range(len(handles)):
+                handles[gather_idx].wait()
+                # reorganize gatherd params to update working param
+                # [[A1, B1], [A2, B2]] -> [[A1.reshape, A2.reshape], [B1.reshape, B2.reshape]]
+                master_params_all_gather = master_params_list[gather_idx]
+                gathered_params = gathered_params_list[gather_idx]
+                all_splited_param_list = []
+                offset = 0
+                for p in master_params_all_gather:
+                    param_size = p.numel()
+                    all_splited_param = []
+                    for all_params in gathered_params:
+                        split_params = all_params[offset : offset + param_size].reshape(p.shape)
+                        all_splited_param.append(split_params)
+                    offset += param_size
+                    all_splited_param_list.append(all_splited_param)
+
+                # Update working parameters
+                for working_param, all_splited_param in zip(working_params_list[gather_idx], all_splited_param_list):
                     working_param.data.copy_(
                         flatten(all_splited_param)[: working_param.numel()].reshape_as(working_param)
                     )
@@ -638,32 +661,37 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
 
         return True, global_norm_groups
 
-    def all_gather_block(
+    def all_gather_params(
         self,
         group_id,
-        block_master_params,
-        block_working_params,
-        all_splited_params_block_list,
-        working_params_block_list,
+        all_gather_master_params,
+        all_gather_working_params,
+        gathered_params_list,
+        working_params_list,
+        master_params_list,
         handles,
         device,
     ):
-        # fuse params of the same block to do all_gather
-        # after all_gather, restore fused params to splited params
-        block_handle, block_all_splited_params = self.gather_fused_params(
-            block_master_params,
+        # fuse params to do all_gather
+        handle, gathered_params = self.gather_fused_params(
+            all_gather_master_params,
             self._zero_world_size[group_id],
             gpc.get_group(self._zero_parallel_mode[group_id]),
             device,
         )
         if self._overlap_sync_param:
             self._param_bcast_sync_handler.add_allgather_handle(
-                block_handle, block_working_params, block_all_splited_params, block_working_params[0].block_name
+                handle,
+                all_gather_master_params,
+                all_gather_working_params,
+                gathered_params,
+                all_gather_working_params[0].block_name,
             )
         else:
-            all_splited_params_block_list.append(block_all_splited_params)
-            working_params_block_list.append(block_working_params)
-            handles.append(block_handle)
+            gathered_params_list.append(gathered_params)
+            working_params_list.append(all_gather_working_params)
+            master_params_list.append(all_gather_master_params)
+            handles.append(handle)
 
     def gather_fused_params(self, params, world_size, group, device):
         # Flatten and concatenate all parameters into a single tensor
@@ -675,19 +703,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
         # Perform the all_gather operation
         handle = dist.all_gather(gathered_params, flattened_params, group=group, async_op=True)
 
-        # restore flat param
-        all_splited_param_list = []
-        offset = 0
-        for p in params:
-            param_size = p.numel()
-            all_splited_param = []
-            for all_params in gathered_params:
-                split_params = all_params[offset : offset + param_size].reshape(p.shape)
-                all_splited_param.append(split_params)
-            offset += param_size
-            all_splited_param_list.append(all_splited_param)
-
-        return handle, all_splited_param_list
+        return handle, gathered_params
 
     def _compute_norm(self, group_id, gradients, parameters):
 

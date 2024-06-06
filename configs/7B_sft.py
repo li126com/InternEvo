@@ -102,6 +102,7 @@ hybrid_zero_optimizer = dict(
     clip_grad_norm=1.0,
     # whether use new optm
     new_version=False,
+    all_gather_size=512 * 1024 * 1024,
 )
 
 loss = dict(

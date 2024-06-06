@@ -39,8 +39,10 @@ class ParamAsyncBcastHandler:
         self._bcast_handles = {rank: [] for rank in range(zero1_size)}
         # initialize an empty list for _allgather_handles
         self._block_allgather_handles = {}
+        self._block_master_params = {}
         self._block_working_params = {}
-        self._block_all_splited_params = {}
+        self._block_gathered_params = {}
+        self._block_allgather_order = {}
 
         # record the parameters to transformer/embeding/head/norm block
         for _chunk in unwrap_naive_amp(model):
@@ -82,8 +84,10 @@ class ParamAsyncBcastHandler:
 
         for block_name in self._block_to_name.values():
             self._block_allgather_handles[block_name] = None
+            self._block_master_params[block_name] = []
             self._block_working_params[block_name] = []
-            self._block_all_splited_params[block_name] = []
+            self._block_gathered_params[block_name] = []
+            self._block_allgather_order[block_name] = -1
 
         # register_forward_pre_hook for transformer/embeding/norm/xxx block
         if "new_version" not in gpc.config.hybrid_zero_optimizer or not gpc.config.hybrid_zero_optimizer.new_version:
@@ -118,21 +122,41 @@ class ParamAsyncBcastHandler:
 
     def _register_sync_parameters_hook_v2(self, isp_communicator: ISPCommunicator = None) -> None:
         def _pre_forward_hook(model: nn.Module, *args, **kwargs):  # pylint: disable=W0613
-            # for each block, wait corresponding all_gather handle to be completed
+            # For each block, wait corresponding all_gather handle to be completed
+            # For each all_gather handle, several consecutive blocks may be involved
+            # In this case only the first block of the handle needs to deal with it
             block_name = self._block_to_name[model]
-            if self._block_allgather_handles[block_name] is None:
-                return
+            if self._block_allgather_order[block_name] == 1:
+                if self._block_allgather_handles[block_name] is None:
+                    return
+                self._block_allgather_handles[block_name].wait()
 
-            self._block_allgather_handles[block_name].wait()
+                # reorganize gatherd params to update working param
+                # [[A1, B1], [A2, B2]] -> [[A1.reshape, A2.reshape], [B1.reshape, B2.reshape]]
+                block_master_params = self._block_master_params[block_name]
+                gathered_params = self._block_gathered_params[block_name]
+                all_splited_param_list = []
+                offset = 0
+                for p in block_master_params:
+                    param_size = p.numel()
+                    all_splited_param = []
+                    for all_params in gathered_params:
+                        split_params = all_params[offset : offset + param_size].reshape(p.shape)
+                        all_splited_param.append(split_params)
+                    offset += param_size
+                    all_splited_param_list.append(all_splited_param)
+                assert len(all_splited_param_list) == len(self._block_working_params[block_name])
+                # Update working parameters
+                for working_param, all_splited_param in zip(
+                    self._block_working_params[block_name], all_splited_param_list
+                ):
+                    working_param.data.copy_(
+                        flatten(all_splited_param)[: working_param.numel()].reshape_as(working_param)
+                    )
 
-            for idx in range(len(self._block_all_splited_params[block_name])):
-                all_splited_param = self._block_all_splited_params[block_name][idx]
-                working_param = self._block_working_params[block_name][idx]
-                working_param.data.copy_(flatten(all_splited_param)[: working_param.numel()].reshape_as(working_param))
-
-            self._block_allgather_handles[block_name] = None
-            self._block_all_splited_params[block_name] = []
-            self._block_working_params[block_name] = []
+                self._block_allgather_handles[block_name] = None
+                self._block_gathered_params[block_name] = []
+                self._block_working_params[block_name] = []
 
         # register_forward_pre_hook for transformer/embeding/norm/xxx block
         for block, _ in self._block_to_rank.items():
@@ -153,8 +177,10 @@ class ParamAsyncBcastHandler:
     def add_bcast_handle(self, rank, handle) -> None:
         self._bcast_handles[rank].append(handle)
 
-    def add_allgather_handle(self, handle, working_param, all_splited_param, block_name) -> None:
+    def add_allgather_handle(self, handle, master_param, working_param, gatherd_param, block_name) -> None:
         assert self._block_allgather_handles[block_name] is None
         self._block_allgather_handles[block_name] = handle
+        self._block_master_params[block_name] = master_param
         self._block_working_params[block_name] = working_param
-        self._block_all_splited_params[block_name] = all_splited_param
+        self._block_gathered_params[block_name] = gatherd_param
+        self._block_allgather_order[block_name] = 1

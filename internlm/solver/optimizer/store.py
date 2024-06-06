@@ -394,7 +394,7 @@ class BucketStore_v2(BaseStore):
         # number of tensors in current bucket
         self.offset_list[-1] += 1
 
-    def build_grad_in_bucket(self):
+    def build_grad_in_bucket(self, comm_stream):
         """Organize parameters' gradient(padding and split), follows the parameters' splitting method
 
         Data structure of self._grad_in_bucket:
@@ -405,6 +405,7 @@ class BucketStore_v2(BaseStore):
         """
 
         for param, padding_size in zip(self._param_list, self._padding_size):
+            param.grad.record_stream(comm_stream)
             grad = param.grad.clone().detach().flatten()
             if padding_size > 0:
                 with torch.no_grad():
@@ -521,8 +522,9 @@ class GradientStore_v2(BaseStore):
         if group_id not in self._grads_of_params:
             self._grads_of_params[group_id] = dict()
         if param_id not in self._grads_of_params[group_id]:
-            self._grads_of_params[group_id][param_id] = [grad]
+            self._grads_of_params[group_id][param_id] = grad
         else:
+            assert False, "Should not arrive here"
             self._grads_of_params[group_id][param_id].append(grad)
 
         self.grad_to_param_mapping[id(grad)] = param_id
@@ -540,60 +542,8 @@ class GradientStore_v2(BaseStore):
 
         self._grads_of_params[group_id][param_id][grad_idx].add_(grad)
 
-    def get_working_grads_by_group_id(self, group_id: int, zero_mode) -> List:
-        """Return list of working gradient slices in the group
-
-        Args:
-            group_id (int): The index of a parameter group
-
-        Returns:
-            List: the list working gradient slices in the group
-        """
-        working_index = gpc.get_local_rank(zero_mode)
-        grad_list = []
-        # When using LoRa and the user sets multiple param_groups
-        # it is possible that some param_groups have no parameters with gradients.
-        if group_id not in self._grads_of_params.keys():  # pylint: disable=C0201
-            return grad_list
-        for param_grads in self._grads_of_params[group_id].values():
-            grad_list.append(param_grads[working_index])
-
-        return grad_list
-
-    def get_working_grad_by_param_id(self, param_id) -> Tensor:
-        """
-        Return the working gradient for the specified parameter.
-
-        Args:
-            param_id (int): The index of the parameter.
-
-        Returns:
-            Tensor: The the working gradient slices for the specified param_id.
-        """
-
-        for group in self._grads_of_params.values():
-            if param_id in group.keys():
-                return group[param_id][self._working_index]
-
-        raise KeyError(f"Working gradient for param_id {param_id} not found.")
-
     def reset_grads_by_group_id(self, group_id: int):
         self._grads_of_params[group_id] = dict()
-
-    def reset_all_gradients(self):
-        self._grads_of_params = dict()
-
-    def get_param_id_for_grad(self, grad: Tensor) -> int:
-        """Return the id of a parameter which the gradient slice belongs to
-
-        Args:
-            grad (Tensor): the gradient slice
-
-        Returns:
-            int: the id of a parameter which the gradient slice belongs to
-        """
-
-        return self.grad_to_param_mapping[id(grad)]
 
 
 class ParameterStore_v2(BaseStore):
