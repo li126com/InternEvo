@@ -101,7 +101,9 @@ hybrid_zero_optimizer = dict(
     # grad clipping
     clip_grad_norm=1.0,
     # whether use new optm
-    new_version=False,
+    use_split_tensor_optim=False,
+    # when use split tensor optm
+    # Perform all gather with a set of parameters of all_gather_size
     all_gather_size=512 * 1024 * 1024,
 )
 

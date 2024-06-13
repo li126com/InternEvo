@@ -345,7 +345,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
     zero_cfg = gpc.config.hybrid_zero_optimizer
     grad_scal_cfg = gpc.config.grad_scaler
 
-    if "new_version" in zero_cfg and zero_cfg.new_version:
+    if "use_split_tensor_optim" in zero_cfg and zero_cfg.use_split_tensor_optim:
         map_param_block(model)
 
     params = create_param_groups(model, adam_cfg.weight_decay)
@@ -377,7 +377,10 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
         param_bcast_sync_handler = None
 
     if not gpc.config.parallel.zero1.fsdp:
-        if "new_version" not in gpc.config.hybrid_zero_optimizer or not gpc.config.hybrid_zero_optimizer.new_version:
+        if (
+            "use_split_tensor_optim" not in gpc.config.hybrid_zero_optimizer
+            or not gpc.config.hybrid_zero_optimizer.use_split_tensor_optim
+        ):
             optimizer = HybridZeroOptimizer(
                 naive_optimizer,
                 grad_scal_cfg=grad_scal_cfg,
@@ -643,6 +646,8 @@ def record_current_batch_training_metrics(
 
         fwd_bwd_time = round(timer("fwd-bwd").elapsed(), 2)
         infos["fwd_bwd_time"] = fwd_bwd_time
+        bwd_time = round(timer("bwd").elapsed(), 2)
+        infos["bwd_time"] = bwd_time
 
         for key, value in acc_perplex.items():
             infos[key] = value

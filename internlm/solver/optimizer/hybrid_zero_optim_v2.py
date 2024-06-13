@@ -107,6 +107,8 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
         self._zero_parallel_mode = []
 
         # working and master params for mixed precision training
+        # master params: params that are splited into the current rank, fp32 params
+        # working params: the original complete params, fp16 params
         self._working_param_groups = dict()
         self._master_param_groups_of_current_rank = dict()
 
@@ -143,6 +145,8 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
             + f"zo-{gpc.get_local_rank(ParallelMode.ZERO1)}.pt"
         )
 
+        self.zero_1_5 = False
+
         # iterate over the param group in the optimizer
         # partition these param groups for data parallel training
         # and add buffers to parameter store for future access
@@ -178,6 +182,9 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
                 grad_reduce_mode = ParallelMode.DATA
             self._bucket_store.append(BucketStore_v2(group_id, grad_reduce_mode, zero_mode=zero_mode))
             self._accum_grad_buckets.append(BucketStore_v2(group_id, grad_reduce_mode, zero_mode=zero_mode))
+
+            if gpc.get_world_size(grad_reduce_mode) != gpc.get_world_size(zero_mode):
+                self.zero_1_5 = True
 
         # initialize communication stream for
         # communication-computation overlapping
@@ -348,18 +355,29 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
                     grad_dtype = flat_grads.dtype
 
                     if not self._partition_grads:
-                        reduce_grads = torch.zeros(
-                            flat_grads.numel() // self._zero_world_size[group_id],
-                            dtype=grad_dtype,
-                            device=get_current_device(),
-                        )
-                        dist.reduce_scatter_tensor(reduce_grads, flat_grads, group=reduce_group)
+                        if not self.zero_1_5:
+                            reduce_grads = torch.zeros(
+                                flat_grads.numel() // self._zero_world_size[group_id],
+                                dtype=grad_dtype,
+                                device=get_current_device(),
+                            )
+                            dist.reduce_scatter_tensor(reduce_grads, flat_grads, group=reduce_group)
 
-                        if reduce_grads.dtype != grad_dtype:
-                            reduce_grads = reduce_grads.to(grad_dtype)
+                            if reduce_grads.dtype != grad_dtype:
+                                reduce_grads = reduce_grads.to(grad_dtype)
 
-                        grad_in_bucket_current_rank = current_bucket.get_grad()[local_rank]
-                        self._update_unpartitoned_grad(grad_in_bucket_current_rank, reduce_grads, group_id)
+                            grad_in_bucket_current_rank = current_bucket.get_grad()[local_rank]
+                            self._update_unpartitoned_grad(grad_in_bucket_current_rank, reduce_grads, group_id)
+                        else:
+                            # zero 1.5
+                            dist.all_reduce(flat_grads, group=reduce_group)
+                            if flat_grads.dtype != grad_dtype:
+                                flat_grads = flat_grads.to(grad_dtype)
+                            flat_grads_per_rank = flat_grads.split(
+                                flat_grads.numel() // self._zero_world_size[group_id]
+                            )
+                            grad_in_bucket = current_bucket.get_grad()
+                            self._update_unpartitoned_grad(grad_in_bucket.values(), flat_grads_per_rank, group_id)
                     else:
                         flat_grads_list = list(flat_grads.split(len(flat_grads) // world_size))
                         recieved_grad = torch.zeros_like(flat_grads_list[0])
@@ -374,10 +392,17 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
                     current_bucket.reset()
 
     def _update_unpartitoned_grad(self, origin_grad_list: List, flat_grad_list: List, group_id: int) -> None:
-        sync_param(flat_grad_list, origin_grad_list)
-        for grad in origin_grad_list:
-            param_id = self._bucket_store[group_id].get_param_id_of_grad(grad)
-            self._add_grad(grad, self._zero_world_size[group_id], group_id, param_id)
+        if not self.zero_1_5:
+            sync_param(flat_grad_list, origin_grad_list)
+            for grad in origin_grad_list:
+                param_id = self._bucket_store[group_id].get_param_id_of_grad(grad)
+                self._add_grad(grad, self._zero_world_size[group_id], group_id, param_id)
+        else:
+            for rank, grad_list in enumerate(origin_grad_list):
+                sync_param(flat_grad_list[rank], grad_list)
+                for grad in grad_list:
+                    param_id = self._bucket_store[group_id].get_param_id_of_grad(grad)
+                    self._add_grad(grad, self._zero_world_size[group_id], group_id, param_id, rank)
 
     def _update_partitoned_grad(
         self,
@@ -486,18 +511,24 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
             real_working_params[group_id] = []
             real_master_params[group_id] = []
             real_master_grads[group_id] = []
+            grad_index = 0 if not self.zero_1_5 else self._zero_local_rank[group_id]
 
             for splited_param in master_params:
                 working_param = self._param_store.master_to_working_param[id(splited_param)]
-                grad = self._grad_store.get_partitioned_gradients_by_param_id(group_id, id(working_param))
-                real_working_params[group_id].append(working_param)
-                # no need to copy fp32 grad if master_weights is False
-                if self._master_weights:
-                    grad = grad.to(splited_param.dtype).to(splited_param.device)
-                splited_param.grad = grad
-                grad_partition_groups.append(grad)
-                real_master_params[group_id].append(splited_param)
-                real_master_grads[group_id].append(splited_param.grad)
+                # if a working param requires grad and has no grad
+                # it is not 'really' working, e.g. the droped layer
+                # else the splited grad should be attached to the splited param
+                grads = self._grad_store.get_partitioned_gradients_by_param_id(group_id, id(working_param))
+                if len(grads) > 0:
+                    real_working_params[group_id].append(working_param)
+                    grad = grads[grad_index]
+                    # no need to copy fp32 grad if master_weights is False
+                    if self._master_weights:
+                        grad = grad.to(splited_param.dtype).to(splited_param.device)
+                    splited_param.grad = grad
+                    grad_partition_groups.append(grad)
+                    real_master_params[group_id].append(splited_param)
+                    real_master_grads[group_id].append(splited_param.grad)
 
             # compute norm
             param_group = real_master_params[group_id]
@@ -627,7 +658,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
             else:
                 # if zero_world_size==1, directly update working param with master param
                 for working_param, master_param in zip(real_working_params[group_id], real_master_params[group_id]):
-                    working_param.data.copy_(master_param.reshape_as(working_param))
+                    working_param.data.copy_(master_param.view_as(working_param))
 
         if not self._overlap_sync_param:
             for gather_idx in range(len(handles)):
@@ -649,9 +680,7 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
 
                 # Update working parameters
                 for working_param, all_splited_param in zip(working_params_list[gather_idx], all_splited_param_list):
-                    working_param.data.copy_(
-                        flatten(all_splited_param)[: working_param.numel()].reshape_as(working_param)
-                    )
+                    working_param.data.copy_(flatten(all_splited_param)[: working_param.numel()].view_as(working_param))
 
         for group_id in range(self.num_param_groups):
             self.optim.param_groups[group_id]["params"] = self._master_param_groups_of_current_rank[group_id]
@@ -696,10 +725,11 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
     def gather_fused_params(self, params, world_size, group, device):
         # Flatten and concatenate all parameters into a single tensor
         flattened_params = torch.cat([p.view(-1) for p in params]).to(device).to(self._dtype)
-        num_elements = flattened_params.numel()
 
         # Prepare the buffer for all_gather
-        gathered_params = [torch.zeros(num_elements, device=device, dtype=self._dtype) for _ in range(world_size)]
+        gathered_params = [
+            torch.empty_like(flattened_params, device=device, dtype=self._dtype) for _ in range(world_size)
+        ]
         # Perform the all_gather operation
         handle = dist.all_gather(gathered_params, flattened_params, group=group, async_op=True)
 
@@ -805,6 +835,29 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
                 ), f"The loaded parameter shape is inconsistent, {self_params.shape} != {params.shape}"
                 for self_param, param in zip(self_params, params):
                     self_param.data.copy_(param.data)
+
+    def reload_zero_fp32_buff(self):
+        for group_id, param_group in enumerate(self.optim.param_groups):
+            if len(param_group["params"]) > 0:
+                for master_param in param_group["params"]:
+                    working_param = self._param_store.master_to_working_param[id(master_param)]
+                    padding_size = self._param_store.get_param_padding_size(working_param)
+
+                    with torch.no_grad():
+                        if padding_size > 0:
+                            padding_param = torch.nn.functional.pad(working_param.data.view(-1), [0, padding_size])
+                        else:
+                            padding_param = working_param.data.view(-1)
+
+                        splited_params = padding_param.split(padding_param.numel() // self._zero_world_size[group_id])
+                        splited_params = splited_params[self._zero_local_rank[group_id]]
+                        splited_param_current_rank = splited_params.detach().float()
+
+                    master_param.data.copy_(splited_param_current_rank)
+
+    ################
+    # Overlap Hook #
+    ################
 
     def _attach_reduction_hook(self):
         # we iterate over the fp16 params

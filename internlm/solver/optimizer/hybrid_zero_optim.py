@@ -941,36 +941,14 @@ class HybridZeroOptimizer(BaseOptimizer):
         if "zero_devide_optim_plan" in states:
             self.params_per_rank_id_dict = states["zero_devide_optim_plan"]
 
-
-def reload_zero_fp32_buff(optimizer):
-    # If we use AMP optimizer, we need to update its fp32 buffer as newly loaded weights value.
-    # Or we must ensure that loading model weights must be done before zero is initialized.
-    if isinstance(optimizer, HybridZeroOptimizer):
-        for group_id, param_group in enumerate(optimizer.optim.param_groups):
-            if optimizer.param_group_has_params[group_id]:
+    def reload_zero_fp32_buff(self):
+        # If we use AMP optimizer, we need to update its fp32 buffer as newly loaded weights value.
+        # Or we must ensure that loading model weights must be done before zero is initialized.
+        for group_id, param_group in enumerate(self.optim.param_groups):
+            if self.param_group_has_params[group_id]:
                 # flatten fp16 params have already been updated by 'load_model_checkpoint'
-                fp16_flat_current_rank = optimizer._param_store.get_flat_fp16_param_by_rank_group(
-                    optimizer._zero_local_rank[group_id], group_id
+                fp16_flat_current_rank = self._param_store.get_flat_fp16_param_by_rank_group(
+                    self._zero_local_rank[group_id], group_id
                 )
                 # param_group["params"] is fp32 flatten optimizer states of this zero rank.
                 param_group["params"][0].data.copy_(fp16_flat_current_rank.float())
-    elif isinstance(optimizer, HybridZeroOptimizer_v2):
-        for group_id, param_group in enumerate(optimizer.optim.param_groups):
-            if len(param_group["params"]) > 0:
-                for master_param in param_group["params"]:
-                    working_param = optimizer._param_store.master_to_working_param[id(master_param)]
-                    padding_size = optimizer._param_store.get_param_padding_size(working_param)
-
-                    with torch.no_grad():
-                        if padding_size > 0:
-                            padding_param = torch.nn.functional.pad(working_param.data.view(-1), [0, padding_size])
-                        else:
-                            padding_param = working_param.data.view(-1)
-
-                        splited_params = padding_param.split(
-                            padding_param.numel() // optimizer._zero_world_size[group_id]
-                        )
-                        splited_params = splited_params[optimizer._zero_local_rank[group_id]]
-                        splited_param_current_rank = splited_params.detach().float()
-
-                    master_param.data.copy_(splited_param_current_rank)

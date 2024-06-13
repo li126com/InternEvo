@@ -437,9 +437,9 @@ def args_sanity_check():
         optim_ckpt._add_item("overlap_sync_grad", False)
     if "overlap_sync_param" not in optim_ckpt:
         optim_ckpt._add_item("overlap_sync_param", False)
-    if "new_version" not in optim_ckpt:
-        optim_ckpt._add_item("new_version", False)
-    elif optim_ckpt.new_version and "all_gather_size" not in optim_ckpt:
+    if "use_split_tensor_optim" not in optim_ckpt:
+        optim_ckpt._add_item("use_split_tensor_optim", False)
+    elif optim_ckpt.use_split_tensor_optim and "all_gather_size" not in optim_ckpt:
         optim_ckpt._add_item("all_gather_size", 512 * 1024 * 1024)
 
     if gpc.is_rank_for_log():

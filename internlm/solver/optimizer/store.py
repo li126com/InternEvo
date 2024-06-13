@@ -522,9 +522,8 @@ class GradientStore_v2(BaseStore):
         if group_id not in self._grads_of_params:
             self._grads_of_params[group_id] = dict()
         if param_id not in self._grads_of_params[group_id]:
-            self._grads_of_params[group_id][param_id] = grad
+            self._grads_of_params[group_id][param_id] = [grad]
         else:
-            assert False, "Should not arrive here"
             self._grads_of_params[group_id][param_id].append(grad)
 
         self.grad_to_param_mapping[id(grad)] = param_id
