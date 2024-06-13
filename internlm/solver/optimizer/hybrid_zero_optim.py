@@ -45,7 +45,6 @@ from internlm.utils.parallel import is_using_isp, is_using_sequence_parallel
 from internlm.utils.timeout import llm_timeout
 
 from .base_optimizer import BaseOptimizer
-from .hybrid_zero_optim_v2 import HybridZeroOptimizer_v2
 from .utils import compute_norm
 
 inf = math.inf
