@@ -115,7 +115,7 @@ class PackedDatasetWithoutCuSeqlen(Dataset):
         self.seed = DEFAULT_SEED
         self.path = self.get_dataset_name()
 
-        if not self.dataset.use_shm:
+        if not gpc.config.data.use_shm:
             self._process_init()
         else:
             if self.dataset.found_cache:
@@ -282,7 +282,7 @@ class PackedDatasetWithCut(PackedDataset):
     ):
         super().__init__(dataset, max_length_per_sample, packed_length)
         self.path = self.get_dataset_name()
-        if not self.dataset.use_shm:
+        if not gpc.config.data.use_shm:
             self.sample_indices, self.len_samples_shuffled, self.acm_len_samples = self.accu_sample_len(seed=self.seed)
             self.num_tokens = sum(self.lengths)
         else:
@@ -549,7 +549,6 @@ def get_packed_dataset_without_short_length(
                     fp,
                     ds_type_id,
                     min_length=min_length_num,
-                    use_shm=gpc.config.data.use_shm,
                     pack_sample_into_one=pack_sample_into_one,
                 )
 

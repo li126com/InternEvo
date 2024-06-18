@@ -55,9 +55,8 @@ class JsonlDataset(torch.utils.data.Dataset):
     Note that only the "tokens" key is used.
     """
 
-    def __init__(self, path: str, dataset_type_id: int = 0, min_length=50, use_shm=False, pack_sample_into_one=False):
-        self.use_shm = use_shm
-        if not self.use_shm:
+    def __init__(self, path: str, dataset_type_id: int = 0, min_length=50, pack_sample_into_one=False):
+        if not gpc.config.data.use_shm:
             self._process_init(path, dataset_type_id, min_length)
         else:
             devices_per_node = internlm_accelerator.device_count()

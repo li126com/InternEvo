@@ -2,7 +2,6 @@
 # -*- encoding: utf-8 -*-
 
 import argparse
-import gc
 import os
 from pathlib import Path
 from typing import Dict, Union
@@ -627,9 +626,6 @@ def initialize_distributed_env(
         seed (int, optional): Specified random seed for every process. 1024 by default.
     """
     backend = internlm_accelerator._communication_backend_name
-
-    # close automatic garbage collection
-    gc.disable()
 
     if launcher == "torch":
         launch_from_torch(config=config, seed=seed, backend=backend)
