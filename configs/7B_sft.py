@@ -71,6 +71,7 @@ data = dict(
     valid_folder=VALID_FOLDER,
     empty_cache_and_diag_interval=200,
     diag_outlier_ratio=1.1,
+    use_shm=False,
 )
 
 grad_scaler = dict(

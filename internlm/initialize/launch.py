@@ -161,6 +161,14 @@ def args_sanity_check():
 
     data.diag_outlier_ratio = max(1, data.diag_outlier_ratio)
 
+    if "use_shm" not in data:
+        data._add_item("use_shm", False)
+    elif data.use_shm and "shm_path" not in data:
+        data._add_item("shm_path", "/dev/shm/metacache")
+
+    if data.train_folder is None:
+        data.use_shm = False
+
     if "use_packed_dataset" not in data:
         data._add_item("use_packed_dataset", True)
 
