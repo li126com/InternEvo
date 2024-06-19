@@ -76,6 +76,8 @@ class JsonlDataset(torch.utils.data.Dataset):
                             found_cache = True
                             shm_path = fp_str
 
+                # for local_rank 0, no need to wait
+                # go forward to do computing and saving
                 if self.local_rank == 0:
                     break
 

@@ -71,7 +71,10 @@ data = dict(
     valid_folder=VALID_FOLDER,
     empty_cache_and_diag_interval=200,
     diag_outlier_ratio=1.1,
+    # whether use shared memory to load meta files
     use_shm=False,
+    # when use shm, the default shm_path is "/dev/shm/metacache"
+    # shm_path="/dev/shm/metacache"
 )
 
 grad_scaler = dict(
