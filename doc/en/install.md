@@ -87,7 +87,6 @@ cd ../../
 pip install git+https://github.com/databricks/megablocks@v0.3.2 # MOE need
 ```
 
-
 ### Environment Image
 Users can use the provided dockerfile combined with docker.Makefile to build their own images, or obtain images with InternEvo runtime environment installed from https://hub.docker.com/r/internlm/internlm.
 
