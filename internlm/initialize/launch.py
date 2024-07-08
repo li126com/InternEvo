@@ -295,10 +295,13 @@ def args_sanity_check():
             ]
 
     if "checkpoint" in model:
+        if "checkpoint_tp_no_comm" not in model:
+            gpc.config.model._add_item("checkpoint_tp_no_comm", True)
         if model.checkpoint is True:
             model.checkpoint = 1
         elif model.checkpoint is False:
             model.checkpoint = 0
+            model.checkpoint_tp_no_comm = False
         else:
             assert (
                 model.checkpoint >= 0 and model.checkpoint <= 1

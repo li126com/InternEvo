@@ -7,6 +7,8 @@ import torch
 from torch.utils.checkpoint import check_backward_validity, detach_variable
 
 from internlm.accelerator import get_accelerator
+from internlm.core.context import ParallelMode
+from internlm.core.context import global_context as gpc
 from internlm.core.context.random import (
     get_current_mode,
     get_states,
@@ -14,6 +16,8 @@ from internlm.core.context.random import (
     set_seed_states,
     sync_states,
 )
+from internlm.core.parallel.comm.tensor import _GATHER_DIM, all_gather_raw
+from internlm.utils.parallel import is_using_isp, is_using_sequence_parallel
 
 from ..utils.common import get_current_device
 
@@ -122,13 +126,33 @@ class CheckpointFunction(torch.autograd.Function):
         # Fill in inputs with appropriate saved tensors.
         for i, idx in enumerate(tensor_indices):
             inputs[idx] = tensors[i]
+
+        # recompute_forward
+        recompute_forward = False
+        if gpc.config.model.checkpoint_tp_no_comm:
+            recompute_forward = True
+            inputs.append(True)
+
         detached_inputs = detach_variable(tuple(inputs))
+
+        handle = None
+        if recompute_forward and is_using_sequence_parallel() and not is_using_isp():
+            grad_output = args[0]
+            grad_output, handle = all_gather_raw(
+                grad_output, process_group=gpc.get_group(ParallelMode.TENSOR), async_op=True, gather_dim=_GATHER_DIM
+            )
+
         if ctx.had_autocast_in_fwd:
             with torch.enable_grad(), internlm_accelerator.amp.autocast():
                 outputs = ctx.run_function(*detached_inputs)
         else:
             with torch.enable_grad():
                 outputs = ctx.run_function(*detached_inputs)
+
+        if handle:
+            handle.wait()
+            args = list(args)
+            args[0] = grad_output
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
