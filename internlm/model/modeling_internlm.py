@@ -181,7 +181,7 @@ class InternLM1Decoder(nn.Module):
             cu_seqlens: 1d LongTensor, len(cu_seqlens) = hidden_states + 1
             indexes: the length of index is same as hidden states, which stand for the current position
         """
-        recompute_forward = args[4] if len(args) > 4 else False
+        no_communication = args[4] if len(args) > 4 else False
         args = args[:4]
 
         def _dropout_and_norm_attn(_hidden_states):
@@ -215,10 +215,10 @@ class InternLM1Decoder(nn.Module):
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 
-        hidden_states = self.mlp(hidden_states, recompute_forward=recompute_forward)
+        hidden_states = self.mlp(hidden_states, no_communication=no_communication)
 
         # pad residual
-        if recompute_forward and is_using_sequence_parallel() and not is_using_isp():
+        if no_communication and is_using_sequence_parallel() and not is_using_isp():
             requires_grad = residual.requires_grad
             pad_before = gpc.get_local_rank(ParallelMode.TENSOR) * residual.shape[_GATHER_DIM]
             pad_after = (

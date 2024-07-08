@@ -45,12 +45,12 @@ class SPFusedDenseFunc(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         communicator: TPCommunicator,
         return_residual=False,
-        recompute_forward=False,
+        no_communication=False,
     ):
         ctx.compute_weight_gradient = weight.requires_grad
         ctx.return_residual = return_residual
         ctx.communicator = communicator
-        ctx.recompute_forward = recompute_forward
+        ctx.no_communication = no_communication
 
         if torch.is_autocast_enabled():
             x = x.to(dtype=torch.get_autocast_gpu_dtype())
@@ -79,7 +79,7 @@ class SPFusedDenseFunc(torch.autograd.Function):
 
         # parallel strategy-specific communication callback 2.
         # see more details in the communicator for different parallel strategies.
-        output, _ = communicator.output_hook(output, async_op=False, recompute_forward=recompute_forward)
+        output, _ = communicator.output_hook(output, async_op=False, no_communication=no_communication)
 
         saved_x = None if ctx.compute_weight_gradient is False else total_x if communicator.save_total_input() else x
         ctx.save_for_backward(saved_x, weight)
@@ -94,7 +94,7 @@ class SPFusedDenseFunc(torch.autograd.Function):
         # parallel strategy-specific communication callback 3.
         # see more details in the communicator for different parallel strategies.
         grad_output, _ = communicator.grad_output_hook(
-            grad_output, recompute_forward=ctx.recompute_forward, async_op=False
+            grad_output, no_communication=ctx.no_communication, async_op=False
         )
         grad_output = grad_output.contiguous()
 
@@ -268,7 +268,7 @@ def fused_dense_func(
     module: Optional[nn.Module] = None,
     bias: Optional[torch.Tensor] = None,
     return_residual: bool = False,
-    recompute_forward=False,
+    no_communication=False,
 ):
     if communicator.communication_mode() == "wp":
         return WPFusedDenseFunc.apply(
@@ -286,7 +286,7 @@ def fused_dense_func(
             bias,
             communicator,
             return_residual,
-            recompute_forward,
+            no_communication,
         )
 
 
@@ -349,7 +349,7 @@ class ParallelLinearWithCommExt(nn.Linear):
         else:
             super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
 
-    def forward(self, input: torch.Tensor, recompute_forward=False) -> torch.Tensor:  # pylint: disable=W0622
+    def forward(self, input: torch.Tensor, no_communication=False) -> torch.Tensor:  # pylint: disable=W0622
         _class_name = self.__class__.__name__
         assert self._communicator is not None, f"{_class_name} should register with a communicator first."
         return fused_dense_func(
@@ -358,7 +358,7 @@ class ParallelLinearWithCommExt(nn.Linear):
             communicator=self._communicator,
             module=self,
             bias=self.bias,
-            recompute_forward=recompute_forward,
+            no_communication=no_communication,
         )
 
 
@@ -471,7 +471,7 @@ class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
         self.first_eval_flag = True
         self.tmp_weight = None
 
-    def forward(self, input, recompute_forward=False):  # pylint: disable=W0622
+    def forward(self, input, no_communication=False):  # pylint: disable=W0622
         _class_name = self.__class__.__name__
         assert self._communicator is not None, f"{_class_name} should register with a communicator first."
 
@@ -502,7 +502,7 @@ class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
             communicator=self._communicator,
             module=self,
             bias=self.bias,
-            recompute_forward=recompute_forward,
+            no_communication=no_communication,
         )
 
 

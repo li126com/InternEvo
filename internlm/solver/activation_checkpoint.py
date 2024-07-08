@@ -127,16 +127,16 @@ class CheckpointFunction(torch.autograd.Function):
         for i, idx in enumerate(tensor_indices):
             inputs[idx] = tensors[i]
 
-        # recompute_forward
-        recompute_forward = False
-        if gpc.config.model.checkpoint_tp_no_comm:
-            recompute_forward = True
+        # no_communication
+        no_communication = False
+        if getattr(gpc.config.model, "checkpoint_tp_no_comm", False):
+            no_communication = True
             inputs.append(True)
 
         detached_inputs = detach_variable(tuple(inputs))
 
         handle = None
-        if recompute_forward and is_using_sequence_parallel() and not is_using_isp():
+        if no_communication and is_using_sequence_parallel() and not is_using_isp():
             grad_output = args[0]
             grad_output, handle = all_gather_raw(
                 grad_output, process_group=gpc.get_group(ParallelMode.TENSOR), async_op=True, gather_dim=_GATHER_DIM

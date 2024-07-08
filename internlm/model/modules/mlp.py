@@ -91,14 +91,14 @@ class FeedForward(nn.Module):
             self.w2 = new_linear("w2", hidden_features, out_features, bias, device=device, dtype=dtype)
             self.w3 = new_linear("w3", in_features, hidden_features, bias, device=device, dtype=dtype)
 
-    def forward(self, x, recompute_forward=False):
+    def forward(self, x, no_communication=False):
         if not self.mlp_layer_fusion:
             w1_o = self.w1(x)
             w3_o = self.w3(x)
         else:
             fussed_out = self.fused_w1_w3(x)
             w1_o, w3_o = torch.split(fussed_out, fussed_out.shape[-1] // 2, dim=-1)
-        out = self.w2(Silu(w1_o, w3_o), recompute_forward=recompute_forward)
+        out = self.w2(Silu(w1_o, w3_o), no_communication=no_communication)
         return out
 
 
