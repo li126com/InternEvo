@@ -6,6 +6,7 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 
+from internlm.core.context.parallel_context import global_context as gpc
 from internlm.model.modules.linear import new_linear
 from internlm.model.modules.utils import Silu
 from internlm.utils.logger import get_logger
@@ -91,14 +92,14 @@ class FeedForward(nn.Module):
             self.w2 = new_linear("w2", hidden_features, out_features, bias, device=device, dtype=dtype)
             self.w3 = new_linear("w3", in_features, hidden_features, bias, device=device, dtype=dtype)
 
-    def forward(self, x, no_communication=False):
+    def forward(self, x):
         if not self.mlp_layer_fusion:
             w1_o = self.w1(x)
             w3_o = self.w3(x)
         else:
             fussed_out = self.fused_w1_w3(x)
             w1_o, w3_o = torch.split(fussed_out, fussed_out.shape[-1] // 2, dim=-1)
-        out = self.w2(Silu(w1_o, w3_o), no_communication=no_communication)
+        out = self.w2(Silu(w1_o, w3_o), no_communication=gpc.recompute_forward_no_comm)
         return out
 
 

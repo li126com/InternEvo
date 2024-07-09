@@ -2,6 +2,7 @@
 # -*- encoding: utf-8 -*-
 
 import weakref
+from contextlib import contextmanager
 
 import torch
 from torch.utils.checkpoint import check_backward_validity, detach_variable
@@ -39,6 +40,30 @@ def copy_to_device(obj, device):
         return {k: copy_to_device(v, device) for k, v in obj.items()}
     else:
         return obj
+
+
+@contextmanager
+def recompute_forward_context(args, no_communication):
+    handle = None
+    try:
+        # Set True when entering the context
+        if no_communication:
+            gpc.recompute_forward_no_comm = True
+            if is_using_sequence_parallel():
+                # overlap all_gather
+                grad_output = args[0]
+                grad_output, handle = all_gather_raw(
+                    grad_output, process_group=gpc.get_group(ParallelMode.TENSOR), async_op=True, gather_dim=_GATHER_DIM
+                )
+        yield
+    finally:
+        # Set False when exiting the context
+        gpc.recompute_forward_no_comm = False
+
+        if handle:
+            handle.wait()
+            args = list(args)
+            args[0] = grad_output
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -132,29 +157,13 @@ class CheckpointFunction(torch.autograd.Function):
 
         detached_inputs = detach_variable(tuple(inputs))
 
-        handle = None
-        if no_communication:
-            gpc.recompute_forward_no_comm = True
-            if is_using_sequence_parallel():
-                grad_output = args[0]
-                grad_output, handle = all_gather_raw(
-                    grad_output, process_group=gpc.get_group(ParallelMode.TENSOR), async_op=True, gather_dim=_GATHER_DIM
-                )
-
-        if ctx.had_autocast_in_fwd:
-            with torch.enable_grad(), internlm_accelerator.amp.autocast():
-                outputs = ctx.run_function(*detached_inputs)
-        else:
-            with torch.enable_grad():
-                outputs = ctx.run_function(*detached_inputs)
-
-        if gpc.recompute_forward_no_comm:
-            gpc.recompute_forward_no_comm = False
-
-        if handle:
-            handle.wait()
-            args = list(args)
-            args[0] = grad_output
+        with recompute_forward_context(args, no_communication):
+            if ctx.had_autocast_in_fwd:
+                with torch.enable_grad(), internlm_accelerator.amp.autocast():
+                    outputs = ctx.run_function(*detached_inputs)
+            else:
+                with torch.enable_grad():
+                    outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)

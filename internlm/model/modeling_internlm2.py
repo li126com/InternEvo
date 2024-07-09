@@ -258,12 +258,10 @@ class InternLM2Decoder(nn.Module):
                     if self.residual_in_fp32:
                         residual = residual.to(torch.float32)
 
-                no_communication = gpc.recompute_forward_no_comm
-
-                hidden_states = self.feed_forward(hidden_states, no_communication=no_communication)
+                hidden_states = self.feed_forward(hidden_states)
 
                 # pad residual
-                if no_communication and is_using_sequence_parallel():
+                if gpc.recompute_forward_no_comm and is_using_sequence_parallel():
                     residual = padding_residual(residual)
 
             return hidden_states + residual
