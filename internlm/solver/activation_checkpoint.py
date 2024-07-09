@@ -62,7 +62,6 @@ def recompute_forward_context(args, no_communication):
 
         if handle:
             handle.wait()
-            args = list(args)
             args[0] = grad_output
 
 
@@ -157,6 +156,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         detached_inputs = detach_variable(tuple(inputs))
 
+        args = list(args)
         with recompute_forward_context(args, no_communication):
             if ctx.had_autocast_in_fwd:
                 with torch.enable_grad(), internlm_accelerator.amp.autocast():
