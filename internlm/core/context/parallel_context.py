@@ -159,6 +159,7 @@ class ParallelContext(metaclass=SingletonMeta):
         self.virtual_pipeline_parallel_rank = None
         self._expert_parallel_group_names = []
         self.is_evaluating = False
+        self.recompute_forward_no_comm = False
 
     @property
     def config(self):

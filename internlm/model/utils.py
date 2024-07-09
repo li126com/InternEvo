@@ -1,5 +1,10 @@
 from typing import Any, Dict, List
 
+import torch
+
+from internlm.core.context import ParallelMode
+from internlm.core.context.parallel_context import global_context as gpc
+from internlm.core.parallel.comm.tensor import _GATHER_DIM
 from internlm.model.modules.mha import MHA
 
 
@@ -51,3 +56,25 @@ def convert_attn_args_to_kwargs(args, kwargs) -> Dict[str, Any]:
         kwargs["max_seqlen"] = args[3]
 
     return kwargs
+
+
+def padding_residual(residual):
+    requires_grad = residual.requires_grad
+    pad_before = gpc.get_local_rank(ParallelMode.TENSOR) * residual.shape[_GATHER_DIM]
+    pad_after = (
+        gpc.get_world_size(ParallelMode.TENSOR) - gpc.get_local_rank(ParallelMode.TENSOR) - 1
+    ) * residual.shape[_GATHER_DIM]
+
+    pad_before_tensor = torch.zeros(
+        (*residual.shape[:_GATHER_DIM], pad_before, *residual.shape[_GATHER_DIM + 1 :]),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    pad_after_tensor = torch.zeros(
+        (*residual.shape[:_GATHER_DIM], pad_after, *residual.shape[_GATHER_DIM + 1 :]),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    residual = torch.cat([pad_before_tensor, residual, pad_after_tensor], dim=1).requires_grad_(requires_grad)
+
+    return residual

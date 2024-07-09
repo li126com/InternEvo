@@ -7,7 +7,6 @@ from torch import nn
 
 from internlm.core.context import ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
-from internlm.core.parallel.comm.tensor import _GATHER_DIM
 from internlm.initialize.initialize_tensor import (
     normal_,
     scaled_init_method_normal,
@@ -22,10 +21,11 @@ from internlm.model.modules.norm import new_layer_norm
 from internlm.model.utils import (
     convert_attn_args_to_kwargs,
     convert_attn_kwargs_to_args,
+    padding_residual,
 )
 from internlm.solver.activation_checkpoint import activation_checkpoint
 from internlm.utils.logger import get_logger
-from internlm.utils.parallel import is_using_isp, is_using_sequence_parallel
+from internlm.utils.parallel import is_using_sequence_parallel
 
 logger = get_logger(__file__)
 
@@ -218,8 +218,6 @@ class InternLM2Decoder(nn.Module):
             cu_seqlens: 1d LongTensor, len(cu_seqlens) = hidden_states + 1
             indexes: the length of index is same as hidden states, which stand for the current position
         """
-        no_communication = args[4] if len(args) > 4 else False
-        args = args[:4]
         if self.prenorm:
 
             def _dropout_and_norm_attn(_residual, _hidden_states):
@@ -259,30 +257,14 @@ class InternLM2Decoder(nn.Module):
 
                     if self.residual_in_fp32:
                         residual = residual.to(torch.float32)
+
+                no_communication = gpc.recompute_forward_no_comm
+
                 hidden_states = self.feed_forward(hidden_states, no_communication=no_communication)
 
                 # pad residual
-                if no_communication and is_using_sequence_parallel() and not is_using_isp():
-                    requires_grad = residual.requires_grad
-                    pad_before = gpc.get_local_rank(ParallelMode.TENSOR) * residual.shape[_GATHER_DIM]
-                    pad_after = (
-                        gpc.get_world_size(ParallelMode.TENSOR) - gpc.get_local_rank(ParallelMode.TENSOR) - 1
-                    ) * residual.shape[_GATHER_DIM]
-
-                    pad_before_tensor = torch.zeros(
-                        (*residual.shape[:_GATHER_DIM], pad_before, *residual.shape[_GATHER_DIM + 1 :]),
-                        dtype=residual.dtype,
-                        device=residual.device,
-                    )
-                    pad_after_tensor = torch.zeros(
-                        (*residual.shape[:_GATHER_DIM], pad_after, *residual.shape[_GATHER_DIM + 1 :]),
-                        dtype=residual.dtype,
-                        device=residual.device,
-                    )
-
-                    residual = torch.cat([pad_before_tensor, residual, pad_after_tensor], dim=1).requires_grad_(
-                        requires_grad
-                    )
+                if no_communication and is_using_sequence_parallel():
+                    residual = padding_residual(residual)
 
             return hidden_states + residual
         else:

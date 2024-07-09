@@ -17,7 +17,7 @@ from internlm.core.context.random import (
     sync_states,
 )
 from internlm.core.parallel.comm.tensor import _GATHER_DIM, all_gather_raw
-from internlm.utils.parallel import is_using_isp, is_using_sequence_parallel
+from internlm.utils.parallel import is_using_sequence_parallel
 
 from ..utils.common import get_current_device
 
@@ -128,19 +128,18 @@ class CheckpointFunction(torch.autograd.Function):
             inputs[idx] = tensors[i]
 
         # no_communication
-        no_communication = False
-        if getattr(gpc.config.model, "checkpoint_tp_no_comm", False):
-            no_communication = True
-            inputs.append(True)
+        no_communication = getattr(gpc.config.model, "checkpoint_tp_no_comm", False)
 
         detached_inputs = detach_variable(tuple(inputs))
 
         handle = None
-        if no_communication and is_using_sequence_parallel() and not is_using_isp():
-            grad_output = args[0]
-            grad_output, handle = all_gather_raw(
-                grad_output, process_group=gpc.get_group(ParallelMode.TENSOR), async_op=True, gather_dim=_GATHER_DIM
-            )
+        if no_communication:
+            gpc.recompute_forward_no_comm = True
+            if is_using_sequence_parallel():
+                grad_output = args[0]
+                grad_output, handle = all_gather_raw(
+                    grad_output, process_group=gpc.get_group(ParallelMode.TENSOR), async_op=True, gather_dim=_GATHER_DIM
+                )
 
         if ctx.had_autocast_in_fwd:
             with torch.enable_grad(), internlm_accelerator.amp.autocast():
@@ -148,6 +147,9 @@ class CheckpointFunction(torch.autograd.Function):
         else:
             with torch.enable_grad():
                 outputs = ctx.run_function(*detached_inputs)
+
+        if gpc.recompute_forward_no_comm:
+            gpc.recompute_forward_no_comm = False
 
         if handle:
             handle.wait()

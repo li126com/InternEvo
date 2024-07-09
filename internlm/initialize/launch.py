@@ -415,7 +415,9 @@ def args_sanity_check():
         ), "only support interleaved pipeline scheduler with overlap"
 
     # when not use tp or sp, checkpoint_tp_no_comm should always be False
-    if gpc.config.parallel["tensor"]["size"] <= 1 and getattr(gpc.config.model, "checkpoint_tp_no_comm", False):
+    if (gpc.config.parallel["tensor"]["mode"] == "isp" or gpc.config.parallel["tensor"]["size"] <= 1) and getattr(
+        gpc.config.model, "checkpoint_tp_no_comm", False
+    ):
         gpc.config.model.checkpoint_tp_no_comm = False
 
     # monitoring default config
