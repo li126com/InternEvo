@@ -6,7 +6,6 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 
-from internlm.core.context.parallel_context import global_context as gpc
 from internlm.model.modules.linear import new_linear
 from internlm.model.modules.utils import Silu
 from internlm.utils.logger import get_logger
@@ -99,7 +98,7 @@ class FeedForward(nn.Module):
         else:
             fussed_out = self.fused_w1_w3(x)
             w1_o, w3_o = torch.split(fussed_out, fussed_out.shape[-1] // 2, dim=-1)
-        out = self.w2(Silu(w1_o, w3_o), no_communication=gpc.recompute_forward_no_comm)
+        out = self.w2(Silu(w1_o, w3_o))
         return out
 
 

@@ -349,9 +349,12 @@ class ParallelLinearWithCommExt(nn.Linear):
         else:
             super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
 
-    def forward(self, input: torch.Tensor, no_communication=False) -> torch.Tensor:  # pylint: disable=W0622
+        self.last_block_layer = False
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0622
         _class_name = self.__class__.__name__
         assert self._communicator is not None, f"{_class_name} should register with a communicator first."
+        no_communication = bool(gpc.recompute_forward_no_comm and self.last_block_layer)
         return fused_dense_func(
             input,
             self.weight,
@@ -414,6 +417,7 @@ class RowParallelLinear(ParallelLinearWithCommExt):
         multiple_of: int = 1,
         device: torch.device = None,
         dtype: torch.dtype = None,
+        layer_name: str = "default",
     ) -> None:
         if in_features % multiple_of:
             raise ValueError(f"in_features ({in_features}) must be a multiple of {multiple_of}")
@@ -429,6 +433,9 @@ class RowParallelLinear(ParallelLinearWithCommExt):
             dtype=dtype,
             split_mode="row",
         )
+
+        if layer_name == "w2":
+            self.last_block_layer = True
 
 
 class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
@@ -471,7 +478,7 @@ class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
         self.first_eval_flag = True
         self.tmp_weight = None
 
-    def forward(self, input, no_communication=False):  # pylint: disable=W0622
+    def forward(self, input):  # pylint: disable=W0622
         _class_name = self.__class__.__name__
         assert self._communicator is not None, f"{_class_name} should register with a communicator first."
 
@@ -502,7 +509,6 @@ class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
             communicator=self._communicator,
             module=self,
             bias=self.bias,
-            no_communication=no_communication,
         )
 
 
@@ -603,6 +609,7 @@ def new_linear(
             multiple_of,
             device,
             dtype,
+            layer_name=name,
         )
     else:
         err_msg = (

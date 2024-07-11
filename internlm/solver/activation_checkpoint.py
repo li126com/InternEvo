@@ -151,7 +151,7 @@ class CheckpointFunction(torch.autograd.Function):
         for i, idx in enumerate(tensor_indices):
             inputs[idx] = tensors[i]
 
-        # no_communication
+        # when checkpoint_tp_no_comm==True, we use TP recomputation communication optimization
         no_communication = getattr(gpc.config.model, "checkpoint_tp_no_comm", False)
 
         detached_inputs = detach_variable(tuple(inputs))
