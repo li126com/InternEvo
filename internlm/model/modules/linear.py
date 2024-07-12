@@ -45,12 +45,10 @@ class SPFusedDenseFunc(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         communicator: TPCommunicator,
         return_residual=False,
-        no_communication=False,
     ):
         ctx.compute_weight_gradient = weight.requires_grad
         ctx.return_residual = return_residual
         ctx.communicator = communicator
-        ctx.no_communication = no_communication
 
         if torch.is_autocast_enabled():
             x = x.to(dtype=torch.get_autocast_gpu_dtype())
@@ -79,7 +77,7 @@ class SPFusedDenseFunc(torch.autograd.Function):
 
         # parallel strategy-specific communication callback 2.
         # see more details in the communicator for different parallel strategies.
-        output, _ = communicator.output_hook(output, async_op=False, no_communication=no_communication)
+        output, _ = communicator.output_hook(output, async_op=False)
 
         saved_x = None if ctx.compute_weight_gradient is False else total_x if communicator.save_total_input() else x
         ctx.save_for_backward(saved_x, weight)
@@ -93,9 +91,7 @@ class SPFusedDenseFunc(torch.autograd.Function):
 
         # parallel strategy-specific communication callback 3.
         # see more details in the communicator for different parallel strategies.
-        grad_output, _ = communicator.grad_output_hook(
-            grad_output, no_communication=ctx.no_communication, async_op=False
-        )
+        grad_output, _ = communicator.grad_output_hook(grad_output, async_op=False)
         grad_output = grad_output.contiguous()
 
         if ctx.return_residual:
@@ -268,7 +264,6 @@ def fused_dense_func(
     module: Optional[nn.Module] = None,
     bias: Optional[torch.Tensor] = None,
     return_residual: bool = False,
-    no_communication=False,
 ):
     if communicator.communication_mode() == "wp":
         return WPFusedDenseFunc.apply(
@@ -286,7 +281,6 @@ def fused_dense_func(
             bias,
             communicator,
             return_residual,
-            no_communication,
         )
 
 
@@ -349,19 +343,15 @@ class ParallelLinearWithCommExt(nn.Linear):
         else:
             super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
 
-        self.last_block_layer = False
-
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0622
         _class_name = self.__class__.__name__
         assert self._communicator is not None, f"{_class_name} should register with a communicator first."
-        no_communication = bool(gpc.recompute_forward_no_comm and self.last_block_layer)
         return fused_dense_func(
             input,
             self.weight,
             communicator=self._communicator,
             module=self,
             bias=self.bias,
-            no_communication=no_communication,
         )
 
 
@@ -417,7 +407,6 @@ class RowParallelLinear(ParallelLinearWithCommExt):
         multiple_of: int = 1,
         device: torch.device = None,
         dtype: torch.dtype = None,
-        layer_name: str = "default",
     ) -> None:
         if in_features % multiple_of:
             raise ValueError(f"in_features ({in_features}) must be a multiple of {multiple_of}")
@@ -433,9 +422,6 @@ class RowParallelLinear(ParallelLinearWithCommExt):
             dtype=dtype,
             split_mode="row",
         )
-
-        if layer_name == "w2":
-            self.last_block_layer = True
 
 
 class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
@@ -602,15 +588,17 @@ def new_linear(
             dtype,
         )
     elif split_mode == "row":
-        return RowParallelLinear(
+        linear = RowParallelLinear(
             in_features,
             out_features,
             bias,
             multiple_of,
             device,
             dtype,
-            layer_name=name,
         )
+        if name == "w2":
+            setattr(linear, "last_block_layer", True)
+        return linear
     else:
         err_msg = (
             f"Parallel strategies for linear is unsupported, which is named as {name}.\n"
