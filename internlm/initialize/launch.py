@@ -2,7 +2,6 @@
 # -*- encoding: utf-8 -*-
 
 import argparse
-import gc
 import os
 from pathlib import Path
 from typing import Dict, Union
@@ -13,10 +12,6 @@ from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import Config
 from internlm.core.context import global_context as gpc
 from internlm.core.context.process_group_initializer import ParallelMode
-from internlm.model.moe.megablock.utils import (
-    check_megablock_installed,
-    check_stk_installed,
-)
 from internlm.utils.common import get_master_node
 from internlm.utils.gputest import warmup_process_group
 from internlm.utils.logger import get_logger
@@ -89,7 +84,7 @@ def args_sanity_check():
         gpc.config.parallel._add_item("pipeline", dict(size=1, interleaved_overlap=False))
 
     if "tensor" not in gpc.config.parallel:
-        gpc.config.parallel._add_item("tensor", 1)
+        gpc.config.parallel._add_item("tensor", dict(size=1, mode="mtp"))
 
     if "weight" not in gpc.config.parallel:
         gpc.config.parallel._add_item("weight", dict(size=1, overlap=False, memory_pool=False))
@@ -164,6 +159,14 @@ def args_sanity_check():
         data._add_item("diag_outlier_ratio", 1.1)
 
     data.diag_outlier_ratio = max(1, data.diag_outlier_ratio)
+
+    if "use_shm" not in data:
+        data._add_item("use_shm", False)
+    elif data.use_shm and "shm_path" not in data:
+        data._add_item("shm_path", "/dev/shm/metacache")
+
+    if data.train_folder is None:
+        data.use_shm = False
 
     if "use_packed_dataset" not in data:
         data._add_item("use_packed_dataset", True)
@@ -339,15 +342,20 @@ def args_sanity_check():
             model._add_item("moe_use_residual", False)
         if "moe_type" not in model:
             model._add_item("moe_type", "GShard")
-        # check dependency
-        if gpc.config.model.moe_type == "MegaBlock":
-            check_megablock_installed()
-        if gpc.config.model.moe_type == "MegaBlock-D":
-            check_megablock_installed()
-            check_stk_installed()
 
     if "mlp_layer_fusion" not in model:
         model._add_item("mlp_layer_fusion", False)
+
+    # qk_interleaved config
+    if "qk_interleaved" not in gpc.config.model:
+        if "adapt_hf" in gpc.config.model:
+            model._add_item("qk_interleaved", not gpc.config.model.adapt_hf)
+        else:
+            model._add_item("qk_interleaved", False)
+    elif "adapt_hf" in gpc.config.model:
+        assert gpc.config.model.adapt_hf == (
+            not gpc.config.model.qk_interleaved
+        ), "adapt_hf and qk_interleaved must be opposite"
 
     # process the parallel config
     if "sequence_parallel" not in gpc.config.parallel:
@@ -436,6 +444,11 @@ def args_sanity_check():
         optim_ckpt._add_item("overlap_sync_grad", False)
     if "overlap_sync_param" not in optim_ckpt:
         optim_ckpt._add_item("overlap_sync_param", False)
+    if "use_split_tensor_optim" not in optim_ckpt:
+        optim_ckpt._add_item("use_split_tensor_optim", False)
+    elif optim_ckpt.use_split_tensor_optim and "all_gather_size" not in optim_ckpt:
+        optim_ckpt._add_item("all_gather_size", 512 * 1024 * 1024)
+
     if gpc.is_rank_for_log():
         logger.info(
             f"overlap_sync_grad:{optim_ckpt.overlap_sync_grad}, overlap_sync_param:{optim_ckpt.overlap_sync_param}"
@@ -618,9 +631,6 @@ def initialize_distributed_env(
         seed (int, optional): Specified random seed for every process. 1024 by default.
     """
     backend = internlm_accelerator._communication_backend_name
-
-    # close automatic garbage collection
-    gc.disable()
 
     if launcher == "torch":
         launch_from_torch(config=config, seed=seed, backend=backend)

@@ -14,6 +14,7 @@ from internlm.accelerator import get_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.context.parallel_context import Config
+from internlm.core.trainer import Trainer
 from internlm.data import (
     build_train_loader_with_data_type,
     build_valid_loader_with_data_type,
@@ -22,7 +23,11 @@ from internlm.eval.evaluation import switch_evaluation_mode
 from internlm.initialize.launch import args_sanity_check
 from internlm.model.losses import FlashGPTLMLoss
 from internlm.model.metrics import AccPerplex, SchedulerMetricHook
-from internlm.train import initialize_model, initialize_optimizer
+from internlm.train import (
+    initialize_model,
+    initialize_optimizer,
+    initialize_parallel_communicator,
+)
 from internlm.utils.common import get_current_device
 from internlm.utils.logger import get_logger
 
@@ -266,6 +271,7 @@ def exam_loss(args):
 
     # initialize model
     model = initialize_model()
+    _ = initialize_parallel_communicator(model)
 
     # initialize loss function
     criterion = FlashGPTLMLoss(parallel_output=True, label_smoothing=gpc.config.loss.label_smoothing)
@@ -297,15 +303,15 @@ def exam_loss(args):
         ),
     ]
 
-    trainer, train_dl, _, _ = internlm.initialize_trainer(
+    engine, scheduler = internlm.initialize_trainer(
         model=model,
         optimizer=optimizer,
         criterion=criterion,
-        train_dataloader=train_dl,
         lr_scheduler=lr_scheduler,
         beta2_scheduler=beta2_scheduler,
         scheduler_hooks=scheduler_hooks,
     )
+    trainer = Trainer(engine, scheduler)
 
     trainer.train()
 

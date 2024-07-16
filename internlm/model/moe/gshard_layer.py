@@ -15,9 +15,9 @@ from torch.nn import Module
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
+from internlm.model.modules.mlp import new_feed_forward
 from internlm.utils.logger import get_logger
 from internlm.utils.megatron_timers import megatron_timer as timer
-from internlm.utils.registry import MODEL_INITIALIZER
 
 from .base_layer import BaseMoELayer
 from .utils import all_to_all
@@ -436,7 +436,6 @@ class TopKGate(Module):
         return gate_output
 
 
-@MODEL_INITIALIZER.register_module(module_name="GShard")
 class GShardMOELayer(BaseMoELayer):
     """MOELayer module which implements MixtureOfExperts as described in Gshard_.
     ::
@@ -461,7 +460,6 @@ class GShardMOELayer(BaseMoELayer):
         hidden_features: int,
         out_features: int,
         num_experts: int,
-        ep_cls: Optional[Callable],
         ep_group: Optional[torch.distributed.ProcessGroup],
         ep_size: int,
         top_k: int = 1,
@@ -496,11 +494,10 @@ class GShardMOELayer(BaseMoELayer):
             ),
             torch.nn.ModuleList(
                 [
-                    ep_cls(
+                    new_feed_forward(
                         in_features,
                         hidden_features,
                         out_features,
-                        process_group=gpc.get_group(ParallelMode.TENSOR),
                         bias=False,
                         device=device,
                         dtype=dtype,

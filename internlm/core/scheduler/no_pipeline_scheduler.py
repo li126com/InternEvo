@@ -85,10 +85,7 @@ class NonPipelineScheduler(BaseScheduler):
         self._grad_accum_offset += self._bsz_stride
 
         if self.data_process_func:
-            _data["input_ids"] = self.data_process_func(_data["input_ids"], _data["cu_seqlens"])
-            _label = self.data_process_func(_label, _data["cu_seqlens"], padding_v=-100)
-            _data.pop("cu_seqlens")
-            _data.pop("indexes")
+            _data, _label = self.data_process_func(_data, _label)
 
         return _data, _label
 
@@ -178,7 +175,6 @@ class NonPipelineScheduler(BaseScheduler):
                 If True, the model is run for the forward pass, else back propagation will be executed.
             return_loss (bool, optional): Loss will be returned if True.
             return_output_label (bool, optional): Output and label will be returned if True.
-
         Returns:
             Tuple[:class:`torch.Tensor`]: A tuple of (output, label, loss), loss and label could be None.
         """

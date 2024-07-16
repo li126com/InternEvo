@@ -3,9 +3,11 @@
 
 from torch import nn
 
-from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
-from internlm.model.ops.fusion_ops_import_helper import internlm_init_CrossEntropyLoss
+from internlm.model.ops.cross_entropy import new_cross_entropy
+from internlm.utils.logger import get_logger
+
+logger = get_logger(__file__)
 
 
 class FlashGPTLMLoss(nn.Module):
@@ -24,12 +26,11 @@ class FlashGPTLMLoss(nn.Module):
             label_smoothing = 0
 
         self.label_smoothing = label_smoothing
-        self.loss_fn = internlm_init_CrossEntropyLoss(
-            parallel_output=parallel_output,
+        self.loss_fn = new_cross_entropy(
             reduction="mean",
-            inplace_backward=True,
-            process_group=gpc.get_group(ParallelMode.TENSOR),
             label_smoothing=self.label_smoothing,
+            parallel_output=parallel_output,
+            inplace_backward=True,
         )
 
     def forward(self, *args):

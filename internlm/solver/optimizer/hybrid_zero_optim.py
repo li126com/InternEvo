@@ -11,7 +11,6 @@ import torch.distributed as dist
 from torch.optim import Optimizer
 
 from internlm.accelerator import get_accelerator
-from internlm.core.communication.utils import ParamAsyncBcastHandler
 from internlm.core.context import Config, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.context.parallel_context import (
@@ -21,6 +20,7 @@ from internlm.core.context.parallel_context import (
     IS_TENSOR_ZERO_PARALLEL,
     IS_WEIGHT_ZERO_PARALLEL,
 )
+from internlm.core.parallel.comm.zero import ParamAsyncBcastHandler
 from internlm.monitor import send_alert_message
 from internlm.solver.optimizer.store import (
     BucketStore,
@@ -940,16 +940,14 @@ class HybridZeroOptimizer(BaseOptimizer):
         if "zero_devide_optim_plan" in states:
             self.params_per_rank_id_dict = states["zero_devide_optim_plan"]
 
-
-def reload_zero_fp32_buff(optimizer):
-    # If we use AMP optimizer, we need to update its fp32 buffer as newly loaded weights value.
-    # Or we must ensure that loading model weights must be done before zero is initialized.
-    if isinstance(optimizer, HybridZeroOptimizer):
-        for group_id, param_group in enumerate(optimizer.optim.param_groups):
-            if optimizer.param_group_has_params[group_id]:
+    def reload_zero_fp32_buff(self):
+        # If we use AMP optimizer, we need to update its fp32 buffer as newly loaded weights value.
+        # Or we must ensure that loading model weights must be done before zero is initialized.
+        for group_id, param_group in enumerate(self.optim.param_groups):
+            if self.param_group_has_params[group_id]:
                 # flatten fp16 params have already been updated by 'load_model_checkpoint'
-                fp16_flat_current_rank = optimizer._param_store.get_flat_fp16_param_by_rank_group(
-                    optimizer._zero_local_rank[group_id], group_id
+                fp16_flat_current_rank = self._param_store.get_flat_fp16_param_by_rank_group(
+                    self._zero_local_rank[group_id], group_id
                 )
                 # param_group["params"] is fp32 flatten optimizer states of this zero rank.
                 param_group["params"][0].data.copy_(fp16_flat_current_rank.float())

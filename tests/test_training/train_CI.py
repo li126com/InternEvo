@@ -20,7 +20,7 @@ import internlm  # noqa: E402
 from internlm.checkpoint import CheckpointManager  # noqa: E402
 from internlm.core.context import ParallelMode  # noqa: E402
 from internlm.core.context import global_context as gpc  # noqa: E402
-from internlm.core.trainer import TrainState  # noqa: E402
+from internlm.core.trainer import TrainState, Trainer  # noqa: E402
 from internlm.data import (  # noqa: E402
     build_train_loader_with_data_type,
     build_valid_loader_with_data_type,
@@ -38,6 +38,7 @@ from internlm.train import (  # noqa: E402
     initialize_llm_profile,
     initialize_model,
     initialize_optimizer,
+    initialize_parallel_communicator,
     record_current_batch_training_metrics,
 )
 from internlm.utils.common import (  # noqa: E402
@@ -62,7 +63,12 @@ def check_model_weights(model, ckpt_path, total_equal=False):
     model1_dict = torch.load(ckpt_path, map_location="cuda")
     model2_dict = model.state_dict()
 
-    for key in model2_dict.keys():
+    copy_of_ordered_dict = model2_dict.copy()
+
+    for key in copy_of_ordered_dict.keys():
+        if "wqkv" in key:
+            model2_dict[key.replace("wqkv", "Wqkv")] = model2_dict.pop(key)
+            key = key.replace("wqkv", "Wqkv")
         if key not in model1_dict:
             assert False, f"Error: The key {key} for current model dose not exist in standard ckpt!"
 
@@ -83,6 +89,7 @@ def check_model_weights(model, ckpt_path, total_equal=False):
 
 
 def main(args):
+    very_begining_time = time.time()
     # init setting
     skip_batches = gpc.config.data.skip_batches
     total_steps = gpc.config.data.total_steps
@@ -109,6 +116,7 @@ def main(args):
 
     # initialize model
     model = initialize_model()
+    _ = initialize_parallel_communicator(model)
 
     with open(args.config, "r") as f:
         config_lines = f.readlines()
@@ -173,15 +181,15 @@ def main(args):
         ),
     ]
 
-    trainer, train_dl, _, _ = internlm.initialize_trainer(
+    engine, scheduler = internlm.initialize_trainer(
         model=model,
         optimizer=optimizer,
         criterion=criterion,
-        train_dataloader=train_dl,
         lr_scheduler=lr_scheduler,
         beta2_scheduler=beta2_scheduler,
         scheduler_hooks=scheduler_hooks,
     )
+    trainer = Trainer(engine, scheduler)
 
     # initialize simple memory profiler
     if args.profiling:
@@ -298,6 +306,7 @@ def main(args):
                 optimizer=optimizer,
                 beta2_scheduler=beta2_scheduler,
                 trainer=trainer,
+                very_begining_time=very_begining_time,
                 start_time=start_time,
                 loss=loss,
                 moe_loss=moe_loss,

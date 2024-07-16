@@ -5,7 +5,7 @@
 ├── interface.py # 生成用的接口
 ├── internlm_sft_on_moss.py # 在 moss 数据集上进行 SFT 训练的样例
 ├── intern_moss_example.py # 在 moss 数据集上进行训练的样例
-├── load_internlm_model.py # 加载 InternLM 原生格式并进行推理的工具
+├── load_internlm2_model.py # 加载 InternLM 原生格式并进行推理的工具
 ├── openai_api.py # 使用 OpenAI 接口实现的流式部署
 ├── pal_inference.py # PAL 范式推理的工具
 ├── README_EN.md
@@ -140,4 +140,59 @@ if __name__ == "__main__":
     ):
         if hasattr(chunk.choices[0].delta, "content"):
             print(chunk.choices[0].delta.content, end="", flush=True)
+```
+
+# load_internlm2_model.py
+
+加载`InternEvo`框架训练的模型权重并进行推理
+
+```bash
+torchrun --master_port 12321 --nnodes=1 --node_rank=0 --nproc_per_node=1 --ckpt_dir=[where the internlm2 model weights are stored] --tokenizer_path=tools/tokenizer_internlm2.model tools/load_internlm2_model.py
+```
+
+LLaMA 7B推理的例子：
+
+```python
+ model = initialize_internlm_model(
+        model_type="LLAMA2",
+        ckpt_dir=args.ckpt_dir,
+        model_config=dict(
+            num_chunks=1,
+            checkpoint=0.2,
+            dtype="torch.bfloat16",
+            embed_split_hidden=True,
+            num_layers=32,
+            hidden_size=4096,
+            vocab_size=32000,
+            embed_grad_scale=1,
+            parallel_output=True,
+            num_attention_heads=32,
+            num_kv_attention_heads=32,
+            mlp_ratio=2.675,
+            use_flash_attn=True,
+            norm_type="rmsnorm",
+            apply_post_layer_norm=False,
+            no_bias=True,
+            layer_norm_epsilon=1e-5,
+        ),
+        del_model_prefix=True,
+    )
+
+    from sentencepiece import SentencePieceProcessor
+
+    prompt = """<|User|>:{query}<eoh>\n<|Bot|>:"""
+    prompt = prompt.replace("{query}", "hello")
+    # LLaMA tokenizer转换成SentencePieceProcessor 或 此处加载Huggingface Tokenizer，则需额外将generate中调用的decode等方法修改成HF风格
+    tokenizer = SentencePieceProcessor(args.tokenizer_path)
+    generation_config = GenerationConfig()
+    output_generator = internlm_interactive_generation(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        generation_config=generation_config,
+        additional_eos_token_list=[tokenizer.eos_id()],
+    )
+
+    for text in output_generator:
+        print(text)
 ```

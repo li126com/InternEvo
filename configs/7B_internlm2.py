@@ -1,5 +1,5 @@
 JOB_NAME = "7b_internlm2_train"
-model_type="INTERNLM2_PUBLIC"
+model_type = "INTERNLM2_PUBLIC"
 DO_ALERT = False
 
 VOCAB_SIZE = 92544
@@ -144,6 +144,14 @@ model = dict(
     layer_norm_epsilon=1e-5,
     num_kv_attention_heads=NUM_KV_ATTENTION_HEAD,
     use_flash_attn=True,
+    # Whether the odd and even columns of the query and key in the model are normally interleaved.
+    # If it's True, the model's odd and even columns are normally ordered; if it's False,
+    # it means that the model has prematurely concatenated all odd columns and even columns in front
+    # and back, in order to improve the RoPE's computational efficiency.
+    # Example:
+    # qk_interleaved = True: q[-1] = [q1,q2,q3,q4,q5,q6,...], k[-1] = [k1,k2,k3,k4,k5,k6,...]
+    # qk_interleaved = False: q[-1] = [q1,q3,q5,...,q2,q4,q6,...], k[-1] = [k1,k3,k5,...,k2,k4,k6,...]
+    qk_interleaved=False,
 )
 
 """
@@ -197,3 +205,18 @@ monitor = dict(
 # metric_dtype can be "fp32" or other string
 # only when set to "fp32" will use fp32 to calc in metrics
 # metric_dtype = "fp32"
+
+generation = dict(
+    ckpt_folder="/path/to/saved/ckpt",
+    output_folder="/path/to/save/generation",
+    batch_size=1,
+    eos_id=[2, 0],
+    bos_id=1,
+    max_length=100,
+    do_sample=True,
+    temperature=1.0,
+    top_k=50,
+    top_p=1.0,
+    repetition_penalty=1,
+    length_penalty=1.0,
+)

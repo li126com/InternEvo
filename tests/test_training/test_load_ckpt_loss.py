@@ -29,6 +29,7 @@ from internlm.core.context.parallel_context import (  # noqa: E402  #pylint: dis
 )
 from internlm.core.trainer import (  # noqa: E402  #pylint: disable=wrong-import-position
     TrainState,
+    Trainer,
 )
 from internlm.data import (  # noqa: E402  #pylint: disable=wrong-import-position
     build_train_loader_with_data_type,
@@ -46,6 +47,7 @@ from internlm.model.metrics import (  # noqa: E402  #pylint: disable=wrong-impor
 from internlm.train import (  # noqa: E402  #pylint: disable=wrong-import-position
     initialize_model,
     initialize_optimizer,
+    initialize_parallel_communicator,
     load_new_batch,
 )
 from internlm.utils.common import (  # noqa: E402  #pylint: disable=wrong-import-position
@@ -67,7 +69,7 @@ config = Config(
             zero1=dict(size=-1, fsdp=False),
             pipeline=dict(size=1, interleaved_overlap=False),
             sequence_parallel=False,
-            tensor=1,
+            tensor=dict(size=1, mode="mtp"),
         ),
         data=dict(
             seq_len=2048,
@@ -218,6 +220,7 @@ def train_model(args):
 
     # initialize model
     model = initialize_model()
+    _ = initialize_parallel_communicator(model)
 
     # initialize loss function
     criterion = FlashGPTLMLoss(parallel_output=True, label_smoothing=gpc.config.loss.label_smoothing)
@@ -263,15 +266,15 @@ def train_model(args):
         ),
     ]
 
-    trainer, train_dl, _, _ = internlm.initialize_trainer(
+    engine, scheduler = internlm.initialize_trainer(
         model=model,
         optimizer=optimizer,
         criterion=criterion,
-        train_dataloader=train_dl,
         lr_scheduler=lr_scheduler,
         beta2_scheduler=beta2_scheduler,
         scheduler_hooks=scheduler_hooks,
     )
+    trainer = Trainer(engine, scheduler)
 
     trainer.train()
     train_iter = iter(train_dl)

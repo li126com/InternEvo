@@ -6,14 +6,15 @@ import internlm
 from internlm.accelerator import get_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
+from internlm.core.trainer import Trainer
 from internlm.data import build_train_loader_with_data_type
 from internlm.model.losses import FlashGPTLMLoss
 from internlm.model.metrics import AccPerplex
 from internlm.train import (
     get_scheduler_hooks,
-    initialize_isp_communicator,
     initialize_model,
     initialize_optimizer,
+    initialize_parallel_communicator,
 )
 from internlm.utils.logger import get_logger
 from tests.common_fixture import (
@@ -54,7 +55,7 @@ def train_check(args):
     model = initialize_model()
 
     # initialize isp communicator
-    isp_communicator = initialize_isp_communicator(model)
+    isp_communicator = initialize_parallel_communicator(model)
 
     # initialize loss function
     criterion = FlashGPTLMLoss(parallel_output=True, label_smoothing=gpc.config.loss.label_smoothing)
@@ -70,15 +71,15 @@ def train_check(args):
         dataset_types=dataset_types,
     )
 
-    trainer, train_dl, _, _ = internlm.initialize_trainer(
+    engine, scheduler = internlm.initialize_trainer(
         model=model,
         optimizer=optimizer,
         criterion=criterion,
-        train_dataloader=train_dl,
         lr_scheduler=lr_scheduler,
         beta2_scheduler=beta2_scheduler,
         scheduler_hooks=get_scheduler_hooks(metric, optimizer, isp_communicator),
     )
+    trainer = Trainer(engine, scheduler)
 
     # transfer the train data loader into train data iterator
     trainer.train()

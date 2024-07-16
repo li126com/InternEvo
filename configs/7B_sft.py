@@ -71,6 +71,10 @@ data = dict(
     valid_folder=VALID_FOLDER,
     empty_cache_and_diag_interval=200,
     diag_outlier_ratio=1.1,
+    # whether use shared memory to load meta files
+    use_shm=False,
+    # when use shm, the default shm_path is "/dev/shm/metacache"
+    # shm_path="/dev/shm/metacache"
 )
 
 grad_scaler = dict(
@@ -100,6 +104,11 @@ hybrid_zero_optimizer = dict(
     reduce_bucket_size=512 * 1024 * 1024,
     # grad clipping
     clip_grad_norm=1.0,
+    # whether use new optm
+    use_split_tensor_optim=False,
+    # when use split tensor optm
+    # Perform all gather with a set of parameters of all_gather_size
+    all_gather_size=512 * 1024 * 1024,
 )
 
 loss = dict(
@@ -145,6 +154,14 @@ model = dict(
     norm_type="rmsnorm",
     layer_norm_epsilon=1e-5,
     use_flash_attn=True,
+    # Whether the odd and even columns of the query and key in the model are normally interleaved.
+    # If it's True, the model's odd and even columns are normally ordered; if it's False,
+    # it means that the model has prematurely concatenated all odd columns and even columns in front
+    # and back, in order to improve the RoPE's computational efficiency.
+    # Example:
+    # qk_interleaved = True: q[-1] = [q1,q2,q3,q4,q5,q6,...], k[-1] = [k1,k2,k3,k4,k5,k6,...]
+    # qk_interleaved = False: q[-1] = [q1,q3,q5,...,q2,q4,q6,...], k[-1] = [k1,k3,k5,...,k2,k4,k6,...]
+    qk_interleaved=False,
     num_chunks=1,  # if num_chunks > 1, interleaved pipeline scheduler is used.
 )
 """

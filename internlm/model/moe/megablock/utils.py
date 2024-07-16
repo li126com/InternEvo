@@ -1,9 +1,7 @@
-import sys
-
 import torch
 
 from internlm.accelerator import get_accelerator
-from internlm.model.utils import Silu
+from internlm.model.modules.utils import Silu
 
 try:
     import stk
@@ -366,26 +364,3 @@ def act_fn(x1, x2, topo):
         )
 
         return y
-
-
-# check dependency
-def check_megablock_installed():
-    try:
-        from megablocks import ops  # noqa # pylint: disable=W0611
-    except ModuleNotFoundError:
-        print(
-            "MegaBlocks not found, please see "
-            "https://github.com/stanford-futuredata/megablocks/. "
-            "Note that MegaBlocks depends on mosaicml-turbo, which only "
-            "supports python 3.10.",
-            flush=True,
-        )
-        sys.exit()
-
-
-def check_stk_installed():
-    try:
-        import stk  # noqa # pylint: disable=W0611
-    except ModuleNotFoundError:
-        print("STK not found: please see https://github.com/stanford-futuredata/stk", flush=True)
-        sys.exit()

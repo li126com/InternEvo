@@ -4,7 +4,7 @@
 # adopted from https://github.com/hpcaitech/ColossalAI/tree/main/colossalai/amp
 
 from functools import partial
-from typing import Any, Union
+from typing import Any, List, Union
 
 import torch
 import torch.distributed as dist
@@ -206,3 +206,10 @@ class NaiveAMPModel(nn.Module):
                     torch.backends.cudnn.allow_tf32 = True
                     torch.backends.cuda.matmul.allow_tf32 = True
                 sub_module.register_forward_pre_hook(partial(_pre_forward_hook_for_fp32))
+
+
+def unwrap_naive_amp(model: Union[nn.Module, nn.ModuleList]) -> List[nn.Module]:
+    if not isinstance(model, nn.ModuleList):
+        model = [model]
+
+    return [_chunk.model if isinstance(_chunk, NaiveAMPModel) else _chunk for _chunk in model]

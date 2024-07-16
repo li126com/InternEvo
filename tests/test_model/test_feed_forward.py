@@ -1,26 +1,12 @@
 import pytest
 import torch
 
-from internlm.model.modules.mlp import BaseFeedForward
+from internlm.model.modules.mlp import new_feed_forward, split_fused_mlp_weight
 from internlm.utils.common import get_current_device
 
 SEQ_LEN = 64
 HIDDEN_SIZE = 128
 MLP_RATIO = 8 / 3
-
-
-class InternLMLinear(torch.nn.Linear):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        *args,  # pylint: disable=W0613
-        bias: bool = True,
-        device=None,
-        dtype=None,
-        **kwargs,  # pylint: disable=W0613
-    ) -> None:
-        super().__init__(in_features, out_features, bias, device, dtype)
 
 
 mlp_args = {
@@ -30,8 +16,6 @@ mlp_args = {
     "bias": False,
     "device": get_current_device(),
     "dtype": torch.bfloat16,
-    "column_cls": InternLMLinear,
-    "row_cls": InternLMLinear,
 }
 
 
@@ -43,13 +27,13 @@ def check_param(a1, a2, b1, b2):
 
 
 def init_mlp():
-    mlp_no_fused = BaseFeedForward(**mlp_args)
-    mlp_fused = BaseFeedForward(mlp_layer_fusion=True, **mlp_args)
+    mlp_no_fused = new_feed_forward(**mlp_args)
+    mlp_fused = new_feed_forward(mlp_layer_fusion=True, **mlp_args)
 
     for _, param in mlp_fused.named_parameters():
         torch.nn.init.normal_(param.data, std=0.02)
 
-    w1, w3 = BaseFeedForward.split_fused_mlp_weight(mlp_fused.fused_w1_w3.weight)
+    w1, w3 = split_fused_mlp_weight(mlp_fused.fused_w1_w3.weight)
     mlp_no_fused.w1.weight.data = w1.data
     mlp_no_fused.w3.weight.data = w3.data
     mlp_no_fused.w2.weight.data = mlp_fused.w2.weight.data
@@ -99,7 +83,7 @@ def test_mlp_layer_fusion_loss():
     l2.backward()
 
     assert torch.allclose(mlp_no_fused.w2.weight.grad, mlp_fused.w2.weight.grad, rtol=1e-4, atol=1e-5)
-    w1_g, w3_g = BaseFeedForward.split_fused_mlp_weight(mlp_fused.fused_w1_w3.weight.grad)
+    w1_g, w3_g = split_fused_mlp_weight(mlp_fused.fused_w1_w3.weight.grad)
     assert torch.allclose(mlp_no_fused.w1.weight.grad, w1_g, rtol=1e-4, atol=1e-5)
     assert torch.allclose(mlp_no_fused.w3.weight.grad, w3_g, rtol=1e-4, atol=1e-5)
 

@@ -6,8 +6,8 @@ VOCAB_SIZE = 32000
 SEQ_LEN = 2048
 HIDDEN_SIZE = 4096
 NUM_ATTENTION_HEAD = 32
-NUM_KV_ATTENTION_HEAD = 8
-MLP_RATIO = 3.5
+NUM_KV_ATTENTION_HEAD = 32
+MLP_RATIO = 2.6875
 NUM_LAYER = 32
 
 
@@ -144,6 +144,14 @@ model = dict(
     layer_norm_epsilon=1e-5,
     num_kv_attention_heads=NUM_KV_ATTENTION_HEAD,
     use_flash_attn=True,
+    # Whether the odd and even columns of the query and key in the model are normally interleaved.
+    # If it's True, the model's odd and even columns are normally ordered; if it's False,
+    # it means that the model has prematurely concatenated all odd columns and even columns in front
+    # and back, in order to improve the RoPE's computational efficiency.
+    # Example:
+    # qk_interleaved = True: q[-1] = [q1,q2,q3,q4,q5,q6,...], k[-1] = [k1,k2,k3,k4,k5,k6,...]
+    # qk_interleaved = False: q[-1] = [q1,q3,q5,...,q2,q4,q6,...], k[-1] = [k1,k3,k5,...,k2,k4,k6,...]
+    qk_interleaved=False,
 )
 
 """

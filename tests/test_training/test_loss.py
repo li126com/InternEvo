@@ -6,19 +6,20 @@ import torch
 import torch.distributed as dist
 
 import internlm
+from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.checkpoint import CheckpointManager
 from internlm.core.context import Config, ParallelMode
 from internlm.core.context import global_context as gpc
-from internlm.core.trainer import TrainState
+from internlm.core.trainer import TrainState, Trainer
 from internlm.data import build_train_loader_with_data_type
 from internlm.initialize import initialize_distributed_env
 from internlm.model.losses import FlashGPTLMLoss
 from internlm.model.metrics import AccPerplex
 from internlm.train import (
     get_scheduler_hooks,
-    initialize_isp_communicator,
     initialize_model,
     initialize_optimizer,
+    initialize_parallel_communicator,
     load_new_batch,
 )
 from internlm.utils.common import BatchSkipper, get_current_device, launch_time
@@ -44,8 +45,8 @@ BASELINE_LOSS_LIST = [
     4.616517543792725,
 ]
 
-
 cur_loss_list = []
+internlm_accelerator = get_accelerator()
 
 
 def train(
@@ -57,8 +58,10 @@ def train(
     interleaved: bool = False,
     tp_mode: str = "mtp",
     enable_sp: bool = False,
-    enable_ckpt: bool = False,
+    save_ckpt: bool = False,
+    load_ckpt: bool = False,
     model_type: str = "INTERNLM",
+    optimizer_ver: str = "v1",
 ):
     # initialize distributed environment
     config = Config.from_file(CONFIG_FILE_PATH)
@@ -68,21 +71,29 @@ def train(
     config.data.fixed_random_dataset_seqlen = False
     config.lr_scheduler.total_steps = TOTAL_STEPS
     config.model_type = model_type
+    config.ckpt.load_ckpt_folder = None
+    config.ckpt.load_ckpt_info = None
+    config.ckpt.auto_resume = False
     total_steps = config.data.total_steps
     skip_batches = config.data.skip_batches
     label_smoothing = config.loss.label_smoothing
+
+    if optimizer_ver == "v2":
+        config.hybrid_zero_optimizer.new_version = True
+        config.all_gather_size = 512 * 1024 * 1024
 
     # update ckpt config
     if model_type == "INTERNLM" and tp_mode != "isp" and interleaved is False:
         config.ckpt.load_ckpt_info = dict(path=INTERNLM1_CKPT_PATH, content=("model",), ckpt_type="internlm_test")
 
-    if enable_ckpt:
+    if save_ckpt:
         config.ckpt.enable_save_ckpt = True
         config.ckpt.checkpoint_every = 10
         config.ckpt.save_ckpt_folder = "local:llm_ckpts/"
-        config.ckpt.load_ckpt_folder = "local:llm_ckpts/"
-        config.ckpt.load_ckpt_info["content"] = ("all",)
         config.ckpt.oss_snapshot_freq = 100
+
+    if load_ckpt:
+        config.ckpt.load_ckpt_info = dict(path="local:llm_ckpts/10", content=("all",), ckpt_type="internevo")
 
     # update parallel config
     config.parallel.tensor = dict(size=tp_size, mode=tp_mode)
@@ -92,7 +103,18 @@ def train(
         config.parallel.pipeline = dict(size=pp_size, interleaved_overlap=True)
         config.model.num_chunks = num_chunks
 
-    initialize_distributed_env(config=config)
+    if tp_mode == "isp" and internlm_accelerator.get_accelerator_backend() in [
+        AcceleratorType.NPU,
+        AcceleratorType.DIPU,
+    ]:
+        config.data.use_packed_dataset = False
+
+    if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
+        launcher = "slurm"
+    else:
+        launcher = "torch"
+
+    initialize_distributed_env(config=config, launcher=launcher)
     assert hasattr(gpc, "config") and gpc.config is not None
 
     # check parallel config
@@ -133,7 +155,7 @@ def train(
     model = initialize_model()
 
     # initialize isp communicator
-    isp_communicator = initialize_isp_communicator(model)
+    isp_communicator = initialize_parallel_communicator(model)
 
     # initialize loss function
     criterion = FlashGPTLMLoss(parallel_output=True, label_smoothing=label_smoothing)
@@ -171,15 +193,15 @@ def train(
     )
 
     # initialize trainer
-    trainer, train_dl, _, _ = internlm.initialize_trainer(
+    engine, scheduler = internlm.initialize_trainer(
         model=model,
         optimizer=optimizer,
         criterion=criterion,
-        train_dataloader=train_dl,
         lr_scheduler=lr_scheduler,
         beta2_scheduler=beta2_scheduler,
         scheduler_hooks=get_scheduler_hooks(metric, optimizer, isp_communicator),
     )
+    trainer = Trainer(engine, scheduler)
 
     # initialize the batch skipper
     batch_skipper = BatchSkipper(skip_batches)
@@ -235,7 +257,7 @@ def train(
             )
         if gpc.is_rank_for_log():
             assert loss is not None and not math.isnan(loss.item())
-            global cur_loss_list
+            global cur_loss_list  # pylint: disable=W0602
             cur_loss_list.append((loss.item() - moe_loss.item() if moe_loss is not None else loss.item()))
         timer("fwd-bwd").stop()
 
@@ -292,6 +314,18 @@ def test_training_loss_with_dp4():
     check_loss_accuracy()
 
 
+@pytest.mark.training_4GPU_optimizer_v2
+def test_training_loss_with_dp4_optimizer_v2():
+    # model training
+    train(dp_size=4, optimizer_ver="v2")
+
+    # print loss value
+    print(f"cur_loss_list: {cur_loss_list}", flush=True)
+
+    check_loss_spike()
+    check_loss_accuracy()
+
+
 @pytest.mark.training_8GPU_4DP2TP
 def test_training_loss_with_dp4_tp2():
     # model training
@@ -316,10 +350,34 @@ def test_training_loss_with_dp4_tp2_sp():
     check_loss_accuracy()
 
 
+@pytest.mark.training_8GPU_4DP2TPSP_optimizer_v2
+def test_training_loss_with_dp4_tp2_sp_optimizer_v2():
+    # model training
+    train(dp_size=4, tp_size=2, tp_mode="fsp", enable_sp=True, optimizer_ver="v2")
+
+    # print loss value
+    print(f"cur_loss_list: {cur_loss_list}", flush=True)
+
+    check_loss_spike()
+    check_loss_accuracy()
+
+
 @pytest.mark.training_8GPU_4DP2PP
 def test_training_loss_with_dp4_pp2():
     # model training
     train(dp_size=4, pp_size=2)
+
+    # print loss value
+    print(f"cur_loss_list: {cur_loss_list}", flush=True)
+
+    check_loss_spike()
+    check_loss_accuracy()
+
+
+@pytest.mark.training_8GPU_4DP2PP_optimizer_v2
+def test_training_loss_with_dp4_pp2_optimizer_v2():
+    # model training
+    train(dp_size=4, pp_size=2, optimizer_ver="v2")
 
     # print loss value
     print(f"cur_loss_list: {cur_loss_list}", flush=True)
@@ -355,6 +413,18 @@ def test_training_loss_with_dp4_tp2_pp2_mtp():
 def test_training_loss_with_dp4_tp2_pp2_msp():
     # model training
     train(dp_size=4, tp_size=2, pp_size=2, tp_mode="msp")
+
+    # print loss value
+    print(f"cur_loss_list: {cur_loss_list}", flush=True)
+
+    check_loss_spike()
+    check_loss_accuracy()
+
+
+@pytest.mark.training_16GPU_4DP2TP2PP_MSP_optimizer_v2
+def test_training_loss_with_dp4_tp2_pp2_msp_optimizer_v2():
+    # model training
+    train(dp_size=4, tp_size=2, pp_size=2, tp_mode="msp", optimizer_ver="v2")
 
     # print loss value
     print(f"cur_loss_list: {cur_loss_list}", flush=True)
@@ -409,7 +479,7 @@ def test_training_with_isp_save_ckpt():
     CONFIG_FILE_PATH = "./configs/7B_isp_sft.py"
 
     # model training save ckpt
-    train(dp_size=4, tp_size=2, wp_size=4, tp_mode="isp", enable_sp=True, enable_ckpt=True)
+    train(dp_size=4, tp_size=2, wp_size=4, tp_mode="isp", enable_sp=True, save_ckpt=True)
 
 
 @pytest.mark.training_8GPU_ISP_LOAD_CKPT
@@ -422,7 +492,7 @@ def test_training_with_isp_load_ckpt():
     TOTAL_STEPS = 20
 
     # model training load ckpt
-    train(dp_size=4, tp_size=2, wp_size=4, tp_mode="isp", enable_sp=True, enable_ckpt=True)
+    train(dp_size=4, tp_size=2, wp_size=4, tp_mode="isp", enable_sp=True, load_ckpt=True)
 
 
 @pytest.mark.training_llama2
