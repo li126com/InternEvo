@@ -206,3 +206,18 @@ monitor = dict(
 # metric_dtype can be "fp32" or other string
 # only when set to "fp32" will use fp32 to calc in metrics
 # metric_dtype = "fp32"
+
+generation = dict(
+    ckpt_folder="/path/to/saved/ckpt",
+    output_folder="/path/to/save/generation",
+    batch_size=1,
+    eos_id=[2, 0],
+    bos_id=1,
+    max_length=100,
+    do_sample=True,
+    temperature=1.0,
+    top_k=50,
+    top_p=1.0,
+    repetition_penalty=1,
+    length_penalty=1.0,
+)

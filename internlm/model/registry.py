@@ -73,6 +73,7 @@ class Registry:
 
 
 model_initializer = Registry("model_initializer")
+hf_config_initializer = Registry("hf_config_initializer")
 
 
 def register_model_initializer() -> None:

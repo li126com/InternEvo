@@ -24,12 +24,13 @@ from . import process_group_initializer as pgroup_initializer
 from .process_group_initializer import ParallelMode
 from .random import add_seed, get_seeds, set_mode
 
+# for layernorm
 IS_REPLICA_ZERO_PARALLEL = "is_replica_zero_parallel"
-# for isp, with optimizer split in dp group
-IS_TENSOR_DATA_PARALLEL = "is_tensor_data_parallel"
-# for mtp/msp/fsp, with optimizer split in zero1 group
+# for mtp/msp/fsp with tensor parallel, and optimizer split in zero1 group
 IS_TENSOR_ZERO_PARALLEL = "is_tensor_zero_parallel"
+# for isp with weight parallel, and optimizer split in zero1 group
 IS_WEIGHT_ZERO_PARALLEL = "is_weight_zero_parallel"
+# for moe
 IS_TENSOR_EXPERT_DATA_PARALLEL = "is_tensor_expert_data_parallel"
 
 logger = get_logger(__file__)
@@ -565,6 +566,7 @@ class ParallelContext(metaclass=SingletonMeta):
         initializers.append(pgroup_initializer.Initializer_Weight_Data(*initializer_args))
         initializers.append(pgroup_initializer.Initializer_Tensor(*initializer_args))
         initializers.append(pgroup_initializer.Initializer_Data(*initializer_args))
+        initializers.append(pgroup_initializer.Initializer_ISP_Data(*initializer_args))
         if isinstance(parallel_config["tensor"], dict) and parallel_config["tensor"]["mode"] == "isp":
             initializers.append(pgroup_initializer.Initializer_Zero1_ISP(*initializer_args))
         else:

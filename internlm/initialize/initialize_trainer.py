@@ -3,7 +3,7 @@
 
 # adopted from https://github.com/hpcaitech/ColossalAI/blob/main/colossalai/initialize
 
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from torch import nn
 from torch.nn.modules.loss import _Loss
@@ -15,6 +15,7 @@ from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.engine import Engine
 from internlm.core.gradient_handler import PipelineSharedModuleGradientHandler
+from internlm.core.parallel.shard import split_data_sequence_parallel
 from internlm.core.scheduler import (
     InterleavedPipelineScheduler,
     NonPipelineScheduler,
@@ -26,14 +27,13 @@ from internlm.data.utils import packed_data_normalizer, unpack_data
 from internlm.solver.optimizer.hybrid_zero_optim import BaseOptimizer
 from internlm.solver.schedulers.beta2_scheduler import Beta2Scheduler
 from internlm.utils.common import SchedulerHook, get_current_device
+from internlm.utils.parallel import is_using_isp
 
 
 def initialize_trainer(
     model: nn.Module,
     optimizer: Optimizer,
     criterion: Optional[_Loss] = None,
-    train_dataloader: Optional[Iterable] = None,
-    test_dataloader: Optional[Iterable] = None,
     lr_scheduler: Optional[_LRScheduler] = None,
     beta2_scheduler: Optional[Beta2Scheduler] = None,
     scheduler_hooks: Optional[List[SchedulerHook]] = None,
@@ -45,14 +45,10 @@ def initialize_trainer(
         model (:class:`torch.nn.Module` or `Callable`): Your model instance or a function to build the model.
         optimizer (:class:`BaseOptimizer`): Your optimizer for training.
         criterion (:class:`torch.nn.modules.loss._Loss`, optional): Your criterion instance.
-        train_dataloader (:class:`torch.utils.data.DataLoader`, optional): Dataloader for training.
-        test_dataloader (:class:`torch.utils.data.DataLoader`, optional): Dataloader for testing.
         lr_scheduler (:class:`torch.nn.lr_scheduler._LRScheduler`, optional): Your lr scheduler instance, optional.
 
     Returns:
-        Tuple (trainer, train_dataloader, test_dataloader, lr_scheduler):
-            A tuple of ``(trainer, train_dataloader, test_dataloader, lr_scheduler)``
-            where only ``trainer`` could not be None.
+        Tuple (engine, scheduler)
     """
 
     if isinstance(model, nn.Module):
@@ -80,7 +76,24 @@ def initialize_trainer(
     # initialize scheduler for trainer
     scheduler = None
 
-    data_fn = packed_data_normalizer if gpc.config.data.use_packed_dataset else unpack_data
+    data_fns = []
+    # default data process function
+    if gpc.config.data.use_packed_dataset:
+        data_fns.append(packed_data_normalizer)
+    else:
+        data_fns.append(unpack_data)
+
+    # support sequence parallel for isp
+    if is_using_isp():
+        data_fns.append(split_data_sequence_parallel)
+
+    # TODO: support context parallel
+
+    def _data_preparation_func(_data, _label):
+        for fn in data_fns:
+            _data, _label = fn(_data, _label)
+
+        return _data, _label
 
     if gpc.is_using_parallel_mode(ParallelMode.PIPELINE):
         gpc.config.NUM_MICRO_BATCHES = gpc.config.data.micro_num
@@ -95,7 +108,7 @@ def initialize_trainer(
 
             communication_overlap = gpc.config.parallel["pipeline"].get("interleaved_overlap", False)
             scheduler = InterleavedPipelineScheduler(
-                data_process_func=data_fn,
+                data_process_func=_data_preparation_func,
                 num_microbatches=gpc.config.NUM_MICRO_BATCHES,
                 num_chunks=gpc.config.model.num_chunks,
                 dtype=gpc.config.model["dtype"],
@@ -106,7 +119,7 @@ def initialize_trainer(
             )
         else:
             scheduler = PipelineScheduler(
-                data_process_func=data_fn,
+                data_process_func=_data_preparation_func,
                 num_microbatches=gpc.config.NUM_MICRO_BATCHES,
                 dtype=gpc.config.model["dtype"],
                 tensor_shape=tensor_shape,
@@ -115,7 +128,7 @@ def initialize_trainer(
             )
     else:
         scheduler = NonPipelineScheduler(
-            data_process_func=data_fn,
+            data_process_func=_data_preparation_func,
             gradient_accumulation_size=gpc.config.data.gradient_accumulation,
             scheduler_hooks=scheduler_hooks,
         )
@@ -131,6 +144,4 @@ def initialize_trainer(
         clip_grad_norm=clip_grad_norm,
     )
 
-    trainer = Trainer(engine, scheduler)
-
-    return trainer, train_dataloader, test_dataloader, lr_scheduler
+    return engine, scheduler

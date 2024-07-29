@@ -9,17 +9,37 @@ from torch import nn
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
+from internlm.core.parallel.comm.utils import _split
 from internlm.utils.logger import get_logger
 
 logger = get_logger(__file__)
 
 
+def split_data_sequence_parallel(data, label):
+    _seq_dim = 1  # [batch, seqlen, ...]
+    _indexes_seq_dim = 0  # [seqlen, ...]
+
+    # NOTICE: since cu_seqlens is used by attention, it should not be splited.
+    # NOTICE: indexes are only used by rotary embedding. There are a few cases:
+    # 1. msp/fsp: After wqkv computation, the hidden states are complete along the sequence dimension,
+    #    so we should use the complete indexes when computing the rotary embedding.
+    # 2. isp: After wqkv computation, the hidden states are segmented along the sequence dimension,
+    #    so we need to segment the indexes accordingly.
+    if "indexes" in data and gpc.config.parallel["tensor"].get("mode", "mtp") == "isp":
+        data["indexes"] = _split(data["indexes"], ParallelMode.TENSOR, dim=_indexes_seq_dim)
+
+    data["input_ids"] = _split(data["input_ids"], ParallelMode.TENSOR, dim=_seq_dim)
+    label = _split(label, ParallelMode.TENSOR, dim=_seq_dim)
+
+    return data, label
+
+
 # The head layer in ISP mode is actually a special case,
 # and we would prefer a unified segmentation and communication logic.
-def get_tensor_split_parallel_mode(is_head: bool = False) -> ParallelMode:
+def get_tensor_split_parallel_mode() -> ParallelMode:
     tp_mode = gpc.config.parallel.tensor.mode
 
-    if tp_mode == "isp" and is_head is False:
+    if tp_mode == "isp":
         return ParallelMode.WEIGHT
     else:
         return ParallelMode.TENSOR

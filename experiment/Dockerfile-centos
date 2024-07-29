@@ -106,11 +106,11 @@ ENV CXX=${GCC_HOME}/bin/c++
 
 
 ##############################################################################
-# Install InternLM development environment, including flash-attention and apex
+# Install InternEvo development environment, including flash-attention and apex
 ##############################################################################
 FROM dep as intrenlm-dev
-COPY . /InternLM
-WORKDIR /InternLM
+COPY . /InternEvo
+WORKDIR /InternEvo
 ARG https_proxy
 ARG http_proxy
 ARG PYTORCH_VERSION
@@ -134,11 +134,11 @@ RUN /opt/conda/bin/pip --no-cache-dir install \
     torch-scatter \
     pyecharts \
     py-libnuma \
-    -f https://data.pyg.org/whl/torch-${PYTORCH_VERSION}+cu117.html \
+    -f https://data.pyg.org/whl/torch-${PYTORCH_VERSION}.html \
     && /opt/conda/bin/pip --no-cache-dir install \
-    --extra-index-url https://download.pytorch.org/whl/cu117 \
-    torch==${PYTORCH_VERSION}+cu117 \
-    torchvision==${TORCHVISION_VERSION}+cu117 \
+    --extra-index-url https://download.pytorch.org/whl/cu118 \
+    torch==${PYTORCH_VERSION} \
+    torchvision==${TORCHVISION_VERSION} \
     torchaudio==${TORCHAUDIO_VERSION}
 
 ARG https_proxy
@@ -147,7 +147,7 @@ ARG TORCH_CUDA_ARCH_LIST="8.0;8.6+PTX"
 ARG FLASH_ATTEN_TAG
 
 RUN git submodule update --init --recursive \
-    && cd /InternLM/third_party/flash-attention \
+    && cd /InternEvo/third_party/flash-attention \
     && git checkout ${FLASH_ATTEN_TAG} \
     && /opt/conda/bin/python setup.py install \
     && cd ./csrc \
@@ -157,6 +157,9 @@ RUN git submodule update --init --recursive \
     && cd ../layer_norm && /opt/conda/bin/pip install -v . \
     && cd ../../../../ \
     && cd ./third_party/apex \
-    && /opt/conda/bin/pip --no-cache-dir install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./ \
+    && /opt/conda/bin/pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./ \
+    && /opt/conda/bin/pip install pytorch-extension \
     && /opt/conda/bin/pip cache purge \
-    && rm -rf ~/.cache/pip
+    && rm -rf ~/.cache/pip \
+    && /opt/conda/bin/conda init \
+    && . ~/.bashrc

@@ -454,7 +454,7 @@ class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
         if norm_head:
             logger.info("Notice that norm head is enabled to normalize head weight.")
 
-        parallel_mode = get_tensor_split_parallel_mode(is_head=True)
+        parallel_mode = get_tensor_split_parallel_mode()
         super().__init__(
             in_features, out_features, parallel_mode, bias=bias, device=device, dtype=dtype, split_mode="column"
         )

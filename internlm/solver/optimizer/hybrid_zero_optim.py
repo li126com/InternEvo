@@ -15,7 +15,6 @@ from internlm.core.context import Config, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.context.parallel_context import (
     IS_REPLICA_ZERO_PARALLEL,
-    IS_TENSOR_DATA_PARALLEL,
     IS_TENSOR_EXPERT_DATA_PARALLEL,
     IS_TENSOR_ZERO_PARALLEL,
     IS_WEIGHT_ZERO_PARALLEL,
@@ -165,7 +164,7 @@ class HybridZeroOptimizer(BaseOptimizer):
 
             if self._is_moe_group(param_group):
                 grad_reduce_mode = ParallelMode.EXPERT_DATA
-            elif param_group["name"] != "embed_head" and self.use_isp:
+            elif self.use_isp:
                 grad_reduce_mode = ParallelMode.WEIGHT_DATA
             else:
                 grad_reduce_mode = ParallelMode.DATA
@@ -344,8 +343,9 @@ class HybridZeroOptimizer(BaseOptimizer):
 
                     # get the AccumulateGrad object of the param itself
                     # If these objects are not kept, reduction hooks may not be attached successfully.
-                    accum_grad_obj = get_grad_accumulate_object(param)
-                    self._grad_store.add_accumulate_grad_object(accum_grad_obj)
+                    if not hasattr(param, "evo_tensor"):
+                        accum_grad_obj = get_grad_accumulate_object(param)
+                        self._grad_store.add_accumulate_grad_object(accum_grad_obj)
 
                     # the grad of layernorm should be all-reduce across the global process group
                     # here is the first stage all-reduce in tp/wp process group
@@ -364,10 +364,16 @@ class HybridZeroOptimizer(BaseOptimizer):
                         and self._isp_communicator.overlap
                         and gpc.config.parallel.weight.size > 1
                     ):
-                        accum_grad_obj.register_hook(accum_grad_hook)
+                        if hasattr(param, "evo_tensor"):
+                            param.register_post_accumulate_grad_hook(accum_grad_hook)
+                        else:
+                            accum_grad_obj.register_hook(accum_grad_hook)
 
                     if self._overlap_sync_grad:
-                        accum_grad_obj.register_hook(reduce_grad_hook)
+                        if hasattr(param, "evo_tensor"):
+                            param.register_post_accumulate_grad_hook(reduce_grad_hook)
+                        else:
+                            accum_grad_obj.register_hook(reduce_grad_hook)
 
                 _define_and_attach(param, reduce_rank)
 
@@ -619,10 +625,6 @@ class HybridZeroOptimizer(BaseOptimizer):
             elif self.optim.param_groups[group_id]["name"] == "fp32":
                 for param in params:
                     setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
-            elif self.optim.param_groups[group_id]["name"] == "embed_head":
-                # should be isp mode
-                for param in params:
-                    setattr(param, IS_TENSOR_DATA_PARALLEL, True)
             elif self._is_moe_group(self.optim.param_groups[group_id]):
                 for param in params:
                     setattr(param, IS_TENSOR_EXPERT_DATA_PARALLEL, True)
@@ -638,8 +640,6 @@ class HybridZeroOptimizer(BaseOptimizer):
             for param in params:
                 if hasattr(param, IS_REPLICA_ZERO_PARALLEL):
                     delattr(param, IS_REPLICA_ZERO_PARALLEL)
-                if hasattr(param, IS_TENSOR_DATA_PARALLEL):
-                    delattr(param, IS_TENSOR_DATA_PARALLEL)
                 if hasattr(param, IS_TENSOR_ZERO_PARALLEL):
                     delattr(param, IS_TENSOR_ZERO_PARALLEL)
                 if hasattr(param, IS_WEIGHT_ZERO_PARALLEL):

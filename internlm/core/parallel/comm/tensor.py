@@ -369,7 +369,7 @@ class MoESequenceParallelCommunicator:
         return (_output, *_others)
 
 
-class EmbbedingTensorParallelCommunicator:
+class EmbeddingTensorParallelCommunicator:
     """
     tensor parallel communicator for embbeding layer
     """
@@ -391,7 +391,7 @@ class EmbbedingTensorParallelCommunicator:
         return gather_forward_split_backward(output, self._parallel_mode, dim=_emb_dim)
 
 
-class EmbbedingSequenceParallelCommunicator:
+class EmbeddingSequenceParallelCommunicator:
     """
     sequence parallel communictor for embbeding layer
     """

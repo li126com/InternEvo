@@ -7,7 +7,6 @@ from internlm.core.context.parallel_context import ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
 from internlm.core.naive_amp import unwrap_naive_amp
 from internlm.model.modules.utils import is_moe_param
-from internlm.utils.parallel import is_tensor_data_parallel_parameter, is_using_isp
 
 
 def split_params_into_different_groups_for_optimizer(
@@ -39,10 +38,7 @@ def split_params_into_different_groups_for_optimizer(
     elif not isinstance(param_groups, list):
         raise ValueError(f"Unknown param group type of {type(param_groups)}")
 
-    # create new groups for IS_TENSOR_DATA_PARALLEL parameter group
     new_groups = {}
-    if is_using_isp():
-        new_groups["embed_head"] = {"name": "embed_head", "params": [], "optimizer_mode": ParallelMode.DATA}
     # create new groups for fp32 parameter group
     new_groups["fp32"] = {"name": "fp32", "params": [], "optimizer_mode": ParallelMode.ZERO1}
 
@@ -60,11 +56,8 @@ def split_params_into_different_groups_for_optimizer(
         # assign param
         origin_params = []
         for param in pgroup["params"]:
-            if is_tensor_data_parallel_parameter(param):
-                # should not be here if not isp mode
-                new_groups["embed_head"]["params"].append(param)
             # moe param means MoE is enabled
-            elif is_moe_param(param):
+            if is_moe_param(param):
                 new_groups[param.group_name]["params"].append(param)
             elif param.dtype == torch.float32 and gpc.config.model.dtype != torch.float32:
                 new_groups["fp32"]["params"].append(param)

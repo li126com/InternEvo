@@ -16,7 +16,6 @@ from internlm.utils.common import get_current_device, get_tensor_norm, move_norm
 from internlm.utils.logger import get_logger
 from internlm.utils.parallel import (
     is_replica_zero_parallel_parameter,
-    is_tensor_data_parallel_parameter,
     is_tensor_expert_data_parallel_parameter,
     is_tensor_zero_parallel_parameter,
     is_using_isp,
@@ -241,9 +240,6 @@ def reduce_grads(gradients, parameters, weight_parallel_mode):
             is_replica_zero_parallel_parameter(p) and gpc.get_local_rank(weight_parallel_mode) == 0
         ):  # if not used in each chunk, such as layernorm IS_REPLICA_ZERO_PARALLEL parameter group
             parallel_grads.append(g.data.float())
-        elif is_tensor_data_parallel_parameter(p):
-            # process all ranks for IS_TENSOR_DATA_PARALLEL parameter group
-            parallel_grads.append(g.data.float())
         elif is_tensor_zero_parallel_parameter(p):
             # process all ranks for IS_TENSOR_ZERO_PARALLEL parameter group
             parallel_grads.append(g.data.float())
@@ -283,10 +279,7 @@ def compute_norm(gradients, parameters, norm_type=2, zero_mode=ParallelMode.ZERO
         total_norm_cuda = torch.tensor([float(total_norm)], device=gradients[0].device, dtype=torch.float32)
 
         # Take max across all model-parallel GPUs.
-        if is_tensor_data_parallel_parameter(parameters[0]):
-            if gpc.is_using_parallel_mode(ParallelMode.TENSOR):
-                dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.MAX, group=gpc.get_group(ParallelMode.TENSOR))
-        elif is_tensor_zero_parallel_parameter(parameters[0]):
+        if is_tensor_zero_parallel_parameter(parameters[0]):
             if gpc.is_using_parallel_mode(ParallelMode.TENSOR):
                 dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.MAX, group=gpc.get_group(ParallelMode.TENSOR))
         else:
@@ -322,17 +315,12 @@ def compute_norm(gradients, parameters, norm_type=2, zero_mode=ParallelMode.ZERO
         Sum across all model-parallel GPUs.
         1. For the IS_REPLICA_ZERO_PARALLEL parameter group, gradients from rank 0 in the tp/wp process group and
             gradients along the pp+zero dimensions from all ranks should be aggregated.
-        2. For the IS_TENSOR_DATA_PARALLEL parameter group, gradients along the tp+pp+zero(dp) dimensions
+        2. For the IS_TENSOR_ZERO_PARALLEL parameter group, gradients along the tp+pp+zero dimensions
             from all ranks should be aggregated.
-        3. For the IS_TENSOR_ZERO_PARALLEL parameter group, gradients along the tp+pp+zero dimensions
-            from all ranks should be aggregated.
-        4. For the IS_WEIGHT_ZERO_PARALLEL parameter group, gradients along the wp+pp+zero dimensions
+        3. For the IS_WEIGHT_ZERO_PARALLEL parameter group, gradients along the wp+pp+zero dimensions
             from all ranks should be aggregated.
         """
-        if is_tensor_data_parallel_parameter(parameters[0]):
-            if gpc.is_using_parallel_mode(ParallelMode.TENSOR):
-                dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=gpc.get_group(ParallelMode.TENSOR))
-        elif is_tensor_zero_parallel_parameter(parameters[0]):
+        if is_tensor_zero_parallel_parameter(parameters[0]):
             if gpc.is_using_parallel_mode(ParallelMode.TENSOR):
                 dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=gpc.get_group(ParallelMode.TENSOR))
         else:

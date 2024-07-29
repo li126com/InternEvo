@@ -78,37 +78,49 @@ cd ../../../../
 安装 Apex (version 23.05)：
 ```bash
 cd ./third_party/apex
-pip install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+# if pip >= 23.1 (ref: https://pip.pypa.io/en/stable/news/#v23-1) which supports multiple `--config-settings` with the same key...
+pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
+# otherwise
+pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --global-option="--cpp_ext" --global-option="--cuda_ext" ./
 cd ../../
 ```
 
+### 额外安装
+```bash
+pip install git+https://github.com/databricks/megablocks@v0.3.2 # MOE相关
+```
+
 ### 环境镜像
-用户可以使用提供的 dockerfile 结合 docker.Makefile 来构建自己的镜像，或者也可以从 https://hub.docker.com/r/internlm/internlm 获取安装了 InternEvo 运行环境的镜像。
+用户可以使用提供的 dockerfile 结合 docker.Makefile 来构建自己的镜像，或者也可以从 https://hub.docker.com/r/internlm/internevo/tags 获取安装了 InternEvo 运行环境的镜像。
 
 #### 镜像配置及构造
 dockerfile 的配置以及构造均通过 docker.Makefile 文件实现，在 InternEvo 根目录下执行如下命令即可 build 镜像：
 ``` bash
 make -f docker.Makefile BASE_OS=centos7
 ```
-在 docker.Makefile 中可自定义基础镜像，环境版本等内容，对应参数可直接通过命令行传递。对于 BASE_OS 分别支持 ubuntu20.04 和 centos7。
+在 docker.Makefile 中可自定义基础镜像，环境版本等内容，对应参数可直接通过命令行传递，默认为推荐的环境版本。对于 BASE_OS 分别支持 ubuntu20.04 和 centos7。
 
 #### 镜像拉取
 基于 ubuntu 和 centos 的标准镜像已经 build 完成也可直接拉取使用：
 
 ```bash
 # ubuntu20.04
-docker pull internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-ubuntu20.04
+docker pull internlm/internevo:torch2.1.0-cuda11.8.0-flashatten2.2.1-ubuntu20.04
 # centos7
-docker pull internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-centos7
+docker pull internlm/internevo:torch2.1.0-cuda11.8.0-flashatten2.2.1-centos7
 ```
 
 #### 容器启动
 对于使用 dockerfile 构建或拉取的本地标准镜像，使用如下命令启动并进入容器：
 ```bash
-docker run --gpus all -it -m 500g --cap-add=SYS_PTRACE --cap-add=IPC_LOCK --shm-size 20g --network=host --name myinternlm internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-centos7 bash
+docker run --gpus all -it -m 500g --cap-add=SYS_PTRACE --cap-add=IPC_LOCK --shm-size 20g --network=host --name internevo_centos internlm/internevo:torch2.1.0-cuda11.8.0-flashatten2.2.1-centos7 bash
 ```
-容器内默认目录即 `/InternLM`，根据[使用文档](./usage.md)即可启动训练。
 
+#### 训练启动
+容器内默认目录即 `/InternEvo`，参考[使用文档](./usage.md)可获取具体使用方法。默认7B模型启动单机8卡训练命令样例：
+```bash
+torchrun --nproc_per_node=8 --nnodes=1 train.py --config configs/7B_sft.py --launcher torch
+```
 
 ## 环境安装（NPU）
 在搭载NPU的机器上安装环境的版本可参考GPU，在NPU上使用昇腾torch_npu代替torch，同时Flash-Attention和Apex不再支持安装，相应功能已由InternEvo代码内部实现。以下教程仅为torch_npu安装。
@@ -134,4 +146,3 @@ pip3 install setuptools
 wget https://gitee.com/ascend/pytorch/releases/download/v6.0.rc1-pytorch2.1.0/torch_npu-2.1.0.post3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 pip install torch_npu-2.1.0.post3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 ```
-

@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import (
     IS_REPLICA_ZERO_PARALLEL,
-    IS_TENSOR_DATA_PARALLEL,
     IS_TENSOR_EXPERT_DATA_PARALLEL,
     IS_TENSOR_ZERO_PARALLEL,
     IS_WEIGHT_ZERO_PARALLEL,
@@ -26,13 +25,15 @@ from internlm.core.naive_amp import (
     unwrap_naive_amp,
 )
 from internlm.core.parallel.comm.isp import (
+    EmbeddingWeightParallelCommunicator,
+    HeadWeightParallelCommunicator,
     ISPCommModelConfig,
     ISPCommunicator,
     ISPCommunicatorSchedulerHook,
 )
 from internlm.core.parallel.comm.tensor import (
-    EmbbedingSequenceParallelCommunicator,
-    EmbbedingTensorParallelCommunicator,
+    EmbeddingSequenceParallelCommunicator,
+    EmbeddingTensorParallelCommunicator,
     HeadSequenceParallelCommunicator,
     HeadTensorParallelCommunicator,
     LinearRole,
@@ -77,7 +78,6 @@ from internlm.utils.logger import get_logger
 from internlm.utils.megatron_timers import megatron_timer as timer
 from internlm.utils.parallel import (
     is_replica_zero_parallel_parameter,
-    is_tensor_data_parallel_parameter,
     is_tensor_expert_data_parallel_parameter,
     is_tensor_zero_parallel_parameter,
     is_using_isp,
@@ -118,11 +118,10 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
                 setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
         # embedding and head
-
         if isinstance(module, (Embedding1D, ScaleColumnParallelLinear)):
             for param in module.parameters():
-                if gpc.is_initialized(ParallelMode.TENSOR) and is_using_isp():
-                    setattr(param, IS_TENSOR_DATA_PARALLEL, True)
+                if gpc.is_initialized(ParallelMode.WEIGHT) and is_using_isp():
+                    setattr(param, IS_WEIGHT_ZERO_PARALLEL, True)
                 elif gpc.is_initialized(ParallelMode.TENSOR) and not is_using_isp():
                     setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
 
@@ -145,15 +144,25 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
             for param in module.parameters():
                 setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
+    def _check_module_hf(_, module):
+        # TODO: check parallel attribute for hf model
+        for param in module.parameters():
+            if gpc.is_initialized(ParallelMode.TENSOR) and is_using_isp():
+                setattr(param, IS_WEIGHT_ZERO_PARALLEL, True)
+            elif gpc.is_initialized(ParallelMode.TENSOR) and not is_using_isp():
+                setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
+
     for _chunk in unwrap_naive_amp(model):
         # set param parallel attribute
         for name, module in _chunk.named_modules():
-            _check_module(name, module)
+            if gpc.config.model_type == "hf":
+                _check_module_hf(name, module)
+            else:
+                _check_module(name, module)
 
         for name, param in _chunk.named_parameters():
             assert (
                 is_replica_zero_parallel_parameter(param)
-                or is_tensor_data_parallel_parameter(param)
                 or is_tensor_zero_parallel_parameter(param)
                 or is_weight_zero_parallel_parameter(param)
                 or is_tensor_expert_data_parallel_parameter(param)
@@ -262,8 +271,8 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
         ColumnParallelLinear.register_cls_communicator(isp_communicator)
         # row parallel linear will not be used.
         RowParallelLinear.register_cls_communicator(None)
-        _head_communicator = HeadSequenceParallelCommunicator(ParallelMode.TENSOR, _retain_out_sharded)
-        _embedding_communicator = EmbbedingSequenceParallelCommunicator(ParallelMode.TENSOR)
+        _head_communicator = HeadWeightParallelCommunicator(gpc.get_group(ParallelMode.WEIGHT))
+        _embedding_communicator = EmbeddingWeightParallelCommunicator(ParallelMode.WEIGHT)
 
     # register communictor for mtp/msp/fsp linear.
 
@@ -276,7 +285,7 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
             TensorParallelCommunicator(process_group=gpc.get_group(ParallelMode.TENSOR), role=LinearRole.ROW)
         )
         _head_communicator = HeadTensorParallelCommunicator(ParallelMode.TENSOR, _retain_out_sharded)
-        _embedding_communicator = EmbbedingTensorParallelCommunicator(ParallelMode.TENSOR)
+        _embedding_communicator = EmbeddingTensorParallelCommunicator(ParallelMode.TENSOR)
 
         # for tp recompute communication optimization, sign last block layer
         for row_parallel_linear in _submodule_filter(model, RowParallelLinear):
@@ -320,7 +329,8 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
         _head_communicator = HeadSequenceParallelCommunicator(
             ParallelMode.TENSOR, _retain_out_sharded, save_total_input_as_activation
         )
-        _embedding_communicator = EmbbedingSequenceParallelCommunicator(ParallelMode.TENSOR)
+
+        _embedding_communicator = EmbeddingSequenceParallelCommunicator(ParallelMode.TENSOR)
 
         # MoE sequence parallel
         if gpc.config.model.get("num_experts", 1) > 1:
@@ -485,7 +495,8 @@ def load_new_batch(train_dl: DataLoader, train_iter: Iterable, train_state: Trai
     if batch[0].get("type_ids", None) is not None:
         # if use_packed_dataset is False, we need to unpack type_ids
         if not gpc.config.data.use_packed_dataset:
-            batch[0]["type_ids"] = unpack_type_ids(batch[0]["type_ids"], batch[0]["cu_seqlens"])
+            if gpc.config.data.type != "hf" or gpc.config.model_type != "hf":
+                batch[0]["type_ids"] = unpack_type_ids(batch[0]["type_ids"], batch[0]["cu_seqlens"])
 
     return batch, train_iter
 
@@ -575,10 +586,17 @@ def record_current_batch_training_metrics(
 
         num_tokens_in_batch = batch[1].nelement()
         real_num_tokens = math.ceil(acc_perplex.pop("real_token_num") / gpc.get_world_size(ParallelMode.GLOBAL))
-        num_samples_in_batch = sum([len(b) - 1 for b in batch[0]["cu_seqlens"]])
-        max_length_in_batch = max([(b[1:] - b[:-1]).max().item() for b in batch[0]["cu_seqlens"]])
-        max_samples_in_batch = max([len(b) - 1 for b in batch[0]["cu_seqlens"]])
-        min_samples_in_batch = min([len(b) - 1 for b in batch[0]["cu_seqlens"]])
+        # TODO: check logic
+        if gpc.config.data.type == "hf" and gpc.config.model_type == "hf" and not gpc.config.data.use_packed_dataset:
+            num_samples_in_batch = gpc.config.data.micro_bsz * gpc.config.data.micro_num
+            max_length_in_batch = batch[0]["attention_mask"].sum(dim=1).max().item()
+            max_samples_in_batch = gpc.config.data.micro_bsz
+            min_samples_in_batch = gpc.config.data.micro_bsz
+        else:
+            num_samples_in_batch = sum([len(b) - 1 for b in batch[0]["cu_seqlens"]])
+            max_length_in_batch = max([(b[1:] - b[:-1]).max().item() for b in batch[0]["cu_seqlens"]])
+            max_samples_in_batch = max([len(b) - 1 for b in batch[0]["cu_seqlens"]])
+            min_samples_in_batch = min([len(b) - 1 for b in batch[0]["cu_seqlens"]])
         time_cost = time.time() - start_time
         tk_per_gpu = round(
             num_tokens_in_batch * gpc.get_world_size(ParallelMode.DATA) / gpc.get_world_size(ParallelMode.GLOBAL),

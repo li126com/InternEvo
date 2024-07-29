@@ -78,36 +78,49 @@ cd ../../../../
 Install Apex (version 23.05):
 ```bash
 cd ./third_party/apex
-pip install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+# if pip >= 23.1 (ref: https://pip.pypa.io/en/stable/news/#v23-1) which supports multiple `--config-settings` with the same key...
+pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
+# otherwise
+pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --global-option="--cpp_ext" --global-option="--cuda_ext" ./
 cd ../../
 ```
 
+### Additional Installation
+```bash
+pip install git+https://github.com/databricks/megablocks@v0.3.2 # MOE need
+```
+
 ### Environment Image
-Users can use the provided dockerfile combined with docker.Makefile to build their own images, or obtain images with InternEvo runtime environment installed from https://hub.docker.com/r/internlm/internlm.
+Users can use the provided dockerfile combined with docker.Makefile to build their own images, or obtain images with InternEvo runtime environment installed from https://hub.docker.com/r/internlm/internevo/tags.
 
 #### Image Configuration and Build
 The configuration and build of the Dockerfile are implemented through the docker.Makefile. To build the image, execute the following command in the root directory of InternEvo:
 ``` bash
 make -f docker.Makefile BASE_OS=centos7
 ```
-In docker.Makefile, you can customize the basic image, environment version, etc., and the corresponding parameters can be passed directly through the command line. For BASE_OS, ubuntu20.04 and centos7 are respectively supported.
+In docker.Makefile, you can customize the basic image, environment version, etc., and the corresponding parameters can be passed directly through the command line. The default is the recommended environment version. For BASE_OS, ubuntu20.04 and centos7 are respectively supported.
 
 #### Pull Standard Image
 The standard image based on ubuntu and centos has been built and can be directly pulled:
 
 ```bash
 # ubuntu20.04
-docker pull internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-ubuntu20.04
+docker pull internlm/internevo:torch2.1.0-cuda11.8.0-flashatten2.2.1-ubuntu20.04
 # centos7
-docker pull internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-centos7
+docker pull internlm/internevo:torch2.1.0-cuda11.8.0-flashatten2.2.1-centos7
 ```
 
 #### Run Container
 For the local standard image built with dockerfile or pulled, use the following command to run and enter the container:
 ```bash
-docker run --gpus all -it -m 500g --cap-add=SYS_PTRACE --cap-add=IPC_LOCK --shm-size 20g --network=host --name myinternlm internlm/internlm:torch1.13.1-cuda11.7.1-flashatten1.0.5-centos7 bash
+docker run --gpus all -it -m 500g --cap-add=SYS_PTRACE --cap-add=IPC_LOCK --shm-size 20g --network=host --name internevo_centos internlm/internevo:torch2.1.0-cuda11.8.0-flashatten2.2.1-centos7 bash
 ```
-The default directory in the container is `/InternLM`, please start training according to the [Usage](./usage.md).
+
+#### Start Training
+The default directory in the container is `/InternEvo`, please start training according to the [Usage](./usage.md). The default 7B model starts the single-machine with 8-GPU training command example as follows:
+```bash
+torchrun --nproc_per_node=8 --nnodes=1 train.py --config configs/7B_sft.py --launcher torch
+```
 
 ## Environment Installation (NPU)
 For machines with NPU, the version of the installation environment can refer to that of GPU. Use Ascend's torch_npu instead of torch on NPU machines. Additionally, Flash-Attention and Apex are no longer supported for installation on NPU. The corresponding functionalities have been internally implemented in the InternEvo codebase. The following tutorial is only for installing torch_npu.

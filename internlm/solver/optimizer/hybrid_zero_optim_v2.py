@@ -11,7 +11,6 @@ from internlm.core.context import Config, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.context.parallel_context import (
     IS_REPLICA_ZERO_PARALLEL,
-    IS_TENSOR_DATA_PARALLEL,
     IS_TENSOR_EXPERT_DATA_PARALLEL,
     IS_TENSOR_ZERO_PARALLEL,
     IS_WEIGHT_ZERO_PARALLEL,
@@ -279,10 +278,6 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
         if hasattr(origin_param, IS_REPLICA_ZERO_PARALLEL):
             value = getattr(origin_param, IS_REPLICA_ZERO_PARALLEL)
             setattr(splited_param_current_rank, IS_REPLICA_ZERO_PARALLEL, value)
-
-        if hasattr(origin_param, IS_TENSOR_DATA_PARALLEL):
-            value = getattr(origin_param, IS_TENSOR_DATA_PARALLEL)
-            setattr(splited_param_current_rank, IS_TENSOR_DATA_PARALLEL, value)
 
         if hasattr(origin_param, IS_TENSOR_EXPERT_DATA_PARALLEL):
             value = getattr(origin_param, IS_TENSOR_EXPERT_DATA_PARALLEL)

@@ -60,6 +60,9 @@ class ParallelMode(Enum):
     # sequence parallel
     SEQUENCE = "sequence"
 
+    # real data parallel for isp
+    ISP_DATA = "isp_data"
+
     # grouped query attention
     GQA = "gqa"
 
@@ -850,6 +853,66 @@ class Initializer_Weight_Data(ProcessGroupInitializer):
                     process_group = group
                     cpu_group = group_cpu
                     ranks_in_group = ranks
+
+        return local_rank, group_world_size, process_group, cpu_group, ranks_in_group, mode
+
+
+class Initializer_ISP_Data(ProcessGroupInitializer):
+    """A ProcessGroupInitializer for real data parallel group in isp.
+
+    Args:
+        rank (int): The rank of current process.
+        world_size (int): Size of whole communication world.
+        weight_parallel_size (int): Size of model weight parallel.
+        weight_data_parallel_size (int): Size of data parallel for common weight.
+        sequence_parallel_size (int): Size of data sequence parallel.
+        data_parallel_size (int): Size of data parallel.
+        pipeline_parallel_size (int): Size of pipeline parallel.
+        tensor_parallel_size (int): Size of tensor parallel.
+        zero1_parallel_size (int): Size of zero1 parallel.
+        nettest_parallel_size (int): Size of net testing parallel.
+        expert_parallel_size (int): Size of expert parallel.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.isp_data_parallel_size = self.tensor_parallel_size * self.data_parallel_size
+        self.num_isp_data_parallel_group = self.world_size // self.isp_data_parallel_size
+
+        assert self.world_size % self.isp_data_parallel_size == 0
+
+    def init_dist_group(self, use_cpu: bool = False):
+        """Initialize real data parallel groups for isp, and assign local_ranks and groups to each gpu.
+
+        Returns:
+            Tuple (local_rank, group_world_size, process_group, ranks_in_group, mode):
+                A real data parallelism's information tuple.
+        """
+        local_rank = None
+        ranks_in_group = None
+        process_group = None
+        cpu_group = None
+        group_world_size = None
+        mode = ParallelMode.ISP_DATA
+
+        for i in range(self.num_isp_data_parallel_group):
+            ranks = [i * self.isp_data_parallel_size + j for j in range(self.isp_data_parallel_size)]
+            group = dist.new_group(ranks, timeout=LLM_NCCL_TIMEOUT)
+            if use_cpu:
+                group_cpu = (
+                    dist.new_group(ranks, backend="gloo", timeout=LLM_NCCL_TIMEOUT)
+                    if dist.get_backend() != "gloo"
+                    else group
+                )
+            else:
+                group_cpu = None
+
+            if self.rank in ranks:
+                local_rank = ranks.index(self.rank)
+                group_world_size = len(ranks)
+                process_group = group
+                cpu_group = group_cpu
+                ranks_in_group = ranks
 
         return local_rank, group_world_size, process_group, cpu_group, ranks_in_group, mode
 
