@@ -134,7 +134,6 @@ class WeightGradStore:
         grad_weight, grad_bias = grad_compute_func(input_tensor, grad_output, has_d_bias)
         if is_using_isp():
             isp_grad_hook = args[0]
-            grad_weight, grad_bias = grad_compute_func(input_tensor, grad_output, has_d_bias)
             grad_weight, _ = isp_grad_hook(grad_weight, async_op=False, is_bias=False)
             if grad_bias is not None:
                 grad_bias, _ = isp_grad_hook(grad_bias, async_op=False, is_bias=True)
