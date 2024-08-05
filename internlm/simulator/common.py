@@ -6,8 +6,7 @@ import torch.distributed as dist
 from torch.distributed import GroupMember
 
 
-# TODO: 这里需要增加一个broadcast
-class CommOp:
+class CostType:
     ALL2ALL = "all2all"
     ALLREDUCE = "all_reduce"
     REDUCESCATTER = "reduce_scatter"
@@ -32,8 +31,11 @@ class BW:
     A100_NVL = 250 * 1024**3  # 满速是 300 GB/s
 
 
-BENCH_TYPE_LIST = [CommOp.ALL2ALL, CommOp.ALLREDUCE, CommOp.REDUCESCATTER, CommOp.ALLGATHER, CommOp.LINEAR]
-# BENCH_TYPE_LIST = [CommOp.ALL2ALL, CommOp.ALLREDUCE, CommOp.REDUCESCATTER, CommOp.ALLGATHER, CommOp.LINEAR]
+BENCH_TYPE_LIST = [CostType.ALL2ALL, CostType.ALLREDUCE, CostType.REDUCESCATTER, CostType.ALLGATHER, CostType.LINEAR]
+# BENCH_TYPE_LIST = [CostType.ALL2ALL, CostType.ALLREDUCE, CostType.REDUCESCATTER, CostType.ALLGATHER, CostType.LINEAR]
+
+
+POSITIVE_INFINITY = 1e12
 
 K = 1024
 
@@ -47,7 +49,8 @@ US = 1000 * MS
 _75GB = 75 * GB
 _100GB = 100 * GB
 
-GLOBAL_BYTE_SIZES_LIST = [512 * KB, 1 * MB, 4 * MB, 64 * MB, 128 * MB, 256 * MB, 512 * MB, 1 * GB, 2 * GB, 4 * GB]
+GLOBAL_BYTE_SIZES_LIST = [1 * KB, 512 * KB, 1 * MB, 4 * MB, 32 * MB, 64 * MB, 128 * MB, 256 * MB, 512 * MB, 1 * GB]
+# GLOBAL_BYTE_SIZES_LIST = [64 * MB, 128 * MB]
 # GLOBAL_BYTE_SIZES_LIST = [512 * KB, 1 * MB, 4 * MB] # , 64 * MB, 128 * MB, 256 * MB]
 GLOBAL_ELEM_SIZES_LIST = [dsize // 2 for dsize in GLOBAL_BYTE_SIZES_LIST]
 WORLD_SIZE_LIST = [2, 4, 8, 16, 32, 64, 128]
@@ -56,21 +59,29 @@ TP_SIZE_RANGE = [1] + list(range(2, 80 + 1, 2))
 OUT_OF_MEM_LATENCY = 10**9
 
 
-def cal_block_p_elem(h, multiple_of, mlp_ratio):
+def cal_block_p_elem(h, q_head, kv_head, multiple_of, mlp_ratio):
     norm1_p_elem = h
     norm2_p_elem = h
-    MHA = h * 3 * h
+
+    Wq = h * h
+    Wkv = 2 * h * (h * kv_head // q_head)
+
     out_proj = h * h
     mlp_hidden_features = multiple_of * ((int(h * mlp_ratio) + multiple_of - 1) // multiple_of)
     mlp_p_elem = (h * mlp_hidden_features) * 3
     dropout1 = 0
     dropout2 = 0
-    return norm1_p_elem + norm2_p_elem + MHA + out_proj + mlp_p_elem + dropout1 + dropout2
+
+    # 简化公式:
+    # 2 * h + 2* h * h + 2 * h * (h * kv_head // q_head) + (h * H_MLP) * 3
+    # H * (2 + 2 * H  + 2 * H * KV_head // Q_head + H_MLP * 3)
+
+    return norm1_p_elem + norm2_p_elem + Wq + Wkv + out_proj + mlp_p_elem + dropout1 + dropout2
 
 
-def cal_model_p_elem(h, l, vocab_size, multiple_of, mlp_ratio):
+def cal_model_p_elem(h, q_head, kv_head, l, vocab_size, mlp_ratio, multiple_of=256):
     embedding_p_elem = vocab_size * h
-    block_p_elem = l * cal_block_p_elem(h, multiple_of, mlp_ratio)
+    block_p_elem = l * cal_block_p_elem(h, q_head, kv_head, multiple_of, mlp_ratio)
     norm_p_elem = h
     head_p_elem = vocab_size * h
     return embedding_p_elem + block_p_elem + norm_p_elem + head_p_elem
@@ -147,10 +158,14 @@ def get_world_size():
         return 1
 
 
-def sync_all():
-    torch.cuda.synchronize()
+def sync_all(group=None):
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group)
+    torch.cuda.synchronize()
+
+
+def sync_local():
+    torch.cuda.synchronize()
 
 
 def get_bw(comm_op, size, duration, args):

@@ -127,7 +127,7 @@ class TensorParallelCommunicator(TPCommunicator):
         """
         all reduce grad_input only for column parallel linear when backward.
         """
-        if dist.get_world_size(self._process_group) <= 1 or self._role == LinearRole.ROW:
+        if gpc.get_group_size(self._process_group) <= 1 or self._role == LinearRole.ROW:
             return grad_input, DUMMY_HANDLE_CONST
 
         return all_reduce_raw(grad_input, process_group=self._process_group, async_op=async_op)
@@ -136,7 +136,7 @@ class TensorParallelCommunicator(TPCommunicator):
         """
         all reduce output only for row parallel linear when forward.
         """
-        if dist.get_world_size(self._process_group) <= 1 or self._role == LinearRole.COLUMN:
+        if gpc.get_group_size(self._process_group) <= 1 or self._role == LinearRole.COLUMN:
             return output, DUMMY_HANDLE_CONST
 
         return all_reduce_raw(output, process_group=self._process_group, async_op=async_op)
@@ -173,7 +173,7 @@ class SequenceParallelCommunicator(TPCommunicator):
         # 2. row parallel linear should not allgather input.
         # 3. column parallel linear should not allgather input if save_total_input_as_activation and backward is True.
         if (
-            dist.get_world_size(self._process_group) <= 1
+            gpc.get_group_size(self._process_group) <= 1
             or self._role == LinearRole.ROW
             or (is_forward is False and self._save_total_input)
         ):
@@ -187,7 +187,7 @@ class SequenceParallelCommunicator(TPCommunicator):
         """
         all gather grad_output only for row parallel linear when backward.
         """
-        if dist.get_world_size(self._process_group) <= 1 or self._role == LinearRole.COLUMN:
+        if gpc.get_group_size(self._process_group) <= 1 or self._role == LinearRole.COLUMN:
             return grad_output, DUMMY_HANDLE_CONST
 
         return all_gather_raw(grad_output, process_group=self._process_group, async_op=async_op, gather_dim=_GATHER_DIM)
@@ -196,7 +196,7 @@ class SequenceParallelCommunicator(TPCommunicator):
         """
         reduce scatter grad_input only for column parallel linear when backward.
         """
-        if dist.get_world_size(self._process_group) <= 1 or self._role == LinearRole.ROW:
+        if gpc.get_group_size(self._process_group) <= 1 or self._role == LinearRole.ROW:
             return grad_input, DUMMY_HANDLE_CONST
 
         return reduce_scatter_raw(
@@ -207,7 +207,7 @@ class SequenceParallelCommunicator(TPCommunicator):
         """
         reduce scatter output only for row parallel linear when forward.
         """
-        if dist.get_world_size(self._process_group) <= 1 or self._role == LinearRole.COLUMN:
+        if gpc.get_group_size(self._process_group) <= 1 or self._role == LinearRole.COLUMN:
             return output, DUMMY_HANDLE_CONST
 
         return reduce_scatter_raw(output, process_group=self._process_group, async_op=async_op, reduce_dim=_REDUCE_DIM)
@@ -230,7 +230,7 @@ class HeadTensorParallelCommunicator(TensorParallelCommunicator):
         """
         split grad_output if retain_out_sharded is False.
         """
-        if self._retain_out_sharded or dist.get_world_size(self._process_group) <= 1:
+        if self._retain_out_sharded or gpc.get_group_size(self._process_group) <= 1:
             return grad_output, DUMMY_HANDLE_CONST
 
         return _split(grad_output, parallel_mode=self._parallel_mode, dim=-1)
@@ -241,7 +241,7 @@ class HeadTensorParallelCommunicator(TensorParallelCommunicator):
         """
         all gather output for head layer if retain_out_sharded is False.
         """
-        if self._retain_out_sharded or dist.get_world_size(self._process_group) <= 1:
+        if self._retain_out_sharded or gpc.get_group_size(self._process_group) <= 1:
             return output, DUMMY_HANDLE_CONST
 
         return _gather(output, parallel_mode=self._parallel_mode, dim=-1)
@@ -271,7 +271,7 @@ class HeadSequenceParallelCommunicator(SequenceParallelCommunicator):
         """
         split grad_output if retain_out_sharded is False.
         """
-        if self._retain_out_sharded or dist.get_world_size(self._process_group) <= 1:
+        if self._retain_out_sharded or gpc.get_group_size(self._process_group) <= 1:
             return grad_output, DUMMY_HANDLE_CONST
 
         return _split(grad_output, parallel_mode=self._parallel_mode, dim=-1)
@@ -283,7 +283,7 @@ class HeadSequenceParallelCommunicator(SequenceParallelCommunicator):
         """
         all gather output for head layer if retain_out_sharded is False.
         """
-        if self._retain_out_sharded or dist.get_world_size(self._process_group) <= 1:
+        if self._retain_out_sharded or gpc.get_group_size(self._process_group) <= 1:
             return output, DUMMY_HANDLE_CONST
 
         return _gather(output, parallel_mode=self._parallel_mode, dim=-1)

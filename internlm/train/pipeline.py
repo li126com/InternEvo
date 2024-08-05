@@ -2,6 +2,7 @@
 # -*- encoding: utf-8 -*-
 
 import math
+import os
 import time
 from typing import Callable, Iterable, List, Optional, Tuple, TypeVar, Union
 
@@ -461,6 +462,8 @@ def initialize_llm_profile(profiling: bool = False, start_time: str = None):
             f"wp{gpc.get_local_rank(ParallelMode.WEIGHT)}_"
             f"tp{gpc.get_local_rank(ParallelMode.TENSOR)}"
         )
+        os.makedirs(trace_path, exist_ok=True)
+
         if internlm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,

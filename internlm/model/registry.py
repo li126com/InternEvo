@@ -6,7 +6,8 @@ from typing import Callable
 from internlm.model.modeling_internlm import InternLM1
 from internlm.model.modeling_internlm2 import InternLM2
 from internlm.model.modeling_llama import Llama2
-from internlm.model.modeling_llava import Llava
+
+# from internlm.model.modeling_llava import Llava
 from internlm.model.modeling_moe import Internlm1MoE
 
 
@@ -37,7 +38,7 @@ class Registry:
             AssertionError: Raises an AssertionError if the module has already been registered before.
         """
 
-        assert module_name not in self._registry, f"{module_name} already registered in {self.name}"
+        # assert module_name not in self._registry, f"{module_name} already registered in {self.name}"
 
         self._registry[module_name] = func
 
@@ -73,6 +74,7 @@ class Registry:
 
 
 model_initializer = Registry("model_initializer")
+benchmark_initializer = Registry("benchmark_initializer")
 
 
 def register_model_initializer() -> None:
@@ -80,4 +82,4 @@ def register_model_initializer() -> None:
     model_initializer.register_module("INTERNLM2_PUBLIC", InternLM2)
     model_initializer.register_module("LLAMA2", Llama2)
     model_initializer.register_module("INTERNLM_MoE", Internlm1MoE)
-    model_initializer.register_module("LLAVA", Llava)
+    # model_initializer.register_module("LLAVA", Llava)

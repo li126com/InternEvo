@@ -343,6 +343,12 @@ class ParallelLinearWithCommExt(nn.Linear):
         else:
             super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
 
+        from internlm.simulator.tracker.module_tracker import ModuleTracker
+
+        self.module_tracker = ModuleTracker(self._get_name())
+        self.register_forward_pre_hook(self.module_tracker.fwd_pre_hook, with_kwargs=True)
+        self.register_full_backward_hook(self.module_tracker.bwd_pre_hook)
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0622
         _class_name = self.__class__.__name__
         assert self._communicator is not None, f"{_class_name} should register with a communicator first."

@@ -1,13 +1,18 @@
 # adopted from https://github.com/NVIDIA/apex/blob/master/apex/normalization/fused_layer_norm
 
 import numbers
+import os
 
 import torch
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
 from internlm.accelerator import AcceleratorType, get_accelerator
+from internlm.utils.common import get_current_device
 from internlm.utils.logger import get_logger
+
+fake_mode = "fake_mode" in os.environ
+
 
 logger = get_logger(__file__)
 internlm_accelerator = get_accelerator()
@@ -54,11 +59,11 @@ class _RMSNorm(torch.nn.Module):
             normalized_shape = (normalized_shape,)
         self.normalized_shape = torch.Size(normalized_shape)
         self.eps = eps
-        self.weight = Parameter(torch.empty(*normalized_shape))
+        self.weight = Parameter(torch.empty(*normalized_shape, device=get_current_device()))
         self.reset_parameters()
 
     def forward(self, _input: torch.Tensor):
-        if apex_rmsnorm_impl:
+        if apex_rmsnorm_impl and not fake_mode:
             _norm_func = mixed_dtype_fused_rms_norm_affine
         else:
             _norm_func = manual_rms_norm
@@ -73,8 +78,12 @@ class _RMSNorm(torch.nn.Module):
 
 
 # TODO: Support deeplink in a more unified manner
-RMSNorm = (
-    MixedFusedRMSNorm
-    if internlm_accelerator.get_accelerator_backend() == AcceleratorType.DIPU and deeplink_rmsnorm_impl
-    else _RMSNorm
-)
+
+if fake_mode:
+    RMSNorm = _RMSNorm
+else:
+    RMSNorm = (
+        MixedFusedRMSNorm
+        if internlm_accelerator.get_accelerator_backend() == AcceleratorType.DIPU and deeplink_rmsnorm_impl
+        else _RMSNorm
+    )

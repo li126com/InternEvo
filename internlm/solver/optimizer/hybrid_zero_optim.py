@@ -6,6 +6,7 @@ from functools import partial
 from itertools import product
 from typing import List, Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
@@ -50,6 +51,14 @@ from .utils import compute_norm
 inf = math.inf
 logger = get_logger(__file__)
 internlm_accelerator = get_accelerator()
+
+import os
+
+from internlm.simulator.tracker.comm_tracker import CommType, get_gloabl_comm_tracker
+
+fake_mode = "fake_mode" in os.environ
+
+comm_tracker = get_gloabl_comm_tracker()
 
 
 class HybridZeroOptimizer(BaseOptimizer):
@@ -234,6 +243,9 @@ class HybridZeroOptimizer(BaseOptimizer):
         self.has_params = sum(self.param_group_has_params) != 0
         # flag used to skip unnecessary gradient reduce operation when gradient accumulation is enabled.
         self.skip_grad_reduce = False
+        self.current_accum_step = 0
+
+        self._unbalance_micro_num = True
 
         self._attach_reduction_hook()
 
@@ -318,11 +330,10 @@ class HybridZeroOptimizer(BaseOptimizer):
                     )
 
                     def reduction_layernorm_func():
+                        parallel_mode = ParallelMode.WEIGHT if self.use_isp else ParallelMode.TENSOR
+                        comm_tracker.add_comm_meta(CommType.SP_NORM_ALLREDUCE, parallel_mode, can_overlap=True)
                         handle = reduce_tensor(
-                            param.grad,
-                            dtype=None,
-                            dst_rank=reduce_rank,
-                            parallel_mode=ParallelMode.WEIGHT if self.use_isp else ParallelMode.TENSOR,
+                            param.grad, dtype=None, dst_rank=reduce_rank, parallel_mode=parallel_mode
                         )
                         handle.wait()
 
@@ -341,6 +352,16 @@ class HybridZeroOptimizer(BaseOptimizer):
                     def extra_layernorm_reduce_grad_hook(*args):  # pylint: disable=W0613
                         if self.skip_grad_reduce is False:
                             reduction_layernorm_func()
+
+                    # define hook for sequence_parallel
+                    def unbalance_micro_num_loss_scale_hook(grad):  # pylint: disable=W0613
+                        if self.skip_grad_reduce is True:  # 只在梯度累加的时候生效
+                            left_step = np.max(gpc.micro_num_list) - self.current_accum_step
+                            scale_denominator = np.sum(left_step >= gpc.micro_num_list)
+                            scale = gpc.get_world_size(ParallelMode.DATA) / scale_denominator
+
+                            return grad * scale
+                        return grad
 
                     # get the AccumulateGrad object of the param itself
                     # If these objects are not kept, reduction hooks may not be attached successfully.
@@ -365,6 +386,10 @@ class HybridZeroOptimizer(BaseOptimizer):
                         and gpc.config.parallel.weight.size > 1
                     ):
                         accum_grad_obj.register_hook(accum_grad_hook)
+
+                    if self._unbalance_micro_num:
+                        # 注意这个hook必须要在梯度累加之前被调用，所以不能采用在 accum_grad_obj 上注册hook，而是需要直接注册在param上
+                        param.register_hook(unbalance_micro_num_loss_scale_hook)
 
                     if self._overlap_sync_grad:
                         accum_grad_obj.register_hook(reduce_grad_hook)
@@ -439,6 +464,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         current_bucket = self._bucket_store[group_id]
 
         if current_bucket.num_elements_in_bucket(reduce_rank) + param_size > self._reduce_bucket_size:
+            comm_tracker.add_comm_meta(CommType.DP_ALLREDUCE, current_bucket.get_dp_parallel_mode(), can_overlap=True)
             self._reduce_grads_stored_in_bucket(current_bucket, reduce_rank)
 
         # the param must not be reduced to ensure correctness
@@ -672,7 +698,9 @@ class HybridZeroOptimizer(BaseOptimizer):
 
         # we need to reduce the gradients left in the communication bucket
         for group_id in range(self.num_param_groups):
-            self._reduce_grads_stored_in_bucket(self._bucket_store[group_id], reduce_rank=None)
+            current_bucket = self._bucket_store[group_id]
+            comm_tracker.add_comm_meta(CommType.DP_ALLREDUCE, current_bucket.get_dp_parallel_mode(), can_overlap=False)
+            self._reduce_grads_stored_in_bucket(current_bucket, reduce_rank=None)
 
         # wait grads reduced and clear reduced grads
         for bucket in self._bucket_in_progress:

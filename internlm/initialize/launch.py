@@ -12,7 +12,7 @@ import torch
 from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import Config
 from internlm.core.context import global_context as gpc
-from internlm.core.context.process_group_initializer import ParallelMode
+from internlm.core.context.process_group_initializer_simplified import ParallelMode
 from internlm.utils.common import get_master_node
 from internlm.utils.gputest import warmup_process_group
 from internlm.utils.logger import get_logger
@@ -32,7 +32,10 @@ logger = get_logger(__file__)
 internlm_accelerator = get_accelerator()
 
 
-def get_default_parser():
+_INTERNEVO_PARSER = None
+
+
+def add_default_arguments():
     """Reads user command line and uses an argument parser to parse the input arguments.
     Input arguments include configuration, host, port, world size, local rank, backend for torch.distributed.
 
@@ -40,7 +43,7 @@ def get_default_parser():
        Parser: Returns the parser with the default arguments, the user may add customized arguments into this parser.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, help="path to the config file")
+    parser.add_argument("--config", type=str, default="", help="path to the config file")
     parser.add_argument(
         "--launcher",
         type=str,
@@ -60,10 +63,44 @@ def get_default_parser():
     parser.add_argument(
         "--disable_volc_topology", default=False, action="store_true", help="disable volc switch topology."
     )
+    parser.add_argument("--fake_mode", default=False, action="store_true", help="Simulation run.")
+
     return parser
 
 
-def args_sanity_check():
+def add_simulator_arguments(parser):
+    group = parser.add_argument_group(title="simulator")
+    group.add_argument("--model_size", type=int, default=7, help="model parameters.")
+    group.add_argument(
+        "--draw_heatmap", default=False, action="store_true", help="wheater to draw model communication heatmap."
+    )
+    group.add_argument("--draw_heatmap_path", type=str, default="./comm_matrix")
+    group.add_argument(
+        "--run_all_solu",
+        action="store_true",
+        default=False,
+        help="Whether to perform a full solution. \
+If not, it will only calculate the estimated TGS based on the parallel configuration provided in the config.",
+    )
+    group.add_argument("--global_batch_size", type=int, default=4 * 1024**2, help="Global batch size limitation.")
+    group.add_argument(
+        "--pre_profiling_data_path", type=str, help="The path to pre-profiled performance data on the target cluster."
+    )
+    group.add_argument("--use_simplified_gp_init", action="store_true", default=False)
+    return parser
+
+
+def get_default_parser():
+    global _INTERNEVO_PARSER
+    if _INTERNEVO_PARSER is None:
+        _INTERNEVO_PARSER = add_default_arguments()
+
+        _INTERNEVO_PARSER = add_simulator_arguments(_INTERNEVO_PARSER)
+
+    return _INTERNEVO_PARSER
+
+
+def args_sanity_check(verbose=False):
     assert gpc.config is not None, "config is not load!"
 
     if "JOB_NAME" not in gpc.config:
@@ -114,7 +151,7 @@ def args_sanity_check():
     assert data.seq_len is not None, "'seq_len' must be given a value"
     assert data.micro_bsz is not None, "'micro_bsz' must be given a value"
 
-    if "packed_length" in data and gpc.is_rank_for_log():
+    if "packed_length" in data and gpc.is_rank_for_log() and verbose:
         logger.warning("packed_length would be ignored and will be setted as seq_len * micro_bsz.")
 
     data._add_item("packed_length", data.seq_len * data.micro_bsz)
@@ -127,7 +164,7 @@ def args_sanity_check():
 
     if "gradient_accumulation" not in data:
         data._add_item("gradient_accumulation", data.micro_num)
-        if gpc.is_rank_for_log():
+        if gpc.is_rank_for_log() and verbose:
             logger.info(f"gradient_accumulation size will be setted to {data.micro_num}.")
     else:
         if pp == 1:
@@ -167,7 +204,7 @@ def args_sanity_check():
     if "fixed_random_dataset_seqlen" not in data:
         data._add_item("fixed_random_dataset_seqlen", True)
 
-    if gpc.is_rank_for_log():
+    if gpc.is_rank_for_log() and verbose:
         logger.info("+" * 15 + " Data Info " + "+" * 15)  # pylint: disable=W1201
         logger.info(f"seq_len: {data.seq_len}")
         logger.info(f"micro_num: {data.micro_num}")
@@ -197,7 +234,7 @@ def args_sanity_check():
                 assert "save_ckpt_folder" in ckpt
                 prefix_list = ["boto3:", "volc:", "oss2:"]
                 if not any(ckpt.save_ckpt_folder.startswith(prefix) for prefix in prefix_list):
-                    if gpc.is_rank_for_log():
+                    if gpc.is_rank_for_log() and verbose:
                         logger.warning(
                             "Storing ckpt on file system does not support asynchronous storage, will use sync save!"
                         )
@@ -230,7 +267,7 @@ def args_sanity_check():
         # to auto-load latest checkpoint.
         ckpt._add_item("auto_resume", True)
 
-    if gpc.is_rank_for_log():
+    if gpc.is_rank_for_log() and verbose:
         logger.info("+" * 15 + " Ckpt Info " + "+" * 15)  # pylint: disable=W1201
         logger.info(f"is enable save ckpt: {ckpt.enable_save_ckpt}")
         logger.info(f"save_ckpt_folder: {ckpt.save_ckpt_folder}")
@@ -248,7 +285,7 @@ def args_sanity_check():
             "resume_tb_folder", os.environ["resume_tb_folder"] if "resume_tb_folder" in os.environ else None
         )
 
-    if gpc.is_rank_for_log():
+    if gpc.is_rank_for_log() and verbose:
         logger.info(f"tensorboard_folder: {gpc.config.tensorboard_folder}")
         logger.info(f"resume_tb_folder: {gpc.config.resume_tb_folder}")
 
@@ -257,7 +294,7 @@ def args_sanity_check():
     torch.backends.cudnn.deterministic = gpc.config.get("cudnn_deterministic", False)
     clip_grad_norm = gpc.config.hybrid_zero_optimizer.get("clip_grad_norm", 0.0)
 
-    if gpc.is_rank_for_log():
+    if gpc.is_rank_for_log() and verbose:
         logger.info("+" * 15 + " Other Info " + "+" * 15)  # pylint: disable=W1201
         logger.info(f"cudnn.benchmark: {torch.backends.cudnn.benchmark }")
         logger.info(f"cudnn.deterministic: {torch.backends.cudnn.deterministic }")
@@ -279,13 +316,14 @@ def args_sanity_check():
             torch.backends.cuda.matmul.allow_tf32 = True
             gpc.config.model.dtype = torch.float32
         else:
-            assert gpc.config.model.dtype in [
-                "torch.float16",
-                "torch.half",
-                "torch.bfloat16",
-                "torch.float32",
-                "torch.tf32",
-            ]
+            if isinstance(gpc.config.model.dtype, str):
+                assert gpc.config.model.dtype in [
+                    "torch.float16",
+                    "torch.half",
+                    "torch.bfloat16",
+                    "torch.float32",
+                    "torch.tf32",
+                ]
 
     if "checkpoint" in model:
         if model.checkpoint is True:
@@ -297,7 +335,7 @@ def args_sanity_check():
                 model.checkpoint >= 0 and model.checkpoint <= 1
             ), f'model.checkpoint: "{model.checkpoint}" should >=0 and <=1'
 
-    if gpc.is_rank_for_log():
+    if gpc.is_rank_for_log() and verbose:
         logger.info("+" * 15 + " Model Info " + "+" * 15)  # pylint: disable=W1201
         logger.info(f"Model: {gpc.config.model}")
 
@@ -321,7 +359,7 @@ def args_sanity_check():
     # Try to change user setting
     if internlm_accelerator.get_accelerator_backend() is not AcceleratorType.GPU:
         gpc.config.model.update({"parallel_output": False})
-        if old_parallel_output is True and gpc.is_rank_for_log():
+        if old_parallel_output is True and gpc.is_rank_for_log() and verbose:
             logger.warning(
                 "'parallel_output' is converted from 'True' to 'False'."
                 "Because 'parallel_output' only support by FlashCrossEntropyLoss."
@@ -426,7 +464,7 @@ def args_sanity_check():
 
     alert = gpc.config.monitor.alert
 
-    if alert.enable_feishu_alert and not alert.feishu_alert_address and gpc.is_rank_for_log():
+    if alert.enable_feishu_alert and not alert.feishu_alert_address and gpc.is_rank_for_log() and verbose:
         logger.warning("alert is enable but alert_address is not set")
 
     optim_ckpt = gpc.config.hybrid_zero_optimizer
@@ -437,7 +475,7 @@ def args_sanity_check():
         optim_ckpt._add_item("overlap_sync_grad", False)
     if "overlap_sync_param" not in optim_ckpt:
         optim_ckpt._add_item("overlap_sync_param", False)
-    if gpc.is_rank_for_log():
+    if gpc.is_rank_for_log() and verbose:
         logger.info(
             f"overlap_sync_grad:{optim_ckpt.overlap_sync_grad}, overlap_sync_param:{optim_ckpt.overlap_sync_param}"
         )
@@ -469,6 +507,7 @@ def launch(
     backend: str = "nccl",
     local_rank: int = None,
     seed: int = 1024,
+    fake_mode: bool = False,
 ):
     """This function first parses the configuration arguments, using :func:`parse_args()` in case one of the input
     arguments are not given. Then initialize and set distributed environment by calling global_context's functions.
@@ -500,15 +539,18 @@ def launch(
     gpc.load_config(config)
 
     # init default process group
-    gpc.init_global_dist(rank, world_size, backend, host, port)
+    gpc.init_global_dist(rank, world_size, backend, host, port, fake_mode=fake_mode)
 
     # init process groups for different parallel modes from config
-    gpc.init_parallel_groups()
+    gpc.init_parallel_groups(fake_mode)
 
     # set cuda device
     if internlm_accelerator.is_available():
         # if local rank is not given, calculate automatically
         gpc.set_device(local_rank)
+
+    if fake_mode:
+        return
 
     gpc.set_seed(seed)
 

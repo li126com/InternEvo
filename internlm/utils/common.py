@@ -21,6 +21,15 @@ CURRENT_TIME = None
 logger = get_logger(__file__)
 internlm_accelerator = get_accelerator()
 
+_INTERNEVO_ARGS = None
+
+
+def get_args():
+    global _INTERNEVO_ARGS
+    if _INTERNEVO_ARGS is None:
+        _INTERNEVO_ARGS = parse_args()
+    return _INTERNEVO_ARGS
+
 
 def parse_args():
     parser = internlm.get_default_parser()

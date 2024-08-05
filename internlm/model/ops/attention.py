@@ -7,6 +7,7 @@ This file implements support for the attention operators.
 """
 
 import math
+import os
 from typing import Callable, Tuple
 
 import torch
@@ -65,6 +66,11 @@ try:
     gpu_flash_attn_impl = True
 except (ModuleNotFoundError, ImportError):
     gpu_flash_attn_impl = False
+
+# from internlm.simulator.ops.attention import FakeFlashAttention
+
+fake_mode = "fake_mode" in os.environ
+
 
 internlm_accelerator = get_accelerator()
 device_backend = internlm_accelerator.get_accelerator_backend()
@@ -127,10 +133,15 @@ def _flash_varlen_kvpacked_attn(
     # compatible data format: [1, packelen, 3, n_head, headim]
     q, kv = q.squeeze(dim=0), kv.squeeze(dim=0)
 
+    # if fake_mode:
+    #     fa_func = FakeFlashAttention.apply
+    # else:
+    fa_func = _flash_varlen_kvpacked_func
+
     # input_idxs: 0: q, 1: kv
     output = _flash_float32_compatibility_wrapper(
         (0, 1),
-        _flash_varlen_kvpacked_func,
+        fa_func,
         q,
         kv,
         cu_seqlens_q,
@@ -167,10 +178,15 @@ def _flash_varlen_qkvsplited_attn(
     # compatible data format: [1, packelen, 3, n_head, headim]
     q, k, v = q.squeeze(dim=0), k.squeeze(dim=0), v.squeeze(dim=0)
 
+    # if fake_mode:
+    #     fa_func = FakeFlashAttention.apply
+    # else:
+    fa_func = _flash_varlen_qkvsplited_func
+
     # input_idxs: 0: q, 1: k, 2: v
     output = _flash_float32_compatibility_wrapper(
         (0, 1, 2),
-        _flash_varlen_qkvsplited_func,
+        fa_func,
         q,
         k,
         v,

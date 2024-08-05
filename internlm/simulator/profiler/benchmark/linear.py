@@ -1,6 +1,8 @@
 import torch
+
 from internlm.model.registry import benchmark_initializer
 from internlm.simulator.common import *
+from internlm.utils.common import get_current_device
 
 from .base_benchmark import UnitBench
 
@@ -26,15 +28,12 @@ class UnitBenchLinear(UnitBench):
         ],  # 7B, (13B, 20B), 30B, 65B, 123B
         "bias": [False],  # it is not work!! False,
         "dtype": [torch.bfloat16],
-        "world_size": [1],
     }
 
     def __init__(self, seq_len, hidden_dim, bias, dtype) -> None:
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
-        self.q = torch.nn.Linear(
-            hidden_dim, hidden_dim, bias=bias, device=f"cuda:{get_local_rank()}", dtype=dtype
-        )  # (hidden_dim, hidden_dim)
+        self.q = torch.nn.Linear(hidden_dim, hidden_dim, bias=bias, device=get_current_device(), dtype=dtype)
         self.dtype = self.q.weight.element_size()
         self.x = torch.rand(1, seq_len, hidden_dim).to(self.q.weight)  # (bsz, seq_len, hidden_dim)
 

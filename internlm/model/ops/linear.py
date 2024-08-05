@@ -6,6 +6,7 @@ operator compatibility layer in the future.
 This file implements support for the linear layer operators.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -13,6 +14,10 @@ from torch.nn.functional import linear as _torch_linear_forward_op
 
 from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import global_context as gpc
+from internlm.simulator.ops.linear import (
+    _fake_linear_bwdward_op,
+    _fake_linear_forward_op,
+)
 
 try:
     from fused_dense_lib import linear_bias_wgrad as _flash_linear_backward_op
@@ -23,6 +28,8 @@ except (ModuleNotFoundError, ImportError):
 
 internlm_accelerator = get_accelerator()
 
+fake_mode = "fake_mode" in os.environ
+
 
 def _select_ops_binding(dtype: torch.dtype, is_cuda: bool = True) -> None:
     dtype_eligible = dtype in (torch.float16, torch.bfloat16) or (
@@ -32,10 +39,14 @@ def _select_ops_binding(dtype: torch.dtype, is_cuda: bool = True) -> None:
     is_gpu_backend = internlm_accelerator.get_accelerator_backend() is AcceleratorType.GPU
     flash_attn_eligible = flash_attn_impl and dtype_eligible and is_cuda
 
-    if use_flash_attn and is_gpu_backend and flash_attn_eligible:
-        return _torch_linear_forward_op, _flash_linear_backward_op
-    else:
+    if fake_mode:
+        # return _fake_linear_forward_op, _fake_linear_bwdward_op
         return _torch_linear_forward_op, _linear_bias_wgrad_torch
+    else:
+        if use_flash_attn and is_gpu_backend and flash_attn_eligible:
+            return _torch_linear_forward_op, _flash_linear_backward_op
+        else:
+            return _torch_linear_forward_op, _linear_bias_wgrad_torch
 
 
 def _linear_bias_wgrad_torch(_input: torch.Tensor, grad_output: torch.Tensor, has_d_bias: bool):

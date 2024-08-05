@@ -14,10 +14,11 @@ import internlm
 from internlm.core.context import Config, ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.context.random import reset_seed
+from internlm.core.parallel.shard import cluster_load_balance
 from internlm.core.trainer import TrainState
 from internlm.initialize.launch import launch
 from internlm.model.losses import FlashGPTLMLoss
-from internlm.simulator.common import AlgoType, CommOp
+from internlm.simulator.common import AlgoType, CostType, cal_model_p_elem
 from internlm.simulator.tracker.comm_tracker import get_gloabl_comm_tracker
 from internlm.simulator.tracker.mem_tracker import get_global_allocator
 
@@ -52,7 +53,11 @@ class WaitHandler:
 
 def dummy_broadcast(tensor, src, group=None, async_op=False):
     global_comm_tracker.cal_comm_cost(
-        comm_op=CommOp.BROADCAST, comm_volume=tensor.numel() * tensor.element_size(), dtype=tensor.dtype
+        comm_op=CostType.BROADCAST,
+        group=group,
+        src=src,
+        comm_volume=tensor.numel() * tensor.element_size(),
+        dtype=tensor.dtype,
     )
     if async_op is True:
         return WaitHandler()
@@ -60,28 +65,43 @@ def dummy_broadcast(tensor, src, group=None, async_op=False):
 
 def dummy_allreduce(tensor, op, group=None, async_op=False):
     global_comm_tracker.cal_comm_cost(
-        comm_op=CommOp.ALLREDUCE, comm_volume=tensor.numel() * tensor.element_size(), dtype=tensor.dtype
+        comm_op=CostType.ALLREDUCE, group=group, comm_volume=tensor.numel() * tensor.element_size(), dtype=tensor.dtype
     )
     if async_op is True:
         return WaitHandler()
 
 
 def dummy_allgahter(tensor_list, tensor, group=None, async_op=False):
+    tensor = torch.concat(tensor_list).view(-1)
+
+    global_comm_tracker.cal_comm_cost(
+        comm_op=CostType.ALLGATHER, group=group, comm_volume=tensor.numel() * tensor.element_size(), dtype=tensor.dtype
+    )
     if async_op is True:
         return WaitHandler()
 
 
 def dummy_reduce_scatter(output, input_list, op, group=None, async_op=False):
-    if async_op is True:
-        return WaitHandler()
+    tensor = torch.concat(input_list).view(-1)
 
+    global_comm_tracker.cal_comm_cost(
+        comm_op=CostType.REDUCESCATTER,
+        group=group,
+        comm_volume=tensor.numel() * tensor.element_size(),
+        dtype=tensor.dtype,
+    )
 
-def dummy_reduce_scatter(output, input_list, op, group=None, async_op=False):
     if async_op is True:
         return WaitHandler()
 
 
 def dummy_all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False):
+    tensor = torch.concat(input_tensor_list).view(-1)
+
+    global_comm_tracker.cal_comm_cost(
+        comm_op=CostType.ALL2ALL, group=group, comm_volume=tensor.numel() * tensor.element_size(), dtype=tensor.dtype
+    )
+
     if async_op is True:
         return WaitHandler()
 
@@ -110,6 +130,55 @@ dist.reduce_scatter = dummy_reduce_scatter
 dist.all_to_all = dummy_all_to_all
 dist.batch_isend_irecv = dummy_batch_isend_irecv
 dist.barrier = dummy_barrier
+
+
+def cal_C(layer_nums=1, has_input_embeding=False, has_output_embeding=False, use_fp16=True):
+    """
+    Do the calculation of total flops required for a single one token under this parameter size,
+    without considering model parallelism other than PP. (TODO: support MoE?)
+    """
+    if use_fp16:
+        element_size = 2
+
+    fp32_element_size = 4
+
+    S, V, H = gpc.config.data.seq_len, gpc.config.model.vocab_size, gpc.config.model.hidden_size
+    mlp_ratio = gpc.config.MLP_RATIO
+
+    q_head_nums = gpc.config.model.num_attention_heads
+    kv_head_nums = gpc.config.model.num_kv_attention_heads
+
+    q_dim = H
+    kv_dim = (H // q_head_nums) * kv_head_nums
+
+    hidden_features = int(H * mlp_ratio)
+
+    EMBEDING, HEAD, LOSS = 0, 0, 0
+    if has_input_embeding:  # vocab, H
+        EMBEDING = element_size * V * H
+
+    if has_output_embeding:  # cross entropy
+        HEAD = element_size * V * H
+        LOSS = fp32_element_size * V * H  # fp32
+
+    QKV = element_size * H * (q_dim + 2 * kv_dim)
+
+    ATTN = 2 * 1 * S * kv_dim  # S * S * H  -> 1 * S * H
+
+    ATTN_OUT = 2 * (q_dim + 2 * kv_dim) * H
+
+    w1 = H * hidden_features
+    w3 = H * hidden_features
+    w2 = hidden_features * H
+
+    MLP = w1 + w2 + w3
+
+    # 2 * H * (H + 2 * H *  V_head // Q_head) + 2 * S * kv_dim + 3 * H * H_MLP
+    LAYER = QKV + ATTN + ATTN_OUT + MLP
+
+    LAYER_ALL = LAYER * layer_nums
+
+    return LAYER_ALL + EMBEDING + HEAD + LOSS
 
 
 def main(args):
@@ -170,7 +239,6 @@ def main(args):
         },
         torch.tensor(micro_num * [list(range(micro_bsz * S))], dtype=torch.int64),
     ]
-    print(batch)
     with initialize_llm_profile(profiling=True, start_time=launch_time()) as prof:
         for batch_count in range(train_state.batch_count, total_steps):
             s = time.time()
@@ -202,9 +270,6 @@ def main(args):
             trainer_result = trainer.step()
             print(f"ont step use time: {time.time() -s :.3f} s", flush=True)
             prof.step()
-            import pdb
-
-            pdb.set_trace()
 
 
 def run_loop(
@@ -245,7 +310,8 @@ def run_loop(
                     if debug:
                         print(
                             f"NO solu: pp:{pp} , sp:{sp} can't find micro_bsz/micro_num for"
-                            f"world_size:{world_size}, seq_len:{S}, global bsz range: [{global_bsz_min}-{global_bsz_max}]!",
+                            f"world_size:{world_size}, seq_len:{S}, global bsz range: \
+[{global_bsz_min}-{global_bsz_max}]!",
                             flush=True,
                         )
                     continue
@@ -260,11 +326,14 @@ def run_loop(
                                 if wp > 1:
                                     if debug:
                                         print("NO solu: msp, fsp not support wp>1 !", flush=True)
-                                    continue  # msp, fsp禁掉fsdp，我们目前还不支持
-                                # zp的搜索空间是被wp限制的，同时他不是按照8的倍数变化的，是,1,2,3, ...这样递增的
-                                zp_search_range = world_size // pp // sp // wp  # 这里的sp对于msp和fsp来说是tp
+                                    continue
+                                # Zp's search space is constrained by Wp, and it does not change in multiples of 8;
+                                # instead, it increments as 1, 2, 3, ..
+                                zp_search_range = world_size // pp // sp // wp  # Here, sp for msp and fsp is tp.
                             else:
-                                zp_search_range = world_size // pp // wp  # internlm实现的zp和deepspeed不一样，zp是在切wp的基础上再切的
+                                # The implementation of zp in InternEvo is different from DeepSpeed.
+                                # Zp is further partitioned on the basis of wp
+                                zp_search_range = world_size // pp // wp
 
                             try:
                                 assert H % sp == 0, f"embed_dim:{H} must be divisible by sp: {sp}"
@@ -278,9 +347,12 @@ def run_loop(
                             for zp_i, zp in enumerate(range(1, zp_search_range + 1)):
                                 # set config
                                 print(
-                                    f"activation_ckpt: {activation_ckpt}, micro_num: {micro_num}, micro_bsz: {micro_bsz}, pp: {pp}, wp: {wp}, zp: {zp}, sp: {sp}, {str(algo_type)}",
+                                    f"activation_ckpt: {activation_ckpt}, micro_num: {micro_num}, \
+micro_bsz: {micro_bsz}, pp: {pp}, wp: {wp}, zp: {zp}, sp: {sp}, {str(algo_type)}",
                                     flush=True,
                                 )
+
+                                gpc.destroy()
                                 gpc.config.model["checkpoint"] = activation_ckpt
                                 gpc.config.parallel["zero1"]["size"] = zp
                                 gpc.config.parallel["tensor"]["size"] = sp
@@ -291,7 +363,6 @@ def run_loop(
                                 gpc.config.data["micro_num"] = micro_num
                                 gpc.config.data["micro_bsz"] = micro_bsz
 
-                                gpc.destroy()
                                 reset_seed()
 
                                 launch(
@@ -303,7 +374,7 @@ def run_loop(
                                     port=12345,
                                     backend="nccl",
                                     seed=0,
-                                    fake_mode=fake_mode,
+                                    fake_mode=True,
                                 )
                                 args_sanity_check()
                                 assert hasattr(gpc, "config") and gpc.config is not None
@@ -312,17 +383,56 @@ def run_loop(
                                     main(args)
 
 
+def run_single(activation_ckpt=False, zp=1, sp=1, algo_type="fsp", pp=1, wp=1, global_bsz=4 * 1024 * 1024):
+    gpc.load_config(config=Config.from_file(args.config))
+    gpc.set_fake_mode(True)
+
+    gpc.config.model["checkpoint"] = activation_ckpt
+    gpc.config.parallel["zero1"]["size"] = zp
+    gpc.config.parallel["tensor"]["size"] = sp
+    gpc.config.parallel["tensor"]["mode"] = str(algo_type)
+    gpc.config.parallel["pipeline"]["size"] = pp
+    gpc.config.parallel["weight"]["size"] = wp
+
+    gpc.config.data["global_bsz"] = global_bsz
+    # gpc.config.data["micro_num"] = micro_num
+    gpc.config.data["micro_bsz"] = 1
+
+    gpc.destroy()
+    reset_seed()
+
+    launch(
+        config=gpc.config,
+        local_rank=0,
+        rank=0,
+        world_size=world_size,
+        host="127.0.0.1",
+        port=12345,
+        backend="nccl",
+        seed=0,
+        fake_mode=True,
+    )
+    args_sanity_check()
+    assert hasattr(gpc, "config") and gpc.config is not None
+
+    cluster_load_balance()
+
+    # with FakeTensorMode():
+    #     main(args)
+
+
 if __name__ == "__main__":
     args = parse_args()
     hostname = socket.gethostname()
     world_size = args.world_size
 
-    fake_mode = "fake_mode" in os.environ
-
+    # fake_mode = True    # "fake_mode" in os.environ
+    os.environ["fake_mode"] = "1"
     # initialize distributed environment
-    print(f"fake_mode: {fake_mode}", flush=True)
+    print(f"fake_mode !!", flush=True)
 
     gloab_allocator.init_capcity = 80 * 1024**3
     gloab_allocator.capcity = 80 * 1024**3
 
-    run_loop(global_bsz=4096 * 1024, world_size=world_size, args=args)
+    # run_loop(global_bsz=4096 * 1024, world_size=world_size, args=args)
+    run_single()

@@ -22,6 +22,7 @@ from internlm.model.utils import (
     convert_attn_args_to_kwargs,
     convert_attn_kwargs_to_args,
 )
+from internlm.simulator.tracker.module_tracker import ModuleTracker
 from internlm.solver.activation_checkpoint import activation_checkpoint
 from internlm.utils.logger import get_logger
 
@@ -118,6 +119,10 @@ class InternLM2Decoder(nn.Module):
         self.use_dynamic_ntk_rope = use_dynamic_ntk_rope
 
         head_dim = hidden_size // num_attention_heads
+        self.module_tracker = ModuleTracker(self._get_name())
+        self.register_forward_pre_hook(self.module_tracker.fwd_pre_hook, with_kwargs=True)
+        self.register_full_backward_hook(self.module_tracker.bwd_pre_hook)
+
         self.attention = GQA(
             embed_dim=hidden_size,
             num_heads=num_attention_heads,

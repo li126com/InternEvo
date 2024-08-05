@@ -523,7 +523,7 @@ class ISPCommunicator(WPCommunicator):
     def weight_hook(
         self, tensor: torch.Tensor, async_op: bool = False, module: nn.Module = None, is_bias: bool = False
     ) -> torch.Tensor:
-        if dist.get_world_size(self.process_group) <= 1:
+        if gpc.get_group_size(self.process_group) <= 1:
             return tensor
 
         if not self.overlap:
@@ -545,7 +545,7 @@ class ISPCommunicator(WPCommunicator):
         reduce_op: dist.ReduceOp = dist.ReduceOp.AVG,
         is_bias: bool = False,
     ) -> Tuple[torch.Tensor, AsyncCommHandle]:
-        if dist.get_world_size(self.process_group) <= 1:
+        if gpc.get_group_size(self.process_group) <= 1:
             return tensor, DUMMY_HANDLE_CONST
 
         if not self.overlap:
@@ -573,7 +573,7 @@ class ISPCommunicator(WPCommunicator):
             result, handle = (
                 self._get_constant_zero(
                     (
-                        tensor.shape[0] // dist.get_world_size(self.process_group),
+                        tensor.shape[0] // gpc.get_group_size(self.process_group),
                         *tensor.shape[1:],
                     )
                 ),
@@ -634,10 +634,10 @@ class _SeqAllToAll(torch.autograd.Function):
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
 
-        if dist.get_world_size(group) <= 1:
+        if gpc.get_group_size(group) <= 1:
             return input_
 
-        seq_world_size = dist.get_world_size(group)
+        seq_world_size = gpc.get_group_size(group)
 
         input_list = [t.contiguous() for t in torch.tensor_split(input_, seq_world_size, scatter_idx)]
         output_list = [torch.empty_like(input_list[0]) for _ in range(seq_world_size)]
@@ -647,7 +647,7 @@ class _SeqAllToAll(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None]:
-        if dist.get_world_size(ctx.group) <= 1:
+        if gpc.get_group_size(ctx.group) <= 1:
             return (None, *grad_output, None, None)
 
         return (None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None)

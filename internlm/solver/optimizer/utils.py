@@ -35,6 +35,9 @@ except (ModuleNotFoundError, ImportError):
     APEX_AVAILABLE = False
 
 inf = math.inf
+import os
+
+fake_mode = "fake_mode" in os.environ
 
 
 def flatten(input_):
@@ -189,7 +192,7 @@ def multi_tensor_l2norm_torch(tensor_list, per_tensor):
 def calc_l2_norm(grads):
     norm = 0.0
     if len(grads) > 0:
-        if APEX_AVAILABLE:
+        if APEX_AVAILABLE and not fake_mode:
             dummy_overflow_buf = torch.tensor([0], device=get_current_device(), dtype=torch.int32)
             norm, _ = multi_tensor_applier(
                 amp_C.multi_tensor_l2norm,
@@ -228,13 +231,13 @@ def reduce_grads(gradients, parameters, weight_parallel_mode):
         if (
             gpc.is_initialized(ParallelMode.PIPELINE)
             and hasattr(p, "pipeline_shared_module_pg")
-            and dist.get_rank(p.pipeline_shared_module_pg) == 0
+            # and dist.get_rank(p.pipeline_shared_module_pg) == 0
         ):  # if shared between different pipe, only count o
             parallel_grads.append(g.data.float())
         elif (
             gpc.is_initialized(ParallelMode.PIPELINE)
             and hasattr(p, "pipeline_shared_module_pg")
-            and dist.get_rank(p.pipeline_shared_module_pg) != 0
+            # and dist.get_rank(p.pipeline_shared_module_pg) != 0
         ):
             continue
         elif (
@@ -355,7 +358,10 @@ def compute_norm(gradients, parameters, norm_type=2, zero_mode=ParallelMode.ZERO
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=gpc.get_group(zero_mode))
 
         if torch.is_tensor(total_norm):
-            total_norm = total_norm.item()
+            if fake_mode:
+                total_norm = 0.1
+            else:
+                total_norm = total_norm.item()
 
     # Need to allreduce(avg) the norms across different ranks because moe params will not be synced during allreduce
     # model and zero have been reduced!!!

@@ -59,7 +59,7 @@ def get_tokenized_train_loader_items(data_cfg):
             folder=data_cfg.train_folder,
             packed_length=data_cfg.packed_length,
             max_length_per_sample=data_cfg.seq_len,
-            show_progress=dist.get_rank() == 0,
+            show_progress=gpc.get_global_rank() == 0,
             min_length=data_cfg.get("min_length", 0),
             min_length_dict=data_cfg.get("min_length_dict", None),
             pack_sample_into_one=data_cfg.get("pack_sample_into_one", False),

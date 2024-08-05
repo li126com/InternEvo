@@ -10,6 +10,7 @@ from torch import Tensor, nn
 
 from internlm.core.context import global_context as gpc
 from internlm.model.ops.rotary_emb import apply_rotary_emb
+from internlm.utils.common import get_current_device
 
 
 class Embedding1D(nn.Module):
@@ -43,7 +44,9 @@ class Embedding1D(nn.Module):
         self.embed_kwargs = kwargs
 
         embed_dim_per_partition = embedding_dim // gpc.tensor_parallel_size
-        self.weight = nn.Parameter(torch.empty((num_embeddings, embed_dim_per_partition), dtype=dtype))
+        self.weight = nn.Parameter(
+            torch.empty((num_embeddings, embed_dim_per_partition), dtype=dtype, device=get_current_device())
+        )
 
     def forward(self, input_: Tensor) -> Tensor:
         return F.embedding(input_, self.weight, self.padding_idx, *self.embed_args, **self.embed_kwargs)

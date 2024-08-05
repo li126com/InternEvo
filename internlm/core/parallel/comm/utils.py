@@ -181,7 +181,7 @@ def all_gather_raw(
     gather_dim: int = 0,
     memory_pool_allocator: Callable = None,
 ):
-    world_size = dist.get_world_size(process_group)
+    world_size = gpc.get_group_size(process_group)
     if world_size <= 1:
         return input_, None
 
@@ -204,7 +204,7 @@ def reduce_scatter_raw(
     reduce_dim: int = 0,
     memory_pool_allocator: Callable = None,
 ):
-    world_size = dist.get_world_size(process_group)
+    world_size = gpc.get_group_size(process_group)
     assert input_.shape[reduce_dim] % world_size == 0
 
     if world_size <= 1:

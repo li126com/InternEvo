@@ -12,6 +12,7 @@ from internlm.model.modules.embedding import new_rotary_embedding
 from internlm.model.modules.linear import new_linear
 from internlm.model.modules.utils import update_kv_cache
 from internlm.model.ops.attention import CrossAttention, SelfAttention
+from internlm.simulator.tracker.module_tracker import ModuleTracker
 from internlm.utils.logger import get_logger
 
 logger = get_logger(__file__)
@@ -90,6 +91,10 @@ class MHA(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
 
         assert self.embed_dim % num_heads == 0, "self.kdim must be divisible by num_heads"
+
+        self.module_tracker = ModuleTracker(self._get_name())
+        self.register_forward_pre_hook(self.module_tracker.fwd_pre_hook, with_kwargs=True)
+        self.register_full_backward_hook(self.module_tracker.bwd_pre_hook)
 
         if self.rotary_emb_dim > 0:
             self.rotary_emb = new_rotary_embedding(
@@ -422,9 +427,12 @@ class GQA(nn.Module):
         Arguments:
             x: (batch, seqlen, hidden_dim)
         """
+        print(f"x shape: {x.shape}", flush=True)
+
         # wqkv
         if self.enable_qkv_fusion:
             qkv = self.wqkv(x)
+            print(f"qkv shape: {qkv.shape}", flush=True)
             qkv = rearrange(qkv, "b s (h gs d) -> b s h gs d", gs=self.q_per_kv + 2, d=self.head_dim)
             q, k, v = (qkv[..., : self.q_per_kv, :], qkv[..., -2, :], qkv[..., -1, :])
             q = rearrange(q, "b s h gs d -> b s (h gs) d")

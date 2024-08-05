@@ -3,6 +3,7 @@ from typing import Callable, List, Optional
 import torch
 
 from internlm.accelerator import AcceleratorType, get_accelerator
+from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.ops.cross_entropy import new_cross_entropy
 from internlm.utils.common import SchedulerHook, get_current_device
@@ -98,7 +99,7 @@ class AccPerplex:
             self.total_log_probs = torch.Tensor([0]).to(device=device)
         self.tp_pg = tp_pg
         self.dp_pg = dp_pg
-        self.tp_local_rank = torch.distributed.get_rank(self.tp_pg)
+        self.tp_local_rank = gpc.get_local_rank(ParallelMode.TENSOR)
         self.tokenizer = tokenizer
         self.total_bytes = torch.Tensor([0]).to(device=device).view(1)
         self.batch_shift = 0

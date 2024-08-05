@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
+import os
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -20,7 +22,9 @@ def Silu(w1_o, w2_o):
     return F.silu(w1_o) * w2_o
 
 
-Silu = torch.jit.script(Silu)
+fake_mode = "fake_mode" in os.environ
+if not fake_mode:
+    Silu = torch.jit.script(Silu)
 
 
 def update_kv_cache(kv, inference_params, layer_idx):

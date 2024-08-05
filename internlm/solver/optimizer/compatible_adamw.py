@@ -33,7 +33,9 @@ def new_compatible_adamw(params, lr: float = 0.001, betas: Tuple[float, float] =
                 "Use fused AdamaW to avoid nan grad norm when "
                 "model size is larger and use_fp32_norm=True, Please note this!"
             )
-        adam_extra_kwargs["fused"] = True
+
+        if fake_mode = "fake_mode" not in os.environ:
+            adam_extra_kwargs["fused"] = True
     elif backend is AcceleratorType.NPU:
         if gpc.is_rank_for_log():
             logger.warning(

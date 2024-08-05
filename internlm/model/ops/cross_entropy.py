@@ -25,6 +25,9 @@ except (ModuleNotFoundError, ImportError):
 logger = get_logger(__file__)
 internlm_accelerator = get_accelerator()
 
+import os
+
+fake_mode = "fake_mode" in os.environ
 
 # TODO: ops是否需要实现更加统一的形式
 def new_cross_entropy(
@@ -34,6 +37,11 @@ def new_cross_entropy(
     parallel_output: bool = False,
     **kwargs,
 ):
+    if fake_mode:
+        kwargs.pop("inplace_backward", None)
+        return nn.CrossEntropyLoss(
+            ignore_index=ignore_index, reduction=reduction, label_smoothing=label_smoothing, **kwargs
+        )
     if parallel_output:
         assert (
             gpc.config.model.get("use_flash_attn", False) and flash_cross_entropy_impl

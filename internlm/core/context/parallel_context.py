@@ -4,25 +4,29 @@
 # adopted from https://github.com/hpcaitech/ColossalAI/blob/main/colossalai/context
 
 import inspect
+import os
 import random
 import socket
 import sys
+from dataclasses import dataclass
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from typing import Union
+from typing import List, Union
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
 from internlm.accelerator import get_accelerator
+from internlm.core.context.process_group_initializer_simplified import Initializer, ParallelMeta
 from internlm.utils.common import SingletonMeta
 from internlm.utils.logger import get_logger
 from internlm.utils.timeout import LLM_NCCL_TIMEOUT
 
 from . import process_group_initializer as pgroup_initializer
-from .process_group_initializer import ParallelMode
+from .process_group_initializer_simplified import ParallelMode
 from .random import add_seed, get_seeds, set_mode
+from internlm.utils.common import get_args
 
 IS_REPLICA_ZERO_PARALLEL = "is_replica_zero_parallel"
 # for isp, with optimizer split in dp group
@@ -127,6 +131,18 @@ class Config(dict):
         return config
 
 
+@dataclass
+class ClusterInfo:
+    # name: str
+    name: str
+    peak_tflops: float
+    capacity: float
+    intra_bw: float
+    inter_bw: float
+    gpu_per_node: int
+    node_num: int
+
+
 class ParallelContext(metaclass=SingletonMeta):
     """This class provides interface functions for users to get the parallel context,
     such as the global rank, the local rank, the world size, etc. of each device.
@@ -134,6 +150,14 @@ class ParallelContext(metaclass=SingletonMeta):
     """
 
     def __init__(self):
+        # load config from file
+        self._config = None
+        self._group_map = {}
+        self.clusters = []
+        self.micro_num_list = None
+        self._init_attr()
+
+    def _init_attr(self):
         # distributed settings
         self._global_ranks = dict()
         self._local_ranks = dict()
@@ -141,9 +165,7 @@ class ParallelContext(metaclass=SingletonMeta):
         self._groups = dict()
         self._cpu_groups = dict()
         self._ranks_in_group = dict()
-
-        # load config from file
-        self._config = None
+        self._all_ranks = dict()
 
         # default parallel args, will be overwritten during process group intialization
         self.world_size = 1
@@ -341,6 +363,13 @@ class ParallelContext(metaclass=SingletonMeta):
         self._check_parallel_mode(parallel_mode)
         return self._world_sizes.get(parallel_mode, 1)
 
+    def get_group_size(self, process_group):
+        if self.fake_mode:
+            mode = self._group_map[id(process_group)]
+            return self.get_world_size(mode)
+        else:
+            return dist.get_world_size(process_group)
+
     def get_group(self, parallel_mode: ParallelMode):
         """Returns the group of the current device for `parallel_mode`.
 
@@ -351,7 +380,10 @@ class ParallelContext(metaclass=SingletonMeta):
             torch.distributed.ProcessGroup: The group of the current device for `parallel_mode`.
         """
         self._check_parallel_mode(parallel_mode)
-        return self._groups[parallel_mode]
+        if parallel_mode not in self._groups:
+            return None
+        else:
+            return self._groups[parallel_mode]
 
     def get_ranks_in_group(self, parallel_mode: ParallelMode):
         """Returns the rank of the current device for `parallel_mode` in the group.
@@ -369,7 +401,16 @@ class ParallelContext(metaclass=SingletonMeta):
         self._check_parallel_mode(parallel_mode)
         return self._cpu_groups[parallel_mode]
 
-    def init_global_dist(self, rank: int, world_size: int, backend: str, host: str, port: int, use_cpu: bool = False):
+    def init_global_dist(
+        self,
+        rank: int,
+        world_size: int,
+        backend: str,
+        host: str,
+        port: int,
+        use_cpu: bool = False,
+        fake_mode: bool = False,
+    ):
         """Initializes the global distributed environment
 
         Args:
@@ -380,36 +421,60 @@ class ParallelContext(metaclass=SingletonMeta):
            port (str): the master port for distributed training.
            use_cpu (bool): whether to set up cpu process group.
         """
-        # initialize the default process group
-        init_method = f"tcp://[{host}]:{port}"
-        dist.init_process_group(
-            rank=rank,
-            world_size=world_size,
-            backend=backend,
-            init_method=init_method,
-            timeout=LLM_NCCL_TIMEOUT,
-        )
 
-        # None will give the default global process group for pytorch dist operations
-        ranks = list(range(world_size))
-        if use_cpu:
-            cpu_group = (
-                dist.new_group(ranks, backend="gloo", timeout=LLM_NCCL_TIMEOUT)
-                if dist.get_backend() != "gloo"
-                else None
-            )
+        # find   cluster info
+        if "clusters" not in self.config:
+            nv_info = {
+                "rank_range": [0, 8],
+                "peak_tflops": 320,
+                "capacity": 80 * 1024**3,
+                "intra_bw": 150,
+                "inter_bw": 100,
+            }
+            self.set_cluster_info("nv_cluster", nv_info)
         else:
-            cpu_group = None
-        self._register_dist(rank, world_size, dist.GroupMember.WORLD, cpu_group, ranks, ParallelMode.GLOBAL)
+            for cluster in self.config.clusters:
+                self.clusters.append(ClusterInfo(**cluster))
+
+        # initialize the default process group
+        if not fake_mode:
+            init_method = f"tcp://[{host}]:{port}"
+            dist.init_process_group(
+                rank=rank,
+                world_size=world_size,
+                backend=backend,
+                init_method=init_method,
+                timeout=LLM_NCCL_TIMEOUT,
+            )
+
+            # None will give the default global process group for pytorch dist operations
+            ranks = list(range(world_size))
+            if use_cpu:
+                cpu_group = (
+                    dist.new_group(ranks, backend="gloo", timeout=LLM_NCCL_TIMEOUT)
+                    if dist.get_backend() != "gloo"
+                    else None
+                )
+            else:
+                cpu_group = None
+
+            group = dist.GroupMember.WORLD
+        else:
+            ranks = list(range(world_size))
+            group, cpu_group = None, None
+
+        self._register_dist(rank, world_size, group, cpu_group, ranks, [list(range(world_size))], ParallelMode.GLOBAL)
         self._global_ranks[ParallelMode.GLOBAL] = rank
 
-    def _register_dist(self, local_rank, world_size, process_group, cpu_group, ranks_in_group, mode):
+    def _register_dist(self, local_rank, world_size, process_group, cpu_group, ranks_in_group, all_ranks, mode):
         self._check_parallel_mode(mode)
         self._local_ranks[mode] = local_rank
         self._world_sizes[mode] = world_size
         self._groups[mode] = process_group
         self._cpu_groups[mode] = cpu_group
         self._ranks_in_group[mode] = ranks_in_group
+        self._group_map[id(process_group)] = mode
+        self._all_ranks[mode] = all_ranks
 
     def check_sanity(self):
         """Checks sanity of the parallel context.
@@ -450,6 +515,28 @@ class ParallelContext(metaclass=SingletonMeta):
                 "will introduce redundancy when saving fsdp model ckpts, recommend setting them to same value"
             )
 
+        if self.tensor_mode == "isp":
+            assert (
+                self.zero1_parallel_size <= self.weight_data_parallel_size
+            ), f"zero1_size:{self.zero1_parallel_size} should be less than wdp_size:{self.weight_data_parallel_size}"
+            assert self.weight_data_parallel_size % self.zero1_parallel_size == 0, (
+                f"weight_data_parallel_size:{self.weight_data_parallel_size} % "
+                f"zero1_parallel_size: {self.zero1_parallel_size} != 0"
+            )
+        else:
+            assert (
+                self.zero1_parallel_size <= self.data_parallel_size
+            ), f"zero1_size:{self.zero1_parallel_size} should be less than dp_size:{self.data_parallel_size}"
+            assert (
+                self.data_parallel_size % self.zero1_parallel_size == 0
+            ), f"data_parallel_size:{self.data_parallel_size} % zero1_parallel_size: {self.zero1_parallel_size} != 0"
+
+        assert self.zero1_parallel_size >= 1 and self.zero1_parallel_size <= self.world_size
+
+        assert (
+            self.data_parallel_size % self.num_experts == 0 or self.num_experts % self.data_parallel_size == 0
+        ), "can not place the experts evenly"
+
     def _set_parallel_size_from_config(self, config: dict, key: str, attr_name: str):
         if key in config:
             ele = config[key]
@@ -462,10 +549,11 @@ class ParallelContext(metaclass=SingletonMeta):
                     f'{"Parallel configuration does not support this kind of argument, please use int or dict"}'
                 )
 
-    def init_parallel_groups(self):
+    def init_parallel_groups(self, fake_mode: bool = False):
         """Initializes the parallel groups."""
 
         # get rank and world size
+        self.fake_mode = fake_mode
         rank = self.get_global_rank()
         world_size = self.get_world_size(ParallelMode.GLOBAL)
         self.world_size = world_size
@@ -488,7 +576,14 @@ class ParallelContext(metaclass=SingletonMeta):
             self._set_parallel_size_from_config(parallel_config, "tensor", "tensor_parallel_size")
             self._set_parallel_size_from_config(parallel_config, "pipeline", "pipeline_parallel_size")
             self._set_parallel_size_from_config(parallel_config, "zero1", "zero1_parallel_size")
+            
+        
+        if get_args().use_simplified_gp_init:
+            self._init_use_simplified_pg(rank, world_size, parallel_config)
+        else:
+            self._init_pg(rank, world_size, parallel_config)
 
+    def _init_pg(self, rank, world_size, parallel_config):
         # the user should not set the data parallel size manually
         # instead, it should be calculated based on other parallel config
         self.sequence_parallel_size = self.tensor_parallel_size
@@ -496,7 +591,11 @@ class ParallelContext(metaclass=SingletonMeta):
         self.weight_data_parallel_size = max(
             1, self.world_size // self.pipeline_parallel_size // self.weight_parallel_size
         )
-        if isinstance(parallel_config["tensor"], dict) and parallel_config["tensor"]["mode"] == "isp":
+
+        if (
+            isinstance(parallel_config["tensor"], dict)
+            and parallel_config["tensor"]["mode"] == "isp"
+        ):
             if self.zero1_parallel_size == -1:
                 self.zero1_parallel_size = self.weight_data_parallel_size
             self.zero1_parallel_size = max(1, self.zero1_parallel_size)
@@ -523,7 +622,8 @@ class ParallelContext(metaclass=SingletonMeta):
         if "sequence_parallel" not in parallel_config:
             parallel_config._add_item("sequence_parallel", True)
         if isinstance(parallel_config["tensor"], int) or (
-            isinstance(parallel_config["tensor"], dict) and parallel_config["tensor"]["mode"] == "mtp"
+            isinstance(parallel_config["tensor"], dict)
+            and parallel_config["tensor"]["mode"] == "mtp"
         ):
             parallel_config["sequence_parallel"] = False
 
@@ -564,7 +664,11 @@ class ParallelContext(metaclass=SingletonMeta):
         initializers.append(pgroup_initializer.Initializer_Weight_Data(*initializer_args))
         initializers.append(pgroup_initializer.Initializer_Tensor(*initializer_args))
         initializers.append(pgroup_initializer.Initializer_Data(*initializer_args))
-        if isinstance(parallel_config["tensor"], dict) and parallel_config["tensor"]["mode"] == "isp":
+        initializers.append(pgroup_initializer.Initializer_ISP_Data(*initializer_args))
+        if (
+            isinstance(parallel_config["tensor"], dict)
+            and parallel_config["tensor"]["mode"] == TensorParallelMode.isp.name
+        ):
             initializers.append(pgroup_initializer.Initializer_Zero1_ISP(*initializer_args))
         else:
             initializers.append(pgroup_initializer.Initializer_Zero1(*initializer_args))
@@ -582,6 +686,66 @@ class ParallelContext(metaclass=SingletonMeta):
                     self._register_dist(*args)
             else:
                 self._register_dist(*parallel_setting)
+    
+    def _init_use_simplified_pg(self, rank, world_size, parallel_config):
+        try:
+            self.tensor_mode = parallel_config["tensor"]["mode"]
+        except AttributeError:
+            self.tensor_mode = "mtp"
+
+        self.num_experts = self.config.model.get("num_experts", 1)
+
+        # the user should not set the data parallel size manually
+        # instead, it should be calculated based on other parallel config
+        self.sequence_parallel_size = self.tensor_parallel_size
+        self.data_parallel_size = max(1, self.world_size // self.pipeline_parallel_size // self.sequence_parallel_size)
+        self.weight_data_parallel_size = max(
+            1, self.world_size // self.pipeline_parallel_size // self.weight_parallel_size
+        )
+
+        if self.tensor_mode == "isp":
+            if self.zero1_parallel_size == -1:
+                self.zero1_parallel_size = self.weight_data_parallel_size
+        else:
+            if self.zero1_parallel_size == -1:
+                self.zero1_parallel_size = self.data_parallel_size
+
+        # set sequence parallel value
+        if self.tensor_mode == "mtp":
+            parallel_config["sequence_parallel"] = False
+        else:
+            parallel_config._add_item("sequence_parallel", True)
+
+        # by default, expert_parallel_size equals to data_parallel_size, but if the number of experts is smaller
+        # than data_parallel_size, set expert_parallel_size to be the number of experts to make sure each device
+        # has one expert.
+        self.expert_parallel_size = min(self.data_parallel_size, self.num_experts)
+
+        self.check_sanity()
+
+        parallel_info = {
+            "tp": ParallelMeta(self.tensor_parallel_size, ParallelMode.TENSOR),
+            "wp": ParallelMeta(self.weight_parallel_size, ParallelMode.WEIGHT),
+            "pp": ParallelMeta(self.pipeline_parallel_size, ParallelMode.PIPELINE),
+            "dp": ParallelMeta(self.data_parallel_size, ParallelMode.DATA),
+            "zero1": ParallelMeta(self.zero1_parallel_size, ParallelMode.ZERO1),
+            "wdp": ParallelMeta(self.weight_data_parallel_size, ParallelMode.WEIGHT_DATA),
+            "ep": ParallelMeta(self.expert_parallel_size, ParallelMode.EXPERT),
+            "edp": ParallelMeta(self.data_parallel_size // self.expert_parallel_size, ParallelMode.EXPERT_DATA),
+            "intra_dp": ParallelMeta(-1, ParallelMode.INTRA_DP_SZIE),
+            "inter_dp": ParallelMeta(-1, ParallelMode.INTER_DP_SZIE),
+        }
+
+        initializer = Initializer(rank, world_size, self.fake_mode, self.tensor_mode, parallel_info)
+        parallel_settings = initializer.init_dist_group()
+
+        for name, parallel_setting in parallel_settings.items():
+            # print(f"name: {name}, parallel_setting: {parallel_setting}")
+            if isinstance(parallel_setting, list):
+                for args in parallel_setting:
+                    self._register_dist(*args)
+            else:
+                self._register_dist(*parallel_setting)
 
     def is_initialized(self, parallel_mode: ParallelMode):
         """Returns a boolean value indicating whether `parallel_mode` is initialized
@@ -589,14 +753,19 @@ class ParallelContext(metaclass=SingletonMeta):
         """
         return parallel_mode in self._groups
 
+    def set_fake_mode(self, fake_mode: bool = False):
+        self.fake_mode = fake_mode
+
     def destroy(self):
         """Destroys the current distributed parallel environment."""
-        for mode, group in self._groups.items():
-            if mode is not ParallelMode.GLOBAL:
-                dist.destroy_process_group(group)
-        # destroy global process group
-        dist.destroy_process_group()
-        self._groups.clear()
+        if not self.fake_mode:
+            for mode, group in self._groups.items():
+                if mode is not ParallelMode.GLOBAL:
+                    dist.destroy_process_group(group)
+            # destroy global process group
+            dist.destroy_process_group()
+
+        self._init_attr()
 
     def set_device(self, device_ordinal: int = None):
         """Sets distributed processes to be bound to devices.
@@ -624,7 +793,6 @@ class ParallelContext(metaclass=SingletonMeta):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        assert internlm_accelerator.is_available()
 
         # data parallel seed are kept the same in the same pipeline stage
         dp_seed = seed
@@ -668,6 +836,113 @@ class ParallelContext(metaclass=SingletonMeta):
 
     def set_virtual_pipeline_parallel_rank(self, rank):
         self.virtual_pipeline_parallel_rank = rank
+
+    def get_parallel_all_ranks(self, mode):
+        return self._all_ranks[mode]
+
+    def get_cluster_local_rank(self):
+        devices_offset = 0
+        for i, cluster in enumerate(self.clusters):
+            devices_offset += cluster.gpu_per_node * cluster.node_num
+            if self.get_global_rank() < devices_offset:
+                return i
+        raise ValueError
+
+    def get_model_parallel_size(self):
+        return self.get_world_size(ParallelMode.PIPELINE) * self.get_world_size(ParallelMode.TENSOR)
+
+    def check_pg_is_intra(self, parallel_mode: ParallelMode):
+        pg_group_ranks = self.get_ranks_in_group(parallel_mode)
+        if len(pg_group_ranks) > 8:
+            return False
+        else:
+            min_rank = min(pg_group_ranks)
+            max_rank = max(pg_group_ranks)
+            return (max_rank - min_rank) <= 7
+
+    def same_group_in_one_node(self, parallel_mode: ParallelMode):
+        """获得一个节点内有多少个相同类型的PG, 在跨节点通信时会存在带宽竞争
+        这里返回的相同PG的数量会乘上每个rank的通信数据量大小
+
+        Args:
+            parallel_mode (ParallelMode):
+
+        Returns:
+            int: 一个节点内相同类型的PG的数量
+        """
+        pg_group_ranks = self.get_ranks_in_group(parallel_mode)
+        pg_group_ranks = sorted(pg_group_ranks)
+        if len(pg_group_ranks) == 1:
+            return 1
+        else:
+            stride = pg_group_ranks[1] - pg_group_ranks[0]
+            if stride >= 8:
+                return 8
+            else:
+                return stride
+
+    # def set_cluster_info(self, name: str, info: dict):
+    #     self.clusters[name] = ClusterInfo(**info)
+
+    def get_cluster_info(self, name: str):
+        return self.clusters[name]
+
+    def get_cluster_name_from_ip(self):
+        """
+        node_ip_list = [
+            'metax-c500-1',
+            'metax-c500-2',
+            'nvidia-node-1',
+            'nvidia-node-2',
+        ]
+        """
+        hostname = socket.gethostname()
+        cluster_name = hostname.split("-")[0]
+        return cluster_name
+
+    def sort_rank_based_on_ip_and_capacity(self):
+        Capacity = []
+
+        def sort_rank(x, y):
+            x_name = self.get_cluster_name_from_ip(x)
+            y_name = self.get_cluster_name_from_ip(y)
+            if x_name == y_name:
+                return x_name > y_name
+            else:
+                x_c = self.clusters[x_name]["capacity"]
+                y_c = self.clusters[y_name]["capacity"]
+                return x_c > y_c
+
+        for cluster_name, cluster_info in self.clusters.items():
+            peak_tflops.append(cluster_info["peak_tflops"])
+            # Alpha.append(cluster_info.rank_range[-1] - cluster_info.rank_range[-1] + 1)
+            Capacity.append(cluster_info["capacity"])
+
+    def switch_topology_aware_rank_scheduling():
+        """
+        Switch topology-aware rank scheduling can optimize the performance of small-scale
+        collective communications. Currently only supported in Alibaba Cloud.
+        """
+
+        local_rank = int(os.environ["LOCAL_RANK"])
+        cluster_name = get_cluster_name_from_ip()
+
+        try:
+            if cluster_name == "Ali":
+                pass
+            else:
+                rank = int(os.environ["MLP_WORKER_RACK_RANK_INDEX"]) * 8 + local_rank
+        except Exception as e:
+            logger.error(
+                f"The switch topology awareness error is reported, the reason is: {e}",
+                "but don’t worry, this error will not affect normal training.",
+                "If you train on Alibaba or Volcano Cloud, please contact wangguoteng or lijiaxing",
+            )
+        else:
+            # If there is no any error, hack torch rank.
+            os.environ["RANK"] = str(rank)
+            if local_rank == 0:
+                logger.info("Successfully bound node switch affinity!")
 
 
 global_context = ParallelContext()

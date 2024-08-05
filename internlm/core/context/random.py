@@ -2,6 +2,7 @@
 # -*- encoding: utf-8 -*-
 # adopted from https://github.com/hpcaitech/ColossalAI/blob/main/colossalai/context
 
+import os
 from contextlib import contextmanager
 
 from torch import Tensor
@@ -9,6 +10,8 @@ from torch import Tensor
 from internlm.accelerator import get_accelerator
 
 from .process_group_initializer import ParallelMode
+
+fake_mode = "fake_mode" in os.environ
 
 internlm_accelerator = get_accelerator()
 
@@ -35,11 +38,15 @@ class SeedManager:
 
     def set_state(self, parallel_mode: ParallelMode, state: Tensor):
         """Sets the state of the seed manager for `parallel_mode`."""
+        if fake_mode:
+            return
         assert parallel_mode in self._seed_states, f"{parallel_mode} not found in seed manager"
         self._seed_states[parallel_mode] = state
 
     def set_mode(self, parallel_mode: ParallelMode, update_rng_current_mode: bool = True):
         """Sets the current mode of the seed manager."""
+        if fake_mode:
+            return
         if update_rng_current_mode and self.current_mode:
             # save state for current mode
             self._seed_states[self._current_mode] = internlm_accelerator.get_rng_state()
@@ -50,6 +57,8 @@ class SeedManager:
 
     def add_seed(self, parallel_mode: ParallelMode, seed: int, overwrite: bool = False):
         """Adds a seed to the seed manager for `parallel_mode`."""
+        if fake_mode:
+            return
         assert isinstance(parallel_mode, ParallelMode), "Invalid ParallelMode"
         if not overwrite:
             assert parallel_mode not in self._seed_states, f"Seed for {parallel_mode} exists"
@@ -63,6 +72,8 @@ class SeedManager:
         internlm_accelerator.set_rng_state(current_state)
 
     def reset(self):
+        if fake_mode:
+            return
         self._current_mode = None
         self._seeds = {}
         self._seed_states = {}
@@ -131,3 +142,7 @@ def seed(parallel_mode: ParallelMode):
         yield _SEED_MANAGER.set_mode(parallel_mode)
     finally:
         _SEED_MANAGER.set_mode(current_mode)
+
+
+def reset_seed():
+    _SEED_MANAGER.reset()

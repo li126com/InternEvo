@@ -15,7 +15,7 @@ class RandomDataset(Dataset):
 
     """
 
-    def __init__(self, num_samples=10000, max_len=1024, fixed_seqlen: bool = False) -> None:
+    def __init__(self, num_samples=500, max_len=1024, fixed_seqlen: bool = False) -> None:
         super().__init__()
         rng = np.random.RandomState(1999)
         max_num = rng.randint(1, 30, size=(num_samples,))
