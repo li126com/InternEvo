@@ -1,10 +1,10 @@
 from typing import Any, Dict, List
 
+
 import torch
 
 from internlm.core.context import ParallelMode
-from internlm.core.context.parallel_context import global_context as gpc
-from internlm.model.modules.mha import MHA
+from internlm.core.context import global_context as gpc
 
 
 def internlm1_mha_pre_load_convert(
@@ -57,6 +57,7 @@ def convert_attn_args_to_kwargs(args, kwargs) -> Dict[str, Any]:
     return kwargs
 
 
+
 def padding_residual(residual):
     requires_grad = residual.requires_grad
     _GATHER_DIM = 1
@@ -72,3 +73,15 @@ def padding_residual(residual):
     residual = zero_padding_tensor.requires_grad_(requires_grad)
 
     return residual
+
+def convert_hf_config(config):
+    gpc.config.model.vocab_size = gpc.config.VOCAB_SIZE = config.vocab_size
+    gpc.config.model.hidden_size = gpc.config.HIDDEN_SIZE = config.hidden_size
+    gpc.config.model.num_layers = gpc.config.NUM_LAYER = config.num_hidden_layers
+    gpc.config.model.num_attention_heads = gpc.config.NUM_ATTENTION_HEAD = config.num_attention_heads
+    gpc.config.model.mlp_ratio = gpc.config.MLP_RATIO = config.intermediate_size / config.hidden_size
+
+    # For models that use GQA
+    if hasattr(config, "num_key_value_heads"):
+        gpc.config.model.num_kv_attention_heads = gpc.config.NUM_KV_ATTENTION_HEAD = config.num_key_value_heads
+

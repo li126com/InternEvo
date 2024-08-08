@@ -5,6 +5,17 @@
 ### 安装
 请参考[安装文档](./install.md)进行安装。
 
+### 数据准备 （使用huggingface数据集）
+
+如果使用huggingface数据集进行在线加载并且在线tokenize的话，那么以`roneneldan/TinyStories`这个数据为例，数据准备阶段只需要将配置文件做如下改动：
+```python
+TRAIN_FOLDER = "roneneldan/TinyStories"
+data = dict(
+    type="hf",
+    tokenizer_path="internlm/internlm-7b",
+)
+```
+
 ### 数据准备 （预训练）
 
 InternEvo训练任务的数据集包括一系列的`bin`和`meta`文件。使用`tokenizer`从原始文本文件生成训练用数据集。通过在`tools/tokenizer.py`中指定模型参数路径的方式来导入tokenizer模型。目前提供`V7_sft.model`来生成tokens。若想使用不同的模型，可直接修改`tokernizer.py`中的模型参数路径。

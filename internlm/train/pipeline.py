@@ -86,6 +86,7 @@ from internlm.utils.parallel import (
     sync_model_replica_param_group,
 )
 from internlm.utils.timeout import llm_timeout
+from internlm.utils.utils import TensorParallelMode
 
 try:
     import torch_npu
@@ -144,21 +145,10 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
             for param in module.parameters():
                 setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
-    def _check_module_hf(_, module):
-        # TODO: check parallel attribute for hf model
-        for param in module.parameters():
-            if gpc.is_initialized(ParallelMode.TENSOR) and is_using_isp():
-                setattr(param, IS_WEIGHT_ZERO_PARALLEL, True)
-            elif gpc.is_initialized(ParallelMode.TENSOR) and not is_using_isp():
-                setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
-
     for _chunk in unwrap_naive_amp(model):
         # set param parallel attribute
         for name, module in _chunk.named_modules():
-            if gpc.config.model_type == "hf":
-                _check_module_hf(name, module)
-            else:
-                _check_module(name, module)
+            _check_module(name, module)
 
         for name, param in _chunk.named_parameters():
             assert (
@@ -183,7 +173,7 @@ def initialize_model(pre_process_func: Optional[Callable] = None, post_process_f
 
     register_model_initializer()
 
-    model = create_model(model_type=gpc.config.model_type, **(gpc.config.model))
+    model = create_model(model_type=gpc.config.model_type)
 
     if post_process_func:
         post_process_func(pre_process_output)
@@ -277,7 +267,7 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
     # register communictor for mtp/msp/fsp linear.
 
     # tensor parallel
-    if gpc.config.parallel.tensor.mode == "mtp":
+    if gpc.config.parallel.tensor.mode == TensorParallelMode.mtp.name:
         ColumnParallelLinear.register_cls_communicator(
             TensorParallelCommunicator(process_group=gpc.get_group(ParallelMode.TENSOR), role=LinearRole.COLUMN)
         )
@@ -296,8 +286,8 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
                     )
                 )
     # sequence parallel
-    if gpc.config.parallel.tensor.mode in ("msp", "fsp"):
-        save_total_input_as_activation = gpc.config.parallel.tensor.mode == "msp"
+    if gpc.config.parallel.tensor.mode in (TensorParallelMode.msp.name, TensorParallelMode.fsp.name):
+        save_total_input_as_activation = gpc.config.parallel.tensor.mode == TensorParallelMode.msp.name
 
         ColumnParallelLinear.register_cls_communicator(
             SequenceParallelCommunicator(
@@ -495,8 +485,7 @@ def load_new_batch(train_dl: DataLoader, train_iter: Iterable, train_state: Trai
     if batch[0].get("type_ids", None) is not None:
         # if use_packed_dataset is False, we need to unpack type_ids
         if not gpc.config.data.use_packed_dataset:
-            if gpc.config.data.type != "hf" or gpc.config.model_type != "hf":
-                batch[0]["type_ids"] = unpack_type_ids(batch[0]["type_ids"], batch[0]["cu_seqlens"])
+            batch[0]["type_ids"] = unpack_type_ids(batch[0]["type_ids"], batch[0]["cu_seqlens"])
 
     return batch, train_iter
 
@@ -586,17 +575,10 @@ def record_current_batch_training_metrics(
 
         num_tokens_in_batch = batch[1].nelement()
         real_num_tokens = math.ceil(acc_perplex.pop("real_token_num") / gpc.get_world_size(ParallelMode.GLOBAL))
-        # TODO: check logic
-        if gpc.config.data.type == "hf" and gpc.config.model_type == "hf" and not gpc.config.data.use_packed_dataset:
-            num_samples_in_batch = gpc.config.data.micro_bsz * gpc.config.data.micro_num
-            max_length_in_batch = batch[0]["attention_mask"].sum(dim=1).max().item()
-            max_samples_in_batch = gpc.config.data.micro_bsz
-            min_samples_in_batch = gpc.config.data.micro_bsz
-        else:
-            num_samples_in_batch = sum([len(b) - 1 for b in batch[0]["cu_seqlens"]])
-            max_length_in_batch = max([(b[1:] - b[:-1]).max().item() for b in batch[0]["cu_seqlens"]])
-            max_samples_in_batch = max([len(b) - 1 for b in batch[0]["cu_seqlens"]])
-            min_samples_in_batch = min([len(b) - 1 for b in batch[0]["cu_seqlens"]])
+        num_samples_in_batch = sum([len(b) - 1 for b in batch[0]["cu_seqlens"]])
+        max_length_in_batch = max([(b[1:] - b[:-1]).max().item() for b in batch[0]["cu_seqlens"]])
+        max_samples_in_batch = max([len(b) - 1 for b in batch[0]["cu_seqlens"]])
+        min_samples_in_batch = min([len(b) - 1 for b in batch[0]["cu_seqlens"]])
         time_cost = time.time() - start_time
         tk_per_gpu = round(
             num_tokens_in_batch * gpc.get_world_size(ParallelMode.DATA) / gpc.get_world_size(ParallelMode.GLOBAL),

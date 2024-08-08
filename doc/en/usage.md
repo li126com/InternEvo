@@ -6,6 +6,16 @@ To start a demo model training, you need to prepare three things: **installation
 
 Please refer to the [installation guide](./install.md) for instructions on how to install the necessary dependencies.
 
+### Dataset Preparation (HuggingFace Datasets)
+If you are using the HuggingFace datasets for on-the-fly streaming load and tokenize, taking the `roneneldan/TinyStories`` dataset as an example, the data preparation stage only requires the following adjustments in the configuration file:
+```python
+TRAIN_FOLDER = "roneneldan/TinyStories"
+data = dict(
+    type="hf",
+    tokenizer_path="internlm/internlm-7b",
+)
+```
+
 ### Dataset Preparation (Pre-training)
 
 The dataset for the InternEvo training task includes a series of `bin` and `meta` files. A `tokenizer` is used to generate the training dataset from the original text files. The tokenizer model is imported by specifying the model parameter path in `tools/tokenizer.py`. Currently, `tokenizer_internlm.model` is provided to generate tokens. If you want to use a different model, you can directly modify the model parameter path in `tokenizer.py`.

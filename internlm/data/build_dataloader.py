@@ -7,7 +7,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.data.streaming.batch_sampler import StreamingStaticBatchSampler
-from internlm.data.streaming.collaters import nopack_collate_fn, pack_collate_fn
+from internlm.data.streaming.collaters import pack_collate_fn
 from internlm.data.streaming.dataset import (
     HuggingFacePackedDataset,
     HuggingFaceStreamingDataset,
@@ -32,6 +32,7 @@ from internlm.data.tokenized.packed_dataset import (
 )
 from internlm.data.utils import get_dataset_type_ids_map
 from internlm.utils.logger import get_logger
+from internlm.utils.utils import DataType
 
 # global llm logger
 logger = get_logger(__file__)
@@ -119,34 +120,25 @@ def get_tokenized_valid_loader_items(data_cfg):
 
 
 def get_hf_train_loader_items(data_cfg):
+    assert not data_cfg.pack_sample_into_one, "hf dataloader curently only supports pack_sample_into_one=False"
     train_ds = HuggingFaceStreamingDataset(
         dataset_name=data_cfg.train_folder,
         tokenizer_name=data_cfg.tokenizer_path,
         model_max_length=data_cfg.seq_len,
         subset_name=data_cfg.get("subset_name", None),
     )
-    pad_token_id = gpc.config.model.get("pad_token_id", 0)
-    if gpc.config.model_type == "hf" and not data_cfg.use_packed_dataset:
-        train_sampler = StreamingStaticBatchSampler(
-            batch_size=data_cfg.micro_num * data_cfg.micro_bsz, rampup_batch_size=data_cfg.rampup_batch_size
-        )
-        train_collate_fn = partial(
-            nopack_collate_fn,
-            micro_num=data_cfg.micro_num,
-            micro_bsz=data_cfg.micro_bsz,
-            seq_len=data_cfg.seq_len,
-            pad_token_id=pad_token_id,
-        )
-    else:
-        train_ds = HuggingFacePackedDataset(
-            dataset=train_ds, seq_len=data_cfg.seq_len, micro_bsz=data_cfg.micro_bsz, pad_token_id=pad_token_id
-        )
-        train_sampler = StreamingStaticBatchSampler(
-            batch_size=data_cfg.micro_num, rampup_batch_size=data_cfg.rampup_batch_size
-        )
-        train_collate_fn = partial(
-            pack_collate_fn, micro_num=data_cfg.micro_num, micro_bsz=data_cfg.micro_bsz, seq_len=data_cfg.seq_len
-        )
+    train_ds = HuggingFacePackedDataset(
+        dataset=train_ds,
+        seq_len=data_cfg.seq_len,
+        micro_bsz=data_cfg.micro_bsz,
+        pad_token_id=gpc.config.model.get("pad_token_id", 0),
+    )
+    train_sampler = StreamingStaticBatchSampler(
+        batch_size=data_cfg.micro_num, rampup_batch_size=data_cfg.rampup_batch_size
+    )
+    train_collate_fn = partial(
+        pack_collate_fn, micro_num=data_cfg.micro_num, micro_bsz=data_cfg.micro_bsz, seq_len=data_cfg.seq_len
+    )
     return train_ds, train_sampler, train_collate_fn
 
 
@@ -160,10 +152,10 @@ def build_train_loader_with_data_type():
 
     train_folder = data_cfg.get("train_folder", None)
 
-    if data_cfg.type == "tokenized":
+    if data_cfg.type == DataType.tokenized.name:
         train_ds, train_sampler, train_collate_fn = get_tokenized_train_loader_items(data_cfg)
         dataset_types = list(get_dataset_type_ids_map(train_folder).keys()) if train_folder else ["en", "cn", "code"]
-    elif data_cfg.type == "hf":
+    elif data_cfg.type == DataType.hf.name:
         train_ds, train_sampler, train_collate_fn = get_hf_train_loader_items(data_cfg)
         dataset_types = ["en"]
     else:
@@ -187,7 +179,7 @@ def build_valid_loader_with_data_type():
 
     data_cfg = gpc.config.data
 
-    if data_cfg.type in ["tokenized", "hf"]:
+    if data_cfg.type in [DataType.tokenized.name, DataType.hf.name]:
         valid_ds, valid_collate_fn = get_tokenized_valid_loader_items(data_cfg)
     else:
         raise ValueError(f"dataset type {data_cfg.type} is not supported")
@@ -229,7 +221,7 @@ def build_valid_loader_with_data_type():
 def build_generation_loader_with_data_type(data_cfg, generation_cfg):
     """Generate and return the validation data loader based on data type."""
 
-    if data_cfg.type == "tokenized":
+    if data_cfg.type == DataType.tokenized.name:
         gene_ds, _ = get_tokenized_valid_loader_items(data_cfg)
     else:
         raise ValueError(f"dataset type {data_cfg.type} is not supported")
