@@ -100,17 +100,17 @@ def gen_perf():
                 "intra_bw": 150,
                 "inter_bw": 100,
                 "gpu_per_node": 8,
-                "node_num": 1,
+                "node_num": 2,
             },
-            {
-                "name": "mx_cluster",
-                "peak_tflops": 240,
-                "capacity": 64 * 1024**3,
-                "intra_bw": 150,
-                "inter_bw": 100,
-                "gpu_per_node": 8,
-                "node_num": 1,
-            },
+            # {
+            #     "name": "mx_cluster",
+            #     "peak_tflops": 240,
+            #     "capacity": 64 * 1024**3,
+            #     "intra_bw": 150,
+            #     "inter_bw": 100,
+            #     "gpu_per_node": 8,
+            #     "node_num": 1,
+            # },
         ],
     )
 
@@ -139,8 +139,9 @@ def gen_perf():
 
     register_comm_pref_initializer()
 
-    intra_comm_nums = int(math.log(gpus_per_node)) + 1  # 0,1,2,3
-    inter_comm_nums = int(math.log(node_num)) + 1
+    print(f"node_num is {node_num}, gpus_per_node is {gpus_per_node}", flush=True)
+    intra_comm_nums = int(math.log(gpus_per_node, 2)) + 1  # 0,1,2,3
+    inter_comm_nums = int(math.log(node_num, 2)) + 1
 
     data_path = f"./prof_data"
     cal_pic_path = f"{data_path}/pics/cal"
@@ -162,16 +163,18 @@ def gen_perf():
 
     sync_all()
 
+    print(f"inter_comm_nums is {inter_comm_nums}, inter_comm_nums is {inter_comm_nums}", flush=True)
     for i in range(inter_comm_nums):
-        for j in range(intra_comm_nums):
+        for j in range(inter_comm_nums):
             inter_size, intra_size = 2**i, 2**j
+            print(f"inter_size is {inter_size}, intra_size is {intra_size}", flush=True)
             if inter_size * intra_size != 1:
 
                 x_idx, y_idx = get_group_id(rank, gpus_per_node, intra_size, inter_size)
                 groups = new_process_group(world_size, gpus_per_node, intra_size, inter_size)
 
                 for test_type in comm_test_list:
-                    key = gen_comm_key(test_op, intra_size, inter_size)
+                    key = gen_comm_key(test_type, intra_size, inter_size)
                     if dist.get_rank() == 0:
                         print(
                             f"key: {key}, inter_size: {inter_size}, intra_size: {intra_size}, ranks: {groups[y_idx][x_idx][1]}",
