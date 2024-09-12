@@ -153,7 +153,8 @@ class ParallelContext(metaclass=SingletonMeta):
         # load config from file
         self._config = None
         self._group_map = {}
-        self.clusters = []
+        # self.clusters = []
+        self.clusters = {}
         self.micro_num_list = None
         self._init_attr()
 
@@ -424,12 +425,21 @@ class ParallelContext(metaclass=SingletonMeta):
 
         # find   cluster info
         if "clusters" not in self.config:
+            # nv_info = {
+            #     "rank_range": [0, 8],
+            #     "peak_tflops": 320,
+            #     "capacity": 80 * 1024**3,
+            #     "intra_bw": 150,
+            #     "inter_bw": 100,
+            # }
             nv_info = {
-                "rank_range": [0, 8],
+                "name": "nv_cluster",
                 "peak_tflops": 320,
                 "capacity": 80 * 1024**3,
                 "intra_bw": 150,
                 "inter_bw": 100,
+                "gpu_per_node": 8,
+                "node_num": 1,
             }
             self.set_cluster_info("nv_cluster", nv_info)
         else:
@@ -586,6 +596,13 @@ class ParallelContext(metaclass=SingletonMeta):
     def _init_pg(self, rank, world_size, parallel_config):
         # the user should not set the data parallel size manually
         # instead, it should be calculated based on other parallel config
+        try:
+            self.tensor_mode = parallel_config["tensor"]["mode"]
+        except AttributeError:
+            self.tensor_mode = "mtp"
+        
+        self.num_experts = self.config.model.get("num_experts", 1)
+        
         self.sequence_parallel_size = self.tensor_parallel_size
         self.data_parallel_size = max(1, self.world_size // self.pipeline_parallel_size // self.sequence_parallel_size)
         self.weight_data_parallel_size = max(
@@ -664,10 +681,14 @@ class ParallelContext(metaclass=SingletonMeta):
         initializers.append(pgroup_initializer.Initializer_Weight_Data(*initializer_args))
         initializers.append(pgroup_initializer.Initializer_Tensor(*initializer_args))
         initializers.append(pgroup_initializer.Initializer_Data(*initializer_args))
-        initializers.append(pgroup_initializer.Initializer_ISP_Data(*initializer_args))
+        # initializers.append(pgroup_initializer.Initializer_ISP_Data(*initializer_args))
+        # if (
+        #     isinstance(parallel_config["tensor"], dict)
+        #     and parallel_config["tensor"]["mode"] == TensorParallelMode.isp.name
+        # ):
         if (
             isinstance(parallel_config["tensor"], dict)
-            and parallel_config["tensor"]["mode"] == TensorParallelMode.isp.name
+            and parallel_config["tensor"]["mode"] == "isp"
         ):
             initializers.append(pgroup_initializer.Initializer_Zero1_ISP(*initializer_args))
         else:
@@ -842,10 +863,18 @@ class ParallelContext(metaclass=SingletonMeta):
 
     def get_cluster_local_rank(self):
         devices_offset = 0
-        for i, cluster in enumerate(self.clusters):
+        
+        i = 0
+        for _, cluster in self.clusters.items():
             devices_offset += cluster.gpu_per_node * cluster.node_num
             if self.get_global_rank() < devices_offset:
                 return i
+            i += 1
+        
+        # for i, cluster in enumerate(self.clusters):
+        #     devices_offset += cluster.gpu_per_node * cluster.node_num
+        #     if self.get_global_rank() < devices_offset:
+        #         return i
         raise ValueError
 
     def get_model_parallel_size(self):
@@ -881,8 +910,8 @@ class ParallelContext(metaclass=SingletonMeta):
             else:
                 return stride
 
-    # def set_cluster_info(self, name: str, info: dict):
-    #     self.clusters[name] = ClusterInfo(**info)
+    def set_cluster_info(self, name: str, info: dict):
+        self.clusters[name] = ClusterInfo(**info)
 
     def get_cluster_info(self, name: str):
         return self.clusters[name]

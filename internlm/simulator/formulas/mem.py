@@ -223,5 +223,5 @@ def get_block_threshold(
         return get_msp_memory_threshold(**kwargs)
     elif algo == AlgoType.FSP:
         return get_fsp_memory_threshold(**kwargs)
-
-    assert ValueError(f"unknow algo: {algo}")
+    
+    raise ValueError(f"unknow algo: {algo}")

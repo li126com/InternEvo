@@ -125,7 +125,7 @@ def gen_perf():
     )
     group = dist.GroupMember.WORLD
 
-    gpc._register_dist(rank, world_size, group, None, list(range(world_size)), ParallelMode.GLOBAL)
+    gpc._register_dist(rank, world_size, group, None, list(range(world_size)), [list(range(world_size))], ParallelMode.GLOBAL)
     gpc._global_ranks[ParallelMode.GLOBAL] = rank
     gpc.set_device(local_rank)
 

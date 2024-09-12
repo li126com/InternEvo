@@ -62,6 +62,9 @@ class ParallelMode(Enum):
 
     # grouped query attention
     GQA = "gqa"
+    
+    INTRA_DP_SZIE = "intra_dp_size"
+    INTER_DP_SZIE = 'inter_dp_size'
 
 
 class ProcessGroupInitializer(ABC):

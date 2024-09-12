@@ -14,10 +14,10 @@ from torch.nn.functional import linear as _torch_linear_forward_op
 
 from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import global_context as gpc
-from internlm.simulator.ops.linear import (
-    _fake_linear_bwdward_op,
-    _fake_linear_forward_op,
-)
+# from internlm.simulator.ops.linear import (
+#     _fake_linear_bwdward_op,
+#     _fake_linear_forward_op,
+# )
 
 try:
     from fused_dense_lib import linear_bias_wgrad as _flash_linear_backward_op
