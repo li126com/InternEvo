@@ -430,6 +430,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
     adam_cfg = gpc.config.adam
     zero_cfg = gpc.config.hybrid_zero_optimizer
     grad_scal_cfg = gpc.config.grad_scaler
+    use_apex_adam = gpc.config.use_apex_adam
 
     if "use_split_tensor_optim" in zero_cfg and zero_cfg.use_split_tensor_optim:
         map_param_block(model)
@@ -441,6 +442,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
         lr=adam_cfg.lr,
         betas=(adam_cfg.adam_beta1, adam_cfg.adam_beta2),
         eps=adam_cfg.adam_eps,
+        use_apex_adam=use_apex_adam,
     )
 
     if (

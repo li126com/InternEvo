@@ -138,7 +138,7 @@ class Llama2Decoder(nn.Module):
             qk_interleaved=qk_interleaved,
             bias=not no_bias,
             rope_base=rope_base,
-            enable_qkv_fusion=False,
+            enable_qkv_fusion=True,
         )
 
         self.dropout1 = nn.Dropout(drop_rate)

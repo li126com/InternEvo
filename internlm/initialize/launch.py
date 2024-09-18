@@ -73,6 +73,9 @@ def args_sanity_check():
     if "model_type" not in gpc.config:
         gpc.config._add_item("model_type", ModelType.INTERNLM.name)
 
+    if "use_apex_adam" not in gpc.config:
+        gpc.config._add_item("use_apex_adam", False)
+
     # procssing the parallel config in gpc
     if "zero1" not in gpc.config.parallel:
         gpc.config.parallel._add_item("zero1", dict(size=-1, fsdp=False))
