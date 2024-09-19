@@ -133,8 +133,10 @@ class SPFusedDenseFunc(torch.autograd.Function):
             handle_x.wait()
 
             x = x.reshape(batch_dim, x.shape[-1])
-            if gpc.is_using_parallel_mode(ParallelMode.PIPELINE) and gpc.config.parallel["pipeline"].get(
-                "zero_bubble", False
+            if (
+                gpc.is_using_parallel_mode(ParallelMode.PIPELINE)
+                and gpc.config.parallel["pipeline"].get("zero_bubble", False)
+                and not gpc.is_first_rank(ParallelMode.PIPELINE)
             ):
                 from internlm.core.scheduler.pipeline_scheduler import WeightGradStore
 
@@ -234,8 +236,10 @@ class WPFusedDenseFunc(torch.autograd.Function):
 
         total_weight = communicator.weight_hook(weight, module=module)
 
-        is_using_ZB = gpc.is_using_parallel_mode(ParallelMode.PIPELINE) and gpc.config.parallel["pipeline"].get(
-            "zero_bubble", False
+        is_using_ZB = (
+            gpc.is_using_parallel_mode(ParallelMode.PIPELINE)
+            and gpc.config.parallel["pipeline"].get("zero_bubble", False)
+            and not gpc.is_first_rank(ParallelMode.PIPELINE)
         )
 
         # compute weight grad
