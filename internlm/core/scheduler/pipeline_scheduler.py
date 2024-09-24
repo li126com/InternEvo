@@ -911,6 +911,16 @@ class ZeroBubblePipelineScheduler(PipelineScheduler):
 
         # Run 1F1B in steady state.
         for i in range(num_1f1b_micropairs):
+            
+            if i > 0:
+                input_obj = None
+                if not gpc.is_first_rank(ParallelMode.PIPELINE):
+                    input_obj = comm.recv_forward(
+                        forward_recv_shapes,
+                        dtype=self.dtype,
+                        scatter_gather_tensors=self.scatter_gather_tensors,
+                    )
+                    
             # Perform forward computation
             output_obj, moe_loss = self._forward_step(
                 engine,
@@ -946,24 +956,30 @@ class ZeroBubblePipelineScheduler(PipelineScheduler):
 
             input_obj_grad = self._backward_step(engine, i, input_obj, output_obj, output_obj_grad, moe_loss)
 
-            if i == (num_1f1b_micropairs - 1):
-                input_obj = None
-                if not gpc.is_first_rank(ParallelMode.PIPELINE):
-                    comm.send_backward(
-                        input_obj_grad,
-                        scatter_gather_tensors=self.scatter_gather_tensors,
-                    )
-            else:
-                if gpc.is_first_rank(ParallelMode.PIPELINE):
-                    input_obj = None
-                else:
-                    input_obj = comm.send_backward_recv_forward(
-                        input_obj_grad,
-                        forward_recv_shapes,
-                        dtype=self.dtype,
-                        scatter_gather_tensors=self.scatter_gather_tensors,
-                    )
-
+            # if i == (num_1f1b_micropairs - 1):
+            #     input_obj = None
+            #     if not gpc.is_first_rank(ParallelMode.PIPELINE):
+            #         comm.send_backward(
+            #             input_obj_grad,
+            #             scatter_gather_tensors=self.scatter_gather_tensors,
+            #         )
+            # else:
+            #     if gpc.is_first_rank(ParallelMode.PIPELINE):
+            #         input_obj = None
+            #     else:
+            #         input_obj = comm.send_backward_recv_forward(
+            #             input_obj_grad,
+            #             forward_recv_shapes,
+            #             dtype=self.dtype,
+            #             scatter_gather_tensors=self.scatter_gather_tensors,
+            #         )
+                    
+            if not gpc.is_first_rank(ParallelMode.PIPELINE):
+                comm.send_backward(
+                    input_obj_grad,
+                    scatter_gather_tensors=self.scatter_gather_tensors,
+                )
+                    
             WeightGradStore.flush()
             if i >= gpc.get_local_rank(ParallelMode.PIPELINE):
                 WeightGradStore.pop()
