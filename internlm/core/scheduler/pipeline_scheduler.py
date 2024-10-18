@@ -1136,17 +1136,17 @@ class InterleavedPipelineScheduler(PipelineScheduler):
         self.microbatch_offset[model_chunk_id] += self.bsz_stride
         print(f"load_micro_batch_4 {gpc.get_global_rank()}", flush=True)
         print(f"micro_batch_data {gpc.get_global_rank()}: {micro_batch_data}, {type(micro_batch_data)}, {len(micro_batch_data.items())}", flush=True)
-        # internlm_accelerator.synchronize()
-        # for k, v in micro_batch_data.items():
-        #     print(f"{gpc.get_global_rank()} {k}: {type(v)}", flush=True)
-        #     if isinstance(v, torch.Tensor):
-        #         print(f"{gpc.get_global_rank()} {k}: {type(v)}, {v.device.type}, {get_current_device()}", flush=True)
-        #         internlm_accelerator.synchronize()
-        #         v = v.to(get_current_device())
-        #         internlm_accelerator.synchronize()
-        #         print(f"{gpc.get_global_rank()} finish move1", flush=True)
-        #         v = v.detach()
-        #         print(f"{gpc.get_global_rank()} finish move2", flush=True)
+        internlm_accelerator.synchronize()
+        for k, v in micro_batch_data.items():
+            print(f"{gpc.get_global_rank()} {k}: {type(v)}", flush=True)
+            if isinstance(v, torch.Tensor):
+                print(f"{gpc.get_global_rank()} {k}: {type(v)}, {v.device.type}, {get_current_device()}", flush=True)
+                internlm_accelerator.synchronize()
+                v = v.to(get_current_device())
+                internlm_accelerator.synchronize()
+                print(f"{gpc.get_global_rank()} finish move1", flush=True)
+                v = v.detach()
+                print(f"{gpc.get_global_rank()} finish move2", flush=True)
         result = move_to_device(micro_batch_data)
         print(f"load_micro_batch_5 {gpc.get_global_rank()}", flush=True)
         return result
@@ -1174,15 +1174,15 @@ class InterleavedPipelineScheduler(PipelineScheduler):
         if not gpc.is_pipeline_first_stage():
             assert input_obj is not None, f"{gpc.get_global_rank()} input is None"
         print(f"before load_micro_batch {gpc.get_global_rank()}", flush=True)
-        micro_batch_data = self.load_micro_batch(chunk_id)
+        # micro_batch_data = self.load_micro_batch(chunk_id)
         # {'input_ids': tensor([[ 25, 166,   0,  ...,  18,  19,  20]]), 'cu_seqlens': tensor([   0, 2048], dtype=torch.int32), 'indexes': tensor([   0,    1,    2,  ..., 2045, 2046, 2047]), 'max_seqlen': 2048, 'label': torch.tensor([[ 166, -100,    1,  ...,   19,   20, -100]])}
-        # micro_batch_data = {
-        #     'input_ids': torch.randint(5, 10, (1, 2048), device=get_current_device(), ),
-        #     'cu_seqlens': torch.tensor([   0, 2048], dtype=torch.int32, device=get_current_device()),
-        #     'indexes': torch.randint(0, 10, (2048,), device=get_current_device()),
-        #     'max_seqlen': 2048,
-        #     'label': torch.randint(5, 10, (1, 2048), device=get_current_device()),
-        # }
+        micro_batch_data = {
+            'input_ids': torch.randint(5, 10, (1, 2048), device=get_current_device(), ),
+            'cu_seqlens': torch.tensor([   0, 2048], dtype=torch.int32, device=get_current_device()),
+            'indexes': torch.randint(0, 10, (2048,), device=get_current_device()),
+            'max_seqlen': 2048,
+            'label': torch.randint(5, 10, (1, 2048), device=get_current_device()),
+        }
         print(f"after load_micro_batch {gpc.get_global_rank()}", flush=True)
         data, label = self._get_data_label_for_current_step(input_obj, micro_batch_data)
 
@@ -1834,14 +1834,15 @@ class ZeroBubblePipelineVShapeScheduler(InterleavedPipelineScheduler):
         gpc.v_shape = True
         
         self._micro_step = [0, 0]
-        # self.map_input_output = {}
+        self.map_input_output = {}
+        self.map_output_outputgrad = {}
         
     def _clear_state(self) -> None:
         super()._clear_state()
         self._special_chunk0_forward = True
         
         self._micro_step = [0, 0]
-        # self.map_input_output = {}
+        self.map_input_output = {}
         
     
     def _backward_step(self, engine, input_obj, output_obj, output_obj_grad, skip_grad_sync=True, moe_loss=None):
@@ -1942,7 +1943,7 @@ class ZeroBubblePipelineVShapeScheduler(InterleavedPipelineScheduler):
         moe_loss = self._moe_losses[chunk_id].pop(0)
         
         if input_obj is not None:
-            # assert self.map_input_output[id(input_obj)] == id(output_obj), f"{gpc.get_global_rank()}"
+            assert self.map_input_output[id(input_obj)] == id(output_obj), f"{gpc.get_global_rank()}"
             assert input_obj.requires_grad == True
         
         if not gpc.is_pipeline_last_stage():
@@ -1962,8 +1963,8 @@ class ZeroBubblePipelineVShapeScheduler(InterleavedPipelineScheduler):
         self._micro_step[chunk_id] += 1
         print(f"self._micro_step {gpc.get_global_rank()} chunk{chunk_id}: {self._micro_step[chunk_id]}", flush=True)
         output_obj = self._forward_step(engine, chunk_id)
-        # if self._input_objs[chunk_id][-1] is not None:
-            # self.map_input_output[id(self._input_objs[chunk_id][-1])] = id(output_obj)
+        if self._input_objs[chunk_id][-1] is not None:
+            self.map_input_output[id(self._input_objs[chunk_id][-1])] = id(output_obj)
                     
         object_send_next = None
         object_send_prev = None   
@@ -2300,8 +2301,8 @@ class ZeroBubblePipelineVShapeScheduler(InterleavedPipelineScheduler):
             
             if chunk_id == 1:
                 assert micro_step < num_warmup_microsteps_phase_2 - 1
-                # if not (gpc.is_last_rank(ParallelMode.PIPELINE) and micro_step == 0):
-                object_send_prev = output_obj
+                if not (gpc.is_last_rank(ParallelMode.PIPELINE) and micro_step == 0):
+                    object_send_prev = output_obj
                 recv_prev_shape = self._input_obj_shapes[next_chunk_id]
             else:
                 if not gpc.is_last_rank(ParallelMode.PIPELINE):  
@@ -2554,7 +2555,7 @@ class ZeroBubblePipelineVShapeScheduler(InterleavedPipelineScheduler):
         
         # Compute number of 1F1B unit.
         num_1f1b_units = 2 * self.num_microbatches - num_warmup_steps
-        # self._input_objs[1].append(torch.rand((1, 2048, 4096), device=get_current_device(), dtype=torch.bfloat16))
+        self._input_objs[1].append(torch.rand((1, 2048, 4096), device=get_current_device(), dtype=torch.bfloat16))
         
         # 1. Warmup
         self._run_warmup_loop(
