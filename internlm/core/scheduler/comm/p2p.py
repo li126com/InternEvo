@@ -167,13 +167,13 @@ def _communicate(
 
     if object_send_next is not None:
         filling_ops_queue(object_send_next, dist.isend, next_rank, ops)
-
+    # import pdb; pdb.set_trace()
     if len(ops) > 0:
         reqs = dist.batch_isend_irecv(ops)
         for req in reqs:
             req.wait()
-    # To protect against race condition when using batch_isend_irecv().
-    internlm_accelerator.synchronize()
+        # To protect against race condition when using batch_isend_irecv().
+        # internlm_accelerator.synchronize()
 
     if recv_prev and recv_prev_split:
         if isinstance(tensor_recv_prev, torch.Tensor):
@@ -194,6 +194,128 @@ def _communicate(
                 )
 
     return tensor_recv_prev, tensor_recv_next
+
+
+def _communicate_async(
+    object_send_next: Union[torch.Tensor, List[torch.Tensor]] = None,
+    object_send_prev: Union[torch.Tensor, List[torch.Tensor]] = None,
+    recv_prev: bool = False,
+    recv_next: bool = False,
+    recv_prev_shape: Union[torch.Size, List[torch.Size]] = None,
+    recv_next_shape: Union[torch.Size, List[torch.Size]] = None,
+    prev_rank: int = None,
+    next_rank: int = None,
+    dtype: torch.dtype = None,
+    scatter_gather_tensors: bool = False,
+):
+    """
+    Adapted from megatron.p2p_communication.
+    Communicate tensors between stages. Used as helper method in other
+    communication methods that are used in pipeline schedule.
+    Takes the following arguments:
+        object_send_next (Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]): tensor to send to next rank
+        (no tensor sent if set to None).
+        object_send_prev (Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]): tensor to send to prev rank
+        (no tensor sent if set to None).
+        recv_prev (bool): boolean for whether tensor should be received from
+                   previous rank.
+        recv_next (bool): boolean for whether tensor should be received from
+                   next rank.
+        recv_prev_shape (Union[:class:`torch.Size`, List[:class:`torch.Size`]]): shape of the tensor to be received
+        from the previous stage, defualts to None.
+        recv_next_shape (Union[:class:`torch.Size`, List[:class:`torch.Size`]]): shape of the tensor to be received
+        from the next stage, defualts to None.
+        prev_rank (int): the rank of the previous pipeline stage, defualts to None,
+        next_rank (int): the rank of the next pipeline stage, defualts to None,
+        dtype (torch.dtype): data type of intermediate buffers, defaults to None
+        scatter_gather_tensors (bool): whether to scatter and gather tensor between pipeline stages, defaults to False
+
+    Returns:
+        Tuple[Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]]: returns tensor_recv_prev, tensor_recv_next
+    """
+
+    # Create placeholder tensors for receive in forward and backward directions
+    # if needed.
+    tensor_recv_prev = None
+    tensor_recv_next = None
+
+    if recv_prev:
+        assert recv_prev_shape is not None
+        tensor_recv_prev, recv_prev_split = create_recv_buffer_with_shapes(
+            recv_prev_shape, dtype, scatter_gather_tensors
+        )
+
+    if recv_next:
+        assert recv_next_shape is not None
+        tensor_recv_next, recv_next_split = create_recv_buffer_with_shapes(
+            recv_next_shape, dtype, scatter_gather_tensors
+        )
+
+    if object_send_prev is not None or recv_prev:
+        if prev_rank is None:
+            prev_rank = gpc.get_prev_global_rank(ParallelMode.PIPELINE)
+
+    if object_send_next is not None or recv_next:
+        if next_rank is None:
+            next_rank = gpc.get_next_global_rank(ParallelMode.PIPELINE)
+
+    if object_send_prev is not None:
+        object_send_prev = process_object_to_send(object_send_prev, scatter_gather_tensors)
+
+    if object_send_next is not None:
+        object_send_next = process_object_to_send(object_send_next, scatter_gather_tensors)
+
+    ops = []
+    if object_send_prev is not None:
+        filling_ops_queue(object_send_prev, dist.isend, prev_rank, ops)
+
+    if tensor_recv_prev is not None:
+        filling_ops_queue(tensor_recv_prev, dist.irecv, prev_rank, ops)
+
+    if tensor_recv_next is not None:
+        filling_ops_queue(tensor_recv_next, dist.irecv, next_rank, ops)
+
+    if object_send_next is not None:
+        filling_ops_queue(object_send_next, dist.isend, next_rank, ops)
+
+    if len(ops) > 0:
+        reqs = dist.batch_isend_irecv(ops)
+    
+    # return and do other things
+    yield
+    
+    if len(ops) > 0:
+        for req in reqs:
+            req.wait()
+        # To protect against race condition when using batch_isend_irecv().
+        # internlm_accelerator.synchronize()
+
+    if recv_prev and recv_prev_split:
+        if isinstance(tensor_recv_prev, torch.Tensor):
+            tensor_recv_prev = gather_split_1d_tensor(tensor_recv_prev).view(recv_prev_shape).requires_grad_()
+        else:
+            for index in range(len(tensor_recv_prev)):
+                tensor_recv_prev[index] = (
+                    gather_split_1d_tensor(tensor_recv_prev[index]).view(recv_prev_shape[index]).requires_grad_()
+                )
+
+    if recv_next and recv_next_split:
+        if isinstance(tensor_recv_next, torch.Tensor):
+            tensor_recv_next = gather_split_1d_tensor(tensor_recv_next).view(recv_next_shape).requires_grad_()
+        else:
+            for index in range(len(tensor_recv_next)):
+                tensor_recv_next[index] = (
+                    gather_split_1d_tensor(tensor_recv_next[index]).view(recv_next_shape[index]).requires_grad_()
+                )
+    
+    if tensor_recv_prev is not None and tensor_recv_next is None:
+        yield tensor_recv_prev
+    elif tensor_recv_next is not None and tensor_recv_prev is None:
+        yield tensor_recv_next
+    elif tensor_recv_next is None and tensor_recv_prev is None:
+        yield None
+    else:
+        yield (tensor_recv_prev, tensor_recv_next)
 
 
 def recv_forward(
@@ -341,6 +463,7 @@ def send_forward_recv_forward(
     Returns:
         Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]: The input tensor.
     """
+    # import pdb; pdb.set_trace()
     input_tensor, _ = _communicate(
         object_send_next=output_tensor,
         recv_prev=input_tensor_shape is not None,
@@ -469,11 +592,12 @@ def send_forward_and_recv_next_forward_async(
     # return and do other things
     yield
 
-    # check communication completed
-    for req in reqs:
-        req.wait()
-    # To protect against race condition when using batch_isend_irecv()
-    internlm_accelerator.synchronize()
+    if len(reqs) > 0:
+        # check communication completed
+        for req in reqs:
+            req.wait()
+        # To protect against race condition when using batch_isend_irecv()
+        # internlm_accelerator.synchronize()
 
     # Process received data
     if recv_prev_shape is not None and recv_prev_split:
@@ -529,11 +653,12 @@ def send_backward_and_recv_next_backward_async(
     # return and do other things
     yield
 
-    # check communication completed
-    for req in reqs:
-        req.wait()
-    # To protect against race condition when using batch_isend_irecv()
-    internlm_accelerator.synchronize()
+    if len(reqs) > 0:
+        # check communication completed
+        for req in reqs:
+            req.wait()
+        # To protect against race condition when using batch_isend_irecv()
+        # internlm_accelerator.synchronize()
 
     # Process received data
     if recv_next_shape is not None and recv_next_split:
@@ -546,6 +671,217 @@ def send_backward_and_recv_next_backward_async(
                 )
 
     yield tensor_recv_next
+    
+
+def send_tensor_async(
+    object_send_next: Union[torch.Tensor, List[torch.Tensor]] = None,
+    object_send_prev: Union[torch.Tensor, List[torch.Tensor]] = None,
+    prev_rank: int = None,
+    next_rank: int = None,
+    scatter_gather_tensors: bool = False,
+) -> List:
+    """
+    Adapted from megatron.p2p_communication.
+    Communicate tensors between stages. Used as helper method in other
+    communication methods that are used in pipeline schedule.
+    Takes the following arguments:
+        object_send_next (Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]): tensor to send to next rank
+        (no tensor sent if set to None).
+        object_send_prev (Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]): tensor to send to prev rank
+        (no tensor sent if set to None).
+        recv_prev (bool): boolean for whether tensor should be received from
+                   previous rank.
+        recv_next (bool): boolean for whether tensor should be received from
+                   next rank.
+        recv_prev_shape (Union[:class:`torch.Size`, List[:class:`torch.Size`]]): shape of the tensor to be received
+        from the previous stage, defualts to None.
+        recv_next_shape (Union[:class:`torch.Size`, List[:class:`torch.Size`]]): shape of the tensor to be received
+        from the next stage, defualts to None.
+        prev_rank (int): the rank of the previous pipeline stage, defualts to None,
+        next_rank (int): the rank of the next pipeline stage, defualts to None,
+        dtype (torch.dtype): data type of intermediate buffers, defaults to None
+        scatter_gather_tensors (bool): whether to scatter and gather tensor between pipeline stages, defaults to False
+
+    Returns:
+        Tuple[Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]]: returns tensor_recv_prev, tensor_recv_next
+    """
+
+    # Create placeholder tensors for receive in forward and backward directions
+    # if needed.
+
+    if object_send_prev is not None:
+        if prev_rank is None:
+            prev_rank = gpc.get_prev_global_rank(ParallelMode.PIPELINE)
+
+    if object_send_next is not None:
+        if next_rank is None:
+            next_rank = gpc.get_next_global_rank(ParallelMode.PIPELINE)
+
+    if object_send_prev is not None:
+        object_send_prev = process_object_to_send(object_send_prev, scatter_gather_tensors)
+
+    if object_send_next is not None:
+        object_send_next = process_object_to_send(object_send_next, scatter_gather_tensors)
+
+    ops = []
+    if object_send_prev is not None:
+        filling_ops_queue(object_send_prev, dist.isend, prev_rank, ops)
+
+    if object_send_next is not None:
+        filling_ops_queue(object_send_next, dist.isend, next_rank, ops)
+
+    reqs = None
+    if len(ops) > 0:
+        reqs = dist.batch_isend_irecv(ops)
+    #     for req in reqs:
+    #         req.wait()
+    # # To protect against race condition when using batch_isend_irecv().
+    # internlm_accelerator.synchronize()
+    
+    return reqs
+
+
+def recv_tensor(
+    recv_prev_shape: Union[torch.Size, List[torch.Size]] = None,
+    recv_next_shape: Union[torch.Size, List[torch.Size]] = None,
+    prev_rank: int = None,
+    next_rank: int = None,
+    dtype: torch.dtype = None,
+    scatter_gather_tensors: bool = False,
+) -> Tuple[Union[torch.Tensor, List[torch.Tensor]]]:
+    """
+    Adapted from megatron.p2p_communication.
+    Communicate tensors between stages. Used as helper method in other
+    communication methods that are used in pipeline schedule.
+    Takes the following arguments:
+        object_send_next (Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]): tensor to send to next rank
+        (no tensor sent if set to None).
+        object_send_prev (Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]): tensor to send to prev rank
+        (no tensor sent if set to None).
+        recv_prev (bool): boolean for whether tensor should be received from
+                   previous rank.
+        recv_next (bool): boolean for whether tensor should be received from
+                   next rank.
+        recv_prev_shape (Union[:class:`torch.Size`, List[:class:`torch.Size`]]): shape of the tensor to be received
+        from the previous stage, defualts to None.
+        recv_next_shape (Union[:class:`torch.Size`, List[:class:`torch.Size`]]): shape of the tensor to be received
+        from the next stage, defualts to None.
+        prev_rank (int): the rank of the previous pipeline stage, defualts to None,
+        next_rank (int): the rank of the next pipeline stage, defualts to None,
+        dtype (torch.dtype): data type of intermediate buffers, defaults to None
+        scatter_gather_tensors (bool): whether to scatter and gather tensor between pipeline stages, defaults to False
+
+    Returns:
+        Tuple[Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]]: returns tensor_recv_prev, tensor_recv_next
+    """
+
+    # Create placeholder tensors for receive in forward and backward directions
+    # if needed.
+    tensor_recv_prev = None
+    tensor_recv_next = None
+    
+    if recv_prev_shape is None and recv_next_shape is None:
+        return tensor_recv_prev, tensor_recv_next
+
+    if recv_prev_shape:
+        tensor_recv_prev, recv_prev_split = create_recv_buffer_with_shapes(
+            recv_prev_shape, dtype, scatter_gather_tensors
+        )
+
+    if recv_next_shape:
+        tensor_recv_next, recv_next_split = create_recv_buffer_with_shapes(
+            recv_next_shape, dtype, scatter_gather_tensors
+        )
+
+    if recv_prev_shape:
+        if prev_rank is None:
+            prev_rank = gpc.get_prev_global_rank(ParallelMode.PIPELINE)
+
+    if recv_next_shape:
+        if next_rank is None:
+            next_rank = gpc.get_next_global_rank(ParallelMode.PIPELINE)
+
+    ops = []
+    if tensor_recv_prev is not None:
+        filling_ops_queue(tensor_recv_prev, dist.irecv, prev_rank, ops)
+
+    if tensor_recv_next is not None:
+        filling_ops_queue(tensor_recv_next, dist.irecv, next_rank, ops)
+
+    if len(ops) > 0:
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+        # To protect against race condition when using batch_isend_irecv().
+        # internlm_accelerator.synchronize()
+
+    if recv_prev_shape and recv_prev_split:
+        if isinstance(tensor_recv_prev, torch.Tensor):
+            tensor_recv_prev = gather_split_1d_tensor(tensor_recv_prev).view(recv_prev_shape).requires_grad_()
+        else:
+            for index in range(len(tensor_recv_prev)):
+                tensor_recv_prev[index] = (
+                    gather_split_1d_tensor(tensor_recv_prev[index]).view(recv_prev_shape[index]).requires_grad_()
+                )
+
+    if recv_next_shape and recv_next_split:
+        if isinstance(tensor_recv_next, torch.Tensor):
+            tensor_recv_next = gather_split_1d_tensor(tensor_recv_next).view(recv_next_shape).requires_grad_()
+        else:
+            for index in range(len(tensor_recv_next)):
+                tensor_recv_next[index] = (
+                    gather_split_1d_tensor(tensor_recv_next[index]).view(recv_next_shape[index]).requires_grad_()
+                )
+
+    return tensor_recv_prev, tensor_recv_next
+
+
+def fused_send_recv_tensor(
+    object_send_next: Union[torch.Tensor, List[torch.Tensor]] = None,
+    object_send_prev: Union[torch.Tensor, List[torch.Tensor]] = None,
+    recv_prev_shape: Union[torch.Size, List[torch.Size]] = None,
+    recv_next_shape: Union[torch.Size, List[torch.Size]] = None,
+    prev_rank: int = None,
+    next_rank: int = None,
+    dtype: torch.dtype = None,
+    scatter_gather_tensors: bool = False,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    """Fused communication operation. send and recv tensor from next rank or prev rank.
+
+    Args:
+        object_send_next (Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]): tensor to send to next rank
+        (no tensor sent if set to None).
+        object_send_prev (Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]): tensor to send to prev rank
+        (no tensor sent if set to None).
+        recv_prev (bool): boolean for whether tensor should be received from
+                   previous rank.
+        recv_next (bool): boolean for whether tensor should be received from
+                   next rank.
+        recv_prev_shape (Union[:class:`torch.Size`, List[:class:`torch.Size`]]): shape of the tensor to be received
+        from the previous stage, defualts to None.
+        recv_next_shape (Union[:class:`torch.Size`, List[:class:`torch.Size`]]): shape of the tensor to be received
+        from the next stage, defualts to None.
+        prev_rank (int): the rank of the previous pipeline stage, defualts to None,
+        next_rank (int): the rank of the next pipeline stage, defualts to None,
+        dtype (torch.dtype): data type of intermediate buffers, defaults to None
+        scatter_gather_tensors (bool): whether to scatter and gather tensor between pipeline stages, defaults to False
+
+    Returns:
+        Tuple[Union[:class:`torch.Tensor`, List[:class:`torch.Tensor`]]]: returns tensor_recv_prev, tensor_recv_next
+    """
+    tensor_recv_prev, tensor_recv_next = _communicate(
+        object_send_next=object_send_next,
+        object_send_prev=object_send_prev,
+        recv_prev=recv_prev_shape is not None,
+        recv_next=recv_next_shape is not None,
+        recv_prev_shape=recv_prev_shape,
+        recv_next_shape=recv_next_shape,
+        prev_rank=prev_rank,
+        next_rank=next_rank,
+        dtype=dtype,
+        scatter_gather_tensors=scatter_gather_tensors,
+    )
+    return tensor_recv_prev, tensor_recv_next
 
 
 class AsynCommunicator:
@@ -558,16 +894,45 @@ class AsynCommunicator:
         dtype: torch.dtype = None,
         scatter_gather_tensors=False,
         forward: bool = True,
+        send_next: bool = None,
+        recv_next: bool = None,
     ) -> None:
         self._need_receive = recv_shape is not None
+        assert (send_next is not None and recv_next is not None) or (send_next is None and recv_next is None)
 
-        if forward:
+        if send_next is None and recv_next is None:
+            if forward:
+                send_next = True
+                recv_next = False
+            else:
+                send_next = False
+                recv_next = True
+        
+        assert send_next is not None and recv_next is not None
+
+        if send_next and not recv_next:
             self._coroutine = send_forward_and_recv_next_forward_async(
                 tensor_to_send, recv_shape, dtype, scatter_gather_tensors
             )
-        else:
+        elif not send_next and recv_next:
             self._coroutine = send_backward_and_recv_next_backward_async(
                 tensor_to_send, recv_shape, dtype, scatter_gather_tensors
+            )
+        elif send_next and recv_next:
+            self._coroutine = _communicate_async(
+                object_send_next=tensor_to_send,
+                recv_next=recv_shape is not None,
+                recv_next_shape=recv_shape,
+                dtype=dtype,
+                scatter_gather_tensors=scatter_gather_tensors,
+            )
+        else:
+            self._coroutine = _communicate_async(
+                object_send_prev=tensor_to_send,
+                recv_prev=recv_shape is not None,
+                recv_prev_shape=recv_shape,
+                dtype=dtype,
+                scatter_gather_tensors=scatter_gather_tensors,
             )
 
     @property

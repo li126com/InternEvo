@@ -4,6 +4,7 @@ from .pipeline_scheduler import (
     InterleavedPipelineScheduler,
     PipelineScheduler,
     ZeroBubblePipelineScheduler,
+    ZeroBubblePipelineVShapeScheduler,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "InterleavedPipelineScheduler",
     "PipelineScheduler",
     "ZeroBubblePipelineScheduler",
+    "ZeroBubblePipelineVShapeScheduler",
 ]

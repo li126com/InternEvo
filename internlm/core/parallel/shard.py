@@ -185,11 +185,17 @@ def partition_uniform(num_items: int, pipeline_parallel_size: int, num_chunks: i
         left = pipeline_parallel_size - partition_items % pipeline_parallel_size
         if chunk_size == 0:
             raise ValueError("Some nodes in Pipeline have no requests")
-
-        for p in range(pipeline_parallel_size):
-            st = base_idx
-            base_idx += chunk_size + (p >= left)
-            parts[p].append((st, base_idx))
+        
+        if gpc.config.parallel["pipeline"]["mode"] == "ZBV" and idx == 1:
+            for p in range(pipeline_parallel_size-1, -1, -1):
+                st = base_idx
+                base_idx += chunk_size + ((pipeline_parallel_size - p - 1) >= left)
+                parts[p].append((st, base_idx))   
+        else:
+            for p in range(pipeline_parallel_size):
+                st = base_idx
+                base_idx += chunk_size + (p >= left)
+                parts[p].append((st, base_idx))
 
     indexes = []
     for _parts in parts:
@@ -230,7 +236,7 @@ def pipeline_parallel_sharding_wrapper(
         kwargs["last"] = end == num_layers and len(all_parts[-1]) != 0
         kwargs["device"] = device
         kwargs["start_layer_idx"] = start
-
+        print(f"partition_uniform {gpc.get_global_rank()}: {parts}, {kwargs}", flush=True)
         chunk = model_builder(**kwargs).to(device)
         setattr(chunk, "first_layer", start)
         setattr(chunk, "last_layer", end)
