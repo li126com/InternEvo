@@ -169,7 +169,9 @@ def _communicate(
         filling_ops_queue(object_send_next, dist.isend, next_rank, ops)
     # import pdb; pdb.set_trace()
     if len(ops) > 0:
+        print(f"before batch_isend_irecv {gpc.get_global_rank()}", flush=True)
         reqs = dist.batch_isend_irecv(ops)
+        print(f"after batch_isend_irecv {gpc.get_global_rank()}", flush=True)
         for req in reqs:
             req.wait()
         # To protect against race condition when using batch_isend_irecv().
@@ -889,51 +891,77 @@ class AsynCommunicator:
 
     def __init__(
         self,
-        tensor_to_send: Union[torch.Tensor, List[torch.Tensor]],
-        recv_shape: Union[torch.Size, List[torch.Size]],
+        # tensor_to_send: Union[torch.Tensor, List[torch.Tensor]],
+        # recv_shape: Union[torch.Size, List[torch.Size]],
+        # dtype: torch.dtype = None,
+        # scatter_gather_tensors=False,
+        # forward: bool = True,
+        # send_next: bool = None,
+        # recv_next: bool = None,
+        object_send_next: Union[torch.Tensor, List[torch.Tensor]] = None,
+        object_send_prev: Union[torch.Tensor, List[torch.Tensor]] = None,
+        recv_prev: bool = False,
+        recv_next: bool = False,
+        recv_prev_shape: Union[torch.Size, List[torch.Size]] = None,
+        recv_next_shape: Union[torch.Size, List[torch.Size]] = None,
+        prev_rank: int = None,
+        next_rank: int = None,
         dtype: torch.dtype = None,
-        scatter_gather_tensors=False,
-        forward: bool = True,
-        send_next: bool = None,
-        recv_next: bool = None,
+        scatter_gather_tensors: bool = False,
     ) -> None:
-        self._need_receive = recv_shape is not None
-        assert (send_next is not None and recv_next is not None) or (send_next is None and recv_next is None)
-
-        if send_next is None and recv_next is None:
-            if forward:
-                send_next = True
-                recv_next = False
-            else:
-                send_next = False
-                recv_next = True
+        self._need_receive = recv_prev_shape is not None or recv_next_shape is not None
+        # assert (send_next is not None and recv_next is not None) or (send_next is None and recv_next is None)
         
-        assert send_next is not None and recv_next is not None
+        
+        
+        
+        self._coroutine = _communicate_async(
+            object_send_prev=object_send_prev,
+            object_send_next=object_send_next,
+            recv_prev=recv_prev_shape is not None,
+            recv_next=recv_next_shape is not None,
+            recv_prev_shape=recv_prev_shape,
+            recv_next_shape=recv_next_shape,
+            prev_rank=prev_rank,
+            next_rank=next_rank,
+            dtype=dtype,
+            scatter_gather_tensors=scatter_gather_tensors,
+        )
 
-        if send_next and not recv_next:
-            self._coroutine = send_forward_and_recv_next_forward_async(
-                tensor_to_send, recv_shape, dtype, scatter_gather_tensors
-            )
-        elif not send_next and recv_next:
-            self._coroutine = send_backward_and_recv_next_backward_async(
-                tensor_to_send, recv_shape, dtype, scatter_gather_tensors
-            )
-        elif send_next and recv_next:
-            self._coroutine = _communicate_async(
-                object_send_next=tensor_to_send,
-                recv_next=recv_shape is not None,
-                recv_next_shape=recv_shape,
-                dtype=dtype,
-                scatter_gather_tensors=scatter_gather_tensors,
-            )
-        else:
-            self._coroutine = _communicate_async(
-                object_send_prev=tensor_to_send,
-                recv_prev=recv_shape is not None,
-                recv_prev_shape=recv_shape,
-                dtype=dtype,
-                scatter_gather_tensors=scatter_gather_tensors,
-            )
+        # if send_next is None and recv_next is None:
+        #     if forward:
+        #         send_next = True
+        #         recv_next = False
+        #     else:
+        #         send_next = False
+        #         recv_next = True
+        
+        # assert send_next is not None and recv_next is not None
+
+        # if send_next and not recv_next:
+        #     self._coroutine = send_forward_and_recv_next_forward_async(
+        #         tensor_to_send, recv_shape, dtype, scatter_gather_tensors
+        #     )
+        # elif not send_next and recv_next:
+        #     self._coroutine = send_backward_and_recv_next_backward_async(
+        #         tensor_to_send, recv_shape, dtype, scatter_gather_tensors
+        #     )
+        # elif send_next and recv_next:
+        #     self._coroutine = _communicate_async(
+        #         object_send_next=tensor_to_send,
+        #         recv_next=recv_shape is not None,
+        #         recv_next_shape=recv_shape,
+        #         dtype=dtype,
+        #         scatter_gather_tensors=scatter_gather_tensors,
+        #     )
+        # else:
+        #     self._coroutine = _communicate_async(
+        #         object_send_prev=tensor_to_send,
+        #         recv_prev=recv_shape is not None,
+        #         recv_prev_shape=recv_shape,
+        #         dtype=dtype,
+        #         scatter_gather_tensors=scatter_gather_tensors,
+        #     )
 
     @property
     def need_receive(self) -> bool:
