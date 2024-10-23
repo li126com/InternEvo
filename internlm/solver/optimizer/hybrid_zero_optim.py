@@ -240,8 +240,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         # flag used to skip unnecessary gradient reduce operation when gradient accumulation is enabled.
         self.skip_grad_reduce = False
 
-        if gpc.config.parallel["pipeline"].get("mode", "1F1B") == "1F1B":
-            self._attach_reduction_hook()
+        self._attach_reduction_hook()
 
     @property
     def zero_local_rank(self):
@@ -299,10 +298,14 @@ class HybridZeroOptimizer(BaseOptimizer):
 
     # TODO check expert dp is correct when enable moe and overlap both
     def _attach_reduction_hook(self):
+        from internlm.core.scheduler.pipeline_scheduler import WeightGradStore
+        is_using_ZB = gpc.config.parallel["pipeline"].get("mode", "1F1B") != "1F1B"
+        assert is_using_ZB
         # we iterate over the fp16 params
         # on each param, we register a hook to its AccumulateGrad object
         for group_id in range(self.num_param_groups):
             param_group = self._fp16_param_groups[group_id]
+            print(f"param_group {gpc.get_global_rank()}: {len(param_group)}", flush=True)
             for param in param_group:
                 # we should not reduce the param in moe
                 if not param.requires_grad:
@@ -348,6 +351,7 @@ class HybridZeroOptimizer(BaseOptimizer):
                     # NOT IMPORTANT BUT GOOD TO KNOW:
                     # args here is not grad, but allow_unreacable and accumulate_grad
                     def reduce_grad_hook(*args):  # pylint: disable=W0613
+                        # assert self.skip_grad_reduce
                         if self.skip_grad_reduce is False:
                             reduction_func()
 
@@ -374,7 +378,10 @@ class HybridZeroOptimizer(BaseOptimizer):
                         and hasattr(param, IS_REPLICA_ZERO_PARALLEL)
                         and getattr(param, IS_REPLICA_ZERO_PARALLEL) is True
                     ) or (is_gate_param(param) and gpc.config.parallel.expert.no_tp):
-                        accum_grad_obj.register_hook(extra_layernorm_reduce_grad_hook)
+                        if is_using_ZB:
+                            WeightGradStore.register_hook(param, reduce_grad_hook)
+                        else:
+                            accum_grad_obj.register_hook(extra_layernorm_reduce_grad_hook)
 
                     # we should not only register for parameters which have isp_reduce_scatter_name attr.
                     # we must keep up with reduce_grad_hook.
@@ -390,16 +397,23 @@ class HybridZeroOptimizer(BaseOptimizer):
                             and gpc.config.parallel.weight.overlap
                         )
                     ):
-                        if hasattr(param, "evo_tensor"):
-                            param.register_post_accumulate_grad_hook(accum_grad_hook)
+                        if is_using_ZB:
+                            WeightGradStore.register_hook(param, reduce_grad_hook)
                         else:
-                            accum_grad_obj.register_hook(accum_grad_hook)
+                            if hasattr(param, "evo_tensor"):
+                                param.register_post_accumulate_grad_hook(accum_grad_hook)
+                            else:
+                                accum_grad_obj.register_hook(accum_grad_hook)
 
                     if self._overlap_sync_grad:
-                        if hasattr(param, "evo_tensor"):
-                            param.register_post_accumulate_grad_hook(reduce_grad_hook)
+                        if is_using_ZB:
+                            WeightGradStore.register_hook(param, reduce_grad_hook)
                         else:
-                            accum_grad_obj.register_hook(reduce_grad_hook)
+                            assert False
+                            if hasattr(param, "evo_tensor"):
+                                param.register_post_accumulate_grad_hook(reduce_grad_hook)
+                            else:
+                                accum_grad_obj.register_hook(reduce_grad_hook)
 
                 _define_and_attach(param, reduce_rank)
 
