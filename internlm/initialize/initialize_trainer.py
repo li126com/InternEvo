@@ -125,6 +125,7 @@ def initialize_trainer(
                 tensor_shape=tensor_shape,
                 scatter_gather_tensors=scatter_gather,
                 scheduler_hooks=scheduler_hooks,
+                optimizer=optimizer,
             )
         elif gpc.config.parallel["pipeline"]["mode"] == "ZBV":
             scheduler = ZeroBubblePipelineVShapeScheduler(
@@ -135,6 +136,7 @@ def initialize_trainer(
                 tensor_shape=tensor_shape,
                 scatter_gather_tensors=scatter_gather,
                 scheduler_hooks=scheduler_hooks,
+                optimizer=optimizer,
             )
         else:
             scheduler = PipelineScheduler(

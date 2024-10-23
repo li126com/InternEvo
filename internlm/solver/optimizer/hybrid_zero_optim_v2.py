@@ -191,7 +191,8 @@ class HybridZeroOptimizer_v2(BaseOptimizer):
 
         self.skip_grad_reduce = False
 
-        self._attach_reduction_hook()
+        if gpc.config.parallel["pipeline"].get("mode", "1F1B") == "1F1B":
+            self._attach_reduction_hook()
 
     @property
     def dtype(self):

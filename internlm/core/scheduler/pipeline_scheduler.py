@@ -9,6 +9,8 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch.optim.optimizer import Optimizer
+from functools import partial
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
@@ -26,7 +28,12 @@ from internlm.utils.parallel import is_using_isp
 from internlm.utils.timeout import llm_timeout
 
 from .base_scheduler import BaseScheduler
-from internlm.accelerator import get_accelerator
+from internlm.accelerator import AcceleratorType, get_accelerator
+
+from internlm.utils.parallel import is_using_sequence_parallel
+from internlm.model.modules.utils import is_gate_param, is_moe_param
+from internlm.core.context.parallel_context import IS_REPLICA_ZERO_PARALLEL
+
 
 internlm_accelerator = get_accelerator()
 logger = get_logger(__file__)
@@ -120,10 +127,15 @@ class WeightGradStore:
     cache = []
     weight_grad_queue = queue.Queue()
     pp_mode = None
+    optim = None
     
     @classmethod
     def set_pp_mode(cls, mode):
         cls.pp_mode = mode
+    
+    @classmethod
+    def set_optim(cls, optim):
+        cls.optim = optim
 
     @classmethod
     def size(cls):
@@ -163,6 +175,112 @@ class WeightGradStore:
             weight.grad = weight.grad + grad_weight.data if weight.grad is not None else grad_weight
             if has_d_bias:
                 bias.grad = bias.grad + grad_bias.data if bias.grad is not None else grad_bias
+            
+            cls._run_hooks(weight)
+    
+    @classmethod
+    def _run_hooks(cls, param):
+        assert param.requires_grad
+
+        reduce_rank = None
+
+        def _define_and_attach(param, reduce_rank=None):
+            reduction_func = partial(
+                cls.optim._store_and_try_reduce_grads_by_bucket,
+                param=param,
+                reduce_rank=reduce_rank,
+            )
+
+            reduce_scatter_checker = partial(
+                cls.optim._wait_reduce_scatter_and_accumulate_grads,
+                param=param,
+                reduce_rank=reduce_rank,
+            )
+
+            def reduction_layernorm_func():
+                # BUG: 8.0.RC1.alpha003 hccl allreduce AVG op will not perform averaging operation.
+                # So we use sum + div here when training on Ascend machines.
+                op_type = (
+                    torch.distributed.ReduceOp.SUM
+                    if internlm_accelerator.get_accelerator_backend()
+                    in [AcceleratorType.NPU, AcceleratorType.DIPU, AcceleratorType.DITORCH]
+                    else torch.distributed.ReduceOp.AVG
+                )
+                parallel_mode = ParallelMode.WEIGHT if cls.optim.use_isp else ParallelMode.TENSOR
+                from internlm.solver.optimizer.utils import reduce_tensor
+                reduce_tensor(
+                    param.grad,
+                    dtype=None,
+                    dst_rank=reduce_rank,
+                    parallel_mode=parallel_mode,
+                    op_type=op_type,
+                    async_op=False,
+                )
+                if op_type == torch.distributed.ReduceOp.SUM:
+                    param.grad.div_(gpc.get_world_size(parallel_mode))
+
+            # define hook
+            # NOT IMPORTANT BUT GOOD TO KNOW:
+            # args here is not grad, but allow_unreacable and accumulate_grad
+            def reduce_grad_hook(*args):  # pylint: disable=W0613
+                if cls.optim.skip_grad_reduce is False:
+                    reduction_func()
+
+            # define hook for real gradient accumulation.
+            def accum_grad_hook(*args):  # pylint: disable=W0613
+                reduce_scatter_checker()
+
+            # define hook for sequence_parallel
+            def extra_layernorm_reduce_grad_hook(*args):  # pylint: disable=W0613
+                if cls.optim.skip_grad_reduce is False:
+                    reduction_layernorm_func()
+
+            # get the AccumulateGrad object of the param itself
+            # If these objects are not kept, reduction hooks may not be attached successfully.
+            if not hasattr(param, "evo_tensor"):
+                from internlm.solver.optimizer.utils import get_grad_accumulate_object
+                accum_grad_obj = get_grad_accumulate_object(param)
+                cls.optim._grad_store.add_accumulate_grad_object(accum_grad_obj)
+
+            # the grad of layernorm should be all-reduce across the global process group
+            # here is the first stage all-reduce in tp/wp process group
+            # the second stage all-reduce will be processed in reduce_grad_hook
+            if (
+                is_using_sequence_parallel()
+                and hasattr(param, IS_REPLICA_ZERO_PARALLEL)
+                and getattr(param, IS_REPLICA_ZERO_PARALLEL) is True
+            ) or (is_gate_param(param) and gpc.config.parallel.expert.no_tp):
+                # accum_grad_obj.register_hook(extra_layernorm_reduce_grad_hook)
+                extra_layernorm_reduce_grad_hook()
+
+            # we should not only register for parameters which have isp_reduce_scatter_name attr.
+            # we must keep up with reduce_grad_hook.
+            if cls.optim._isp_communicator and (
+                (
+                    is_moe_param(param)
+                    and gpc.config.parallel.expert_weight.size > 1
+                    and gpc.config.parallel.expert_weight.overlap
+                )
+                or (
+                    not is_moe_param(param)
+                    and gpc.config.parallel.weight.size > 1
+                    and gpc.config.parallel.weight.overlap
+                )
+            ):
+                # if hasattr(param, "evo_tensor"):
+                #     param.register_post_accumulate_grad_hook(accum_grad_hook)
+                # else:
+                #     accum_grad_obj.register_hook(accum_grad_hook)
+                accum_grad_hook()
+
+            if cls.optim._overlap_sync_grad:
+                # if hasattr(param, "evo_tensor"):
+                #     param.register_post_accumulate_grad_hook(reduce_grad_hook)
+                # else:
+                #     accum_grad_obj.register_hook(reduce_grad_hook)
+                reduce_grad_hook()
+
+        _define_and_attach(param, reduce_rank)
 
 
 class PipelineScheduler(BaseScheduler):
@@ -789,6 +907,7 @@ class ZeroBubblePipelineScheduler(PipelineScheduler):
         tensor_shape: Union[torch.Size, List[int], Tuple[int]] = None,
         scatter_gather_tensors: bool = False,
         scheduler_hooks: Optional[List[SchedulerHook]] = None,
+        optimizer: Optimizer = None,
     ):
         super().__init__(
             num_microbatches,
@@ -799,6 +918,7 @@ class ZeroBubblePipelineScheduler(PipelineScheduler):
             scheduler_hooks=scheduler_hooks,
         )
         WeightGradStore.set_pp_mode("ZBH1")
+        WeightGradStore.set_optim(optimizer)
 
     def _forward_backward_step(self, engine, return_loss=True, return_output_label=True):
         """
@@ -1793,6 +1913,7 @@ class ZeroBubblePipelineVShapeScheduler(InterleavedPipelineScheduler):
         tensor_shape: Union[torch.Size, List[int], Tuple[int]] = None,
         scatter_gather_tensors: bool = False,
         scheduler_hooks: Optional[List[SchedulerHook]] = None,
+        optimizer: Optimizer = None,
     ):
         """A helper schedule class for pipeline parallelism running environment.
         It uses ZB-V strategy. Other properties are similar as
@@ -1834,6 +1955,7 @@ class ZeroBubblePipelineVShapeScheduler(InterleavedPipelineScheduler):
                 
         self._special_chunk0_forward = True
         WeightGradStore.set_pp_mode("ZBV")
+        WeightGradStore.set_optim(optimizer)
         gpc.v_shape = True
         self.chunk1_need_recv_prev_chunk1_grad = True
         

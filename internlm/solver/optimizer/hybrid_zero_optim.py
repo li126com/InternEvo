@@ -240,7 +240,8 @@ class HybridZeroOptimizer(BaseOptimizer):
         # flag used to skip unnecessary gradient reduce operation when gradient accumulation is enabled.
         self.skip_grad_reduce = False
 
-        self._attach_reduction_hook()
+        if gpc.config.parallel["pipeline"].get("mode", "1F1B") == "1F1B":
+            self._attach_reduction_hook()
 
     @property
     def zero_local_rank(self):
@@ -478,6 +479,7 @@ class HybridZeroOptimizer(BaseOptimizer):
             raise RuntimeError(msg)
 
         # the param must have grad for reduction
+        assert param.requires_grad
         assert param.grad is not None, f"Parameter of size ({param.size()}) has None grad, cannot be reduced"
 
         current_bucket.add_num_elements_in_bucket(param_size, reduce_rank)
