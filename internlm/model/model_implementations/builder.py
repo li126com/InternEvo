@@ -1,9 +1,9 @@
 from typing import List, Union
 
 import torch
-import transformer_engine.pytorch as te
 from torch import nn
 
+from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.parallel.shard import pipeline_parallel_sharding_wrapper
@@ -20,7 +20,13 @@ from internlm.utils.lazy import LazyObject
 from internlm.utils.logger import get_logger
 from internlm.utils.parallel import is_using_fsdp, is_using_hf, is_using_isp
 
+try:
+    import transformer_engine.pytorch as te
+except ImportError:
+    pass
+
 logger = get_logger(__file__)
+internlm_accelerator = get_accelerator()
 
 
 def simple_swap(model, device):
@@ -156,7 +162,8 @@ def create_model_hf(hf: dict) -> nn.Module:
         else:
             traverse(model)
 
-    if gpc.config.get("fp8", None) is not None:
-        simple_swap(model, fsdp_init_method)
+    if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
+        if gpc.config.get("fp8", None) is not None:
+            simple_swap(model, fsdp_init_method)
 
     return model
